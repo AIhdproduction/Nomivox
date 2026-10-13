@@ -1,0 +1,16 @@
+[project]
+name = "e57cls"
+version = "0.1.0"
+description = "Local E57 classifier with verified streaming geometry"
+readme = "README.md"
+license = "LicenseRef-AIhdproduction-Education-Research-1.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "docs/LICENSE_*.txt"]
+authors = [{ name = "AIhdproduction" }]
+requires-python = ">=3.12,<3.13"
+dependencies = ["pye57==0.4.19", "numpy==1.26.4", "Pillow==12.3.0", "scipy==1.17.1", "laspy==2.7.0", "lazrs==0.8.2", "PySide6==6.12.0", "psutil==7.2.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+cache_dir = ".cache/pytest"
+

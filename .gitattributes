@@ -1,0 +1,3 @@
+# Windows launchers need CRLF in clones and in downloaded ZIP archives
+*.bat text eol=crlf
+*.cmd text eol=crlf

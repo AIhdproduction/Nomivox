@@ -1,0 +1,93 @@
+# Local point-cloud datasets (keep the automated tests/ directory)
+/Test_pw/
+/test_data/
+/testdata/
+/data/
+/input/
+*.[eE]57
+*.[lL][aA][sS]
+*.[lL][aA][zZ]
+*.[pP][lL][yY]
+*.[pP][cC][dD]
+*.[pP][tT][sS]
+*.[pP][tT][xX]
+*.[xX][yY][zZ]
+*.[rR][cC][pP]
+*.[rR][cC][sS]
+
+# Generated clouds, inspection reports, logs and diagnostics
+klassifiziert/
+/output/
+/outputs/
+*.log
+*.jsonl
+*.partial
+*.partial.*
+# Dataset-specific local inspection; reusable docs remain versioned
+/docs/e57_findings.md
+
+# Model weights are obtained separately; keep model setup instructions
+/models/*
+!/models/README.md
+!/models/.gitkeep
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+
+# Python environments, package/build artifacts and caches
+.cache/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+.eggs/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Generated array caches and local databases
+*.npy
+*.npz
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# Machine-specific configuration, secrets and editor files
+.env
+.env.*
+!.env.example
+!.env.sample
+.codex/
+.vscode/
+.idea/
+*.code-workspace
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Temporary files and OS metadata
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store

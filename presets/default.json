@@ -1,0 +1,756 @@
+{
+  "schema_version": 1,
+  "preset_name": "Default Outdoor and Indoor",
+  "unclassified_code": 1,
+  "scene_resolved_pairs": [
+    [
+      "ground",
+      "floor"
+    ],
+    [
+      "building",
+      "wall"
+    ],
+    [
+      "construction_machinery",
+      "vehicle"
+    ]
+  ],
+  "classes": [
+    {
+      "id": "ground",
+      "name_de": "Boden",
+      "name_en": "Ground",
+      "code": 2,
+      "color": "#8B6F47",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "ground",
+        "terrain",
+        "soil",
+        "bare earth",
+        "gravel",
+        "earth",
+        "pebbles"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "road",
+      "name_de": "Strasse",
+      "name_en": "Road",
+      "code": 11,
+      "color": "#4D4D4D",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "road",
+        "street",
+        "asphalt",
+        "carriageway",
+        "roadway",
+        "paved road"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "sidewalk",
+      "name_de": "Gehweg",
+      "name_en": "Sidewalk",
+      "code": 73,
+      "color": "#9E9E9E",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "sidewalk",
+        "footpath",
+        "pedestrian path",
+        "pavement",
+        "walkway",
+        "pedestrian walkway"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "curb",
+      "name_de": "Randstein",
+      "name_en": "Curb",
+      "code": 74,
+      "color": "#D6D6D6",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "curb",
+        "kerb",
+        "curb stone",
+        "edge stone",
+        "kerbstone",
+        "road curb"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "low_vegetation",
+      "name_de": "Niedrige Vegetation",
+      "name_en": "Low vegetation",
+      "code": 3,
+      "color": "#7CCB4F",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "low vegetation",
+        "grass",
+        "shrubs",
+        "bushes",
+        "lawn",
+        "ground cover vegetation"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "tree",
+      "name_de": "Hohe Vegetation, Bäume, Hecken",
+      "name_en": "Tree",
+      "code": 5,
+      "color": "#2E7D32",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "tree canopy",
+        "foliage",
+        "leafy branches",
+        "tall vegetation",
+        "hedge",
+        "tree crown",
+        "treetop"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "building",
+      "name_de": "Gebäude",
+      "name_en": "Building",
+      "code": 6,
+      "color": "#C62828",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "building",
+        "house",
+        "facade",
+        "exterior wall",
+        "building exterior",
+        "building facade"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "vehicle",
+      "name_de": "Fahrzeuge",
+      "name_en": "Vehicle",
+      "code": 91,
+      "color": "#1565C0",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "vehicle",
+        "car",
+        "van",
+        "truck",
+        "automobile",
+        "motor vehicle"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "construction_machinery",
+      "name_de": "Baumaschinen",
+      "name_en": "Construction machinery",
+      "code": 67,
+      "color": "#FDD835",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "construction machinery",
+        "excavator",
+        "digger",
+        "bulldozer",
+        "loader",
+        "backhoe",
+        "wheel loader"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "utility_pole",
+      "name_de": "Masten und Strassenlampen",
+      "name_en": "Utility pole",
+      "code": 84,
+      "color": "#6A1B9A",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "utility pole",
+        "light pole",
+        "streetlight",
+        "lamp post",
+        "street lamp",
+        "lamppost"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "traffic_sign",
+      "name_de": "Verkehrsschilder",
+      "name_en": "Traffic sign",
+      "code": 81,
+      "color": "#F50057",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "traffic sign",
+        "road sign",
+        "signpost",
+        "traffic sign board",
+        "roadside sign"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "fence",
+      "name_de": "Zäune und Geländer aussen",
+      "name_en": "Fence",
+      "code": 77,
+      "color": "#00ACC1",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "fence",
+        "barrier",
+        "gate",
+        "site fence",
+        "wire fence",
+        "outdoor guardrail"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "power_line",
+      "name_de": "Freileitungen",
+      "name_en": "Power line",
+      "code": 14,
+      "color": "#1B1B1B",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "overhead power line",
+        "utility wire",
+        "overhead cable",
+        "overhead electrical wire",
+        "overhead power cable"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "construction_material",
+      "name_de": "Lose Gegenstände, Hausrat und Material",
+      "name_en": "Household clutter and material",
+      "code": 76,
+      "color": "#FB8C00",
+      "scene": "both",
+      "enabled": true,
+      "prompts": [
+        "suitcase",
+        "luggage",
+        "backpack",
+        "bag",
+        "clothes",
+        "jacket",
+        "shoes",
+        "toys",
+        "stuffed animal",
+        "cardboard box",
+        "storage box",
+        "basket",
+        "bottle",
+        "bucket",
+        "book",
+        "loose household items",
+        "household clutter",
+        "tools",
+        "building material",
+        "construction material",
+        "construction container",
+        "site container",
+        "handbag",
+        "shopping bag",
+        "sweater",
+        "trousers",
+        "blanket",
+        "cushion",
+        "laundry",
+        "plastic container"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "water",
+      "name_de": "Wasser",
+      "name_en": "Water",
+      "code": 9,
+      "color": "#29B6F6",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "water",
+        "pond",
+        "stream",
+        "puddle",
+        "water surface",
+        "standing water"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "wall",
+      "name_de": "Wand",
+      "name_en": "Wall",
+      "code": 100,
+      "color": "#E0C9A6",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "wall",
+        "interior wall",
+        "partition wall",
+        "drywall",
+        "plaster wall",
+        "tiled wall"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "ceiling",
+      "name_de": "Decke",
+      "name_en": "Ceiling",
+      "code": 101,
+      "color": "#ECEFF1",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "ceiling",
+        "interior ceiling",
+        "suspended ceiling",
+        "soffit",
+        "plaster ceiling",
+        "ceiling panels"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "floor",
+      "name_de": "Fussboden",
+      "name_en": "Floor",
+      "code": 102,
+      "color": "#A1887F",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "floor",
+        "interior floor",
+        "flooring",
+        "floor slab",
+        "wooden floor",
+        "parquet floor",
+        "tiled floor",
+        "carpeted floor"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "door",
+      "name_de": "Tür",
+      "name_en": "Door",
+      "code": 103,
+      "color": "#5D4037",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "door",
+        "doorway",
+        "door frame",
+        "door panel",
+        "interior door"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "window",
+      "name_de": "Fenster",
+      "name_en": "Window",
+      "code": 104,
+      "color": "#80DEEA",
+      "scene": "both",
+      "enabled": true,
+      "prompts": [
+        "window",
+        "glazing",
+        "window frame",
+        "glass pane",
+        "window sash",
+        "casement window"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "stairs",
+      "name_de": "Treppe",
+      "name_en": "Stairs",
+      "code": 105,
+      "color": "#FF8A65",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "stairs",
+        "staircase",
+        "stair steps",
+        "stair treads",
+        "stair risers",
+        "stairway",
+        "flight of stairs"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "railing",
+      "name_de": "Geländer",
+      "name_en": "Railing",
+      "code": 107,
+      "color": "#7E57C2",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "railing",
+        "handrail",
+        "balustrade",
+        "banister",
+        "stair railing"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "column",
+      "name_de": "Säule / Stütze",
+      "name_en": "Column",
+      "code": 108,
+      "color": "#90A4AE",
+      "scene": "both",
+      "enabled": true,
+      "prompts": [
+        "column",
+        "pillar",
+        "support post",
+        "structural column",
+        "support pillar"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "beam",
+      "name_de": "Balken / Träger",
+      "name_en": "Beam",
+      "code": 109,
+      "color": "#546E7A",
+      "scene": "both",
+      "enabled": true,
+      "prompts": [
+        "beam",
+        "girder",
+        "joist",
+        "support beam",
+        "structural beam"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "steel_structure",
+      "name_de": "Stahlkonstruktion und Gerüste",
+      "name_en": "Steel structure",
+      "code": 110,
+      "color": "#455A64",
+      "scene": "both",
+      "enabled": true,
+      "prompts": [
+        "steel structure",
+        "steel frame",
+        "steel truss",
+        "scaffolding",
+        "construction scaffold",
+        "metal framework",
+        "scaffold structure"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "pipe",
+      "name_de": "Rohr",
+      "name_en": "Pipe",
+      "code": 111,
+      "color": "#26A69A",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "pipe",
+        "pipeline",
+        "plumbing pipe",
+        "water pipe",
+        "drain pipe"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "cable",
+      "name_de": "Kabel",
+      "name_en": "Cable",
+      "code": 112,
+      "color": "#FFD54F",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "cable",
+        "cable tray",
+        "conduit",
+        "electrical wiring",
+        "electrical cable"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "electrical",
+      "name_de": "Elektrische Anlagen",
+      "name_en": "Electrical",
+      "code": 113,
+      "color": "#FF7043",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "electrical cabinet",
+        "distribution board",
+        "switch box",
+        "socket",
+        "fuse box",
+        "electrical outlet"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "hvac",
+      "name_de": "Heizung, Lüftung, Klima",
+      "name_en": "HVAC",
+      "code": 114,
+      "color": "#9CCC65",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "air duct",
+        "ventilation duct",
+        "HVAC unit",
+        "air conditioning unit",
+        "radiator",
+        "heating unit",
+        "air vent",
+        "ventilation grille"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "ceiling_equipment",
+      "name_de": "Deckenausrüstung",
+      "name_en": "Ceiling equipment",
+      "code": 116,
+      "color": "#CE93D8",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "ceiling light",
+        "sprinkler",
+        "ceiling mounted fixture",
+        "ceiling lamp",
+        "pendant light",
+        "smoke detector"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "furniture",
+      "name_de": "Möbel",
+      "name_en": "Furniture",
+      "code": 117,
+      "color": "#BA68C8",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "furniture",
+        "cabinet",
+        "shelf",
+        "chair",
+        "table",
+        "desk",
+        "sofa",
+        "couch",
+        "armchair",
+        "bed",
+        "wardrobe",
+        "chest of drawers",
+        "dining table",
+        "bookcase"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "sanitary_fixtures",
+      "code": 63,
+      "name_de": "Sanitäranlagen",
+      "name_en": "Sanitary fixtures",
+      "color": "#4FC3F7",
+      "scene": "indoor",
+      "prompts": [
+        "toilet",
+        "toilet bowl",
+        "toilet cistern",
+        "bathtub",
+        "bath tub",
+        "washbasin",
+        "bathroom sink",
+        "shower tray",
+        "shower enclosure",
+        "bidet",
+        "urinal",
+        "faucet",
+        "shower head",
+        "wash basin",
+        "shower base"
+      ],
+      "enabled": true,
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "manhole",
+      "code": 75,
+      "name_de": "Schachtdeckel",
+      "name_en": "Manhole cover",
+      "color": "#607D8B",
+      "scene": "outdoor",
+      "prompts": [
+        "manhole cover",
+        "sewer cover",
+        "inspection cover",
+        "utility access cover",
+        "drain cover",
+        "sewer manhole lid",
+        "access hatch cover"
+      ],
+      "enabled": true,
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "tree_trunk",
+      "code": 95,
+      "name_de": "Baumstamm",
+      "name_en": "Tree trunk",
+      "color": "#795548",
+      "scene": "outdoor",
+      "prompts": [
+        "tree trunk",
+        "tree stem",
+        "tree bark",
+        "tree bole",
+        "main tree stem"
+      ],
+      "enabled": true,
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    }
+  ],
+  "special": [
+    {
+      "id": "unclassified",
+      "name_de": "Unklassifiziert",
+      "name_en": "Unclassified",
+      "code": 1,
+      "color": "#000000"
+    },
+    {
+      "id": "reflection",
+      "name_de": "Reflexion (virtuelle Spiegelpunkte)",
+      "name_en": "Reflection",
+      "code": 68,
+      "color": "#FF00FF"
+    }
+  ],
+  "auxiliary": [
+    {
+      "id": "sky",
+      "name_en": "Sky",
+      "prompts": [
+        "sky",
+        "clouds"
+      ],
+      "output": false
+    },
+    {
+      "id": "mirror_mask",
+      "name_en": "Mirror",
+      "prompts": [
+        "mirror",
+        "bathroom mirror",
+        "wall mirror"
+      ],
+      "output": false
+    },
+    {
+      "id": "glass_mask",
+      "name_en": "Window glass",
+      "prompts": [
+        "window glass",
+        "glass window pane",
+        "windowpane"
+      ],
+      "output": false
+    }
+  ]
+}

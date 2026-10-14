@@ -52,16 +52,44 @@ def test_reflection_eta_uses_parent_phase_and_never_shows_zero(qt_application):
         window.handle_event(dict(event='phase_started',phase='mirror',elapsed_seconds=0))
         window.update_clock()
         assert tr('estimate_pending') in window.bottom.text()
+        assert tr('total_estimate_pending') in window.bottom.text()
         window.handle_event(dict(event='progress',phase='mirror_masks',fraction=.6,image=6,image_count=10))
         window.update_clock()
         assert window.phase_key == 'mirror'
-        assert tr('remaining',minutes=7) in window.bottom.text()
+        assert tr('remaining',duration='7 min') in window.bottom.text()
+        assert tr('total_remaining',duration='43 min') in window.bottom.text()
         window.handle_event(dict(event='progress',phase='mirror_masks',fraction=.7,image=7,image_count=10))
         window.update_clock()
-        assert tr('remaining',minutes=5) in window.bottom.text()
+        assert tr('remaining',duration='5 min') in window.bottom.text()
+        assert tr('total_remaining',duration='36 min') in window.bottom.text()
         window.handle_event(dict(event='phase_started',phase='segmentation',elapsed_seconds=600))
         window.update_clock()
         assert tr('estimate_pending') in window.bottom.text()
+        assert tr('total_remaining',duration='36 min') in window.bottom.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_total_eta_covers_phase_and_keeps_finished_status(qt_application, monkeypatch):
+    monkeypatch.setattr(time, 'monotonic', lambda: 10000.)
+    window = MainWindow(Path('test.e57'),auto_start=False)
+    try:
+        window.watching = True
+        window.started = 9400.
+        window.handle_event(dict(event='phase_started',phase='output',elapsed_seconds=0))
+        window.handle_event(dict(event='progress',phase='output',fraction=.5))
+        window.update_clock()
+        # A late slow phase must not have a shorter total ETA than its own ETA.
+        assert tr('remaining',duration='10 min') in window.bottom.text()
+        assert tr('total_remaining',duration='10 min') in window.bottom.text()
+        window.handle_event(dict(event='finished',elapsed_seconds=600,output='test.las'))
+        completed = window.bottom.text()
+        window.update_clock()
+        assert window.bottom.text() == completed
+        assert tr('run_done') in completed
+        assert 'Gesamtrestzeit' not in completed
     finally:
         window.close()
         window.deleteLater()

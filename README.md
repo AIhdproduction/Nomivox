@@ -103,6 +103,13 @@ progress across all its images or scans. Until enough information is available,
 the interface displays **Restzeit wird berechnet …** (Calculating remaining time).
 Cache hits, different image contents, and GPU load can affect the estimate.
 
+The status line also shows **Gesamtrestzeit**: a rough estimate for the entire
+remaining run, including the current and subsequent phases. It extrapolates
+elapsed time from the weighted overall progress and updates continuously.
+Because phase weights are fixed and actual phase durations vary, this estimate
+can change substantially. Until enough progress is available, it displays
+**Gesamtrestzeit wird berechnet …**. Hover over the status line for details.
+
 ## How classification works
 
 1. **Inspect and read the E57.** Scan positions, images, poses, and attributes are

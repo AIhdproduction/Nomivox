@@ -17,6 +17,13 @@ def tr(key, **values):
     return STRINGS[key].format(**values)
 
 
+def format_duration(seconds, include_seconds=False):
+    minutes, seconds = divmod(max(0,int(seconds)),60)
+    hours, minutes = divmod(minutes,60)
+    text = f'{hours} h {minutes:02d} min' if hours else f'{minutes} min'
+    return text+f' {seconds:02d} s' if include_seconds else text
+
+
 class MainWindow(QMainWindow):
     def __init__(self, source, auto_start=True):
         super().__init__()
@@ -52,6 +59,8 @@ class MainWindow(QMainWindow):
         self.settings_tab()
         self.run_tab()
         self.bottom = QLabel(tr('ready'))
+        self.bottom.setWordWrap(True)
+        self.bottom.setToolTip(tr('total_estimate_hint'))
         self.overall = QProgressBar()
         self.overall.setRange(0,1000)
         layout.addWidget(self.overall)
@@ -545,7 +554,7 @@ class MainWindow(QMainWindow):
             self.phase.setText(tr('run_done'))
             self.result_label.setText(tr('result_ready',path=event['output']))
             elapsed = int(event.get('elapsed_seconds',0))
-            self.bottom.setText(tr('elapsed',minutes=elapsed//60,seconds=elapsed%60)+' · '+tr('run_done'))
+            self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+tr('run_done'))
         if kind != 'progress':
             self.log.appendPlainText(json.dumps(event,ensure_ascii=False))
 
@@ -600,7 +609,7 @@ class MainWindow(QMainWindow):
             self.set_running(False)
 
     def update_clock(self):
-        if not self.started or (not self.watching and self.process.state() == QProcess.ProcessState.NotRunning):
+        if self.finished_ok or not self.started or (not self.watching and self.process.state() == QProcess.ProcessState.NotRunning):
             return
         elapsed = max(0,int(time.monotonic()-self.started))
         import math
@@ -608,8 +617,14 @@ class MainWindow(QMainWindow):
         phase_elapsed = max(0,elapsed-beginning) if beginning is not None else 0
         remaining = (max(1,math.ceil(phase_elapsed*(1-self.phase_fraction)/self.phase_fraction/60))
                      if beginning is not None and phase_elapsed >= 5 and .01 < self.phase_fraction < 1 else None)
-        self.bottom.setText(tr('elapsed',minutes=elapsed//60,seconds=elapsed%60)+' · '+
-                            (tr('remaining',minutes=remaining) if remaining is not None else tr('estimate_pending')))
+        # Overall progress uses fixed phase weights, so this is a rough extrapolation.
+        total_remaining = (max(1,math.ceil(elapsed*(1-self.current_fraction)/self.current_fraction/60))
+                           if elapsed >= 5 and .01 < self.current_fraction < 1 else None)
+        if total_remaining is not None and remaining is not None:
+            total_remaining = max(total_remaining,remaining)
+        self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+
+                            (tr('remaining',duration=format_duration(remaining*60)) if remaining is not None else tr('estimate_pending'))+' · '+
+                            (tr('total_remaining',duration=format_duration(total_remaining*60)) if total_remaining is not None else tr('total_estimate_pending')))
 
     def open_file(self,name):
         if self.config:

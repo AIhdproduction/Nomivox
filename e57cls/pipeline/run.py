@@ -33,6 +33,10 @@ from e57cls.mirror.pipeline import build as build_mirrors
 LOG = logging.getLogger(__name__)
 
 
+class InputNotClassifiable(ValueError):
+    """Input lacks the image/camera metadata required before expensive processing."""
+
+
 def select_classes(preset, mode):
     if mode == 'unsure':
         mode = 'indoor'
@@ -227,6 +231,10 @@ def execute(config, backend_factory=None, listen=True):
         inspection = inspect_file(source)
         atomic_json(output/"inspect_report.json", inspection)
         atomic_text(output/"inspect_report.md", markdown(inspection))
+        if not any(scan['classification_eligible_metadata'] for scan in inspection['scans']):
+            strings = json.loads((Path(__file__).resolve().parents[1]/'gui/strings_de.json').read_text(encoding='utf-8'))
+            reason = 'input_no_images' if inspection['image_count'] == 0 else 'input_no_usable_images'
+            raise InputNotClassifiable(strings[reason])
         store_report = build_store(source, cache/"scan_store", progress=lambda s,n,t: control.checkpoint())
         atomic_json(output/"store_report.json", store_report)
         stores = [load_scan(Path(item["path"]), store_report["source_sha256"], verify_hashes=False) for item in store_report["scans"]]
@@ -371,6 +379,10 @@ def execute(config, backend_factory=None, listen=True):
     except Cancelled:
         LOG.info("Run cancelled at a safe work-unit boundary; cache remains reusable")
         return {"cancelled": True}
+    except InputNotClassifiable as error:
+        LOG.warning("Input rejected before classification: %s", error)
+        control.event("error", code="input_rejected", detail=str(error))
+        raise
     except Exception:
         LOG.exception("Run failed")
         control.event("error", code="run_failed")

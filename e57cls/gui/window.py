@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self.started = 0
         self.current_fraction = 0
         self.finished_ok = False
+        self.input_rejected = False
         self.closing = False
         self.loading = False
         self.overrides = {}
@@ -262,7 +263,7 @@ class MainWindow(QMainWindow):
             self.pause_button.setEnabled(False)
             self.cancel_button.setEnabled(False)
             self.resume_button.setEnabled(False)
-            if self.finished_ok:
+            if self.finished_ok or self.input_rejected:
                 self.watching = False
                 self.watch_timer.stop()
                 self.set_running(False)
@@ -422,6 +423,7 @@ class MainWindow(QMainWindow):
         self.phase_fraction = 0.
         self.phase_key = ''
         self.finished_ok = False
+        self.input_rejected = False
         env = QProcessEnvironment.systemEnvironment()
         for key,value in {'PYTHONUNBUFFERED':'1','PYTHONUTF8':'1','PYTHONDONTWRITEBYTECODE':'1',
                           'OMP_NUM_THREADS':'4','MKL_NUM_THREADS':'4','TEMP':str(Path(self.config['cache'])/'temp'),
@@ -522,7 +524,20 @@ class MainWindow(QMainWindow):
         elif kind == 'warning':
             self.log.appendPlainText(STRINGS.get(event.get('code'),tr('technical_warning')))
         elif kind == 'error':
-            self.phase.setText(tr('run_failed'))
+            if event.get('code') == 'input_rejected':
+                self.input_rejected = True
+                self.phase.setText(tr('input_rejected'))
+                self.read_inspection()
+                message = event.get('detail',tr('input_no_usable_images'))
+                self.result_label.setText(message)
+                self.result_label.setWordWrap(True)
+                self.log.appendPlainText(message)
+                warning = QMessageBox(QMessageBox.Icon.Warning,tr('input_rejected'),message,
+                                      QMessageBox.StandardButton.Ok,self)
+                warning.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+                warning.open()
+            else:
+                self.phase.setText(tr('run_failed'))
         elif kind == 'finished':
             self.finished_ok = True
             self.current_fraction = 1
@@ -543,7 +558,7 @@ class MainWindow(QMainWindow):
                 meta = scan['metadata']
                 images = [report['images'][i-1] for i in scan['image_indices']]
                 kinds = sorted({r for image in images for r in image['representations']})
-                values = [row+1,meta.get('name',''),meta['points']['record_count'],len(images),', '.join(kinds),
+                values = [row+1,meta.get('name',''),scan['record_count'],len(images),', '.join(kinds),
                           tr('pose_'+scan['pose_status']),tr('scene_both'),tr('available') if scan['classification_eligible_metadata'] else tr('not_classifiable')]
                 for col,value in enumerate(values):
                     self.scan_table.setItem(row,col,QTableWidgetItem(str(value)))
@@ -560,7 +575,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.cancel_button.setEnabled(running)
-        self.resume_button.setEnabled(not running and self.config is not None and not self.finished_ok)
+        self.resume_button.setEnabled(not running and self.config is not None and not self.finished_ok and not self.input_rejected)
         self.open_output.setEnabled(self.config is not None)
         self.open_log.setEnabled(self.config is not None)
         self.open_report.setEnabled(self.config is not None and (Path(self.config['output'])/'report.html').exists())
@@ -569,7 +584,9 @@ class MainWindow(QMainWindow):
         self.read_stdout()
         self.read_stderr()
         self.set_running(False)
-        if code == 130:
+        if self.input_rejected:
+            self.phase.setText(tr('input_rejected'))
+        elif code == 130:
             self.phase.setText(tr('state_cancelled'))
         elif code != 0 or not self.finished_ok:
             self.phase.setText(tr('run_failed'))

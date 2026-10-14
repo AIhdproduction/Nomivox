@@ -9,34 +9,42 @@ from pye57 import libe57 as lib
 
 from e57cls.files import file_hash
 from e57cls.pipeline.config import resolve_config
-from e57cls.pipeline.run import execute
+from e57cls.pipeline.run import execute, InputNotClassifiable
 from e57cls.pipeline.control import Cancelled
 
 
-def small_project(path):
+def small_project(path, image_problem=None):
     writer = pye57.E57(str(path), 'w')
     # A wall straight ahead, with modest angular separation between points.
     y, z = np.meshgrid(np.linspace(-1, 1, 11), np.linspace(-1, 1, 11))
     writer.write_scan_raw({'cartesianX': np.full(y.size, 3.), 'cartesianY': y.ravel(),
                           'cartesianZ': z.ravel()}, name='synthetic')
+    if image_problem == 'no_images':
+        writer.close()
+        return
     imf = writer.image_file
     images = writer.root['images2D']
     node = lib.StructureNode(imf)
     images.append(node)
     node.set('guid', lib.StringNode(imf, 'synthetic-image'))
-    node.set('associatedData3DGuid', lib.StringNode(imf, writer.data3d[0]['guid'].value()))
+    guid = 'unknown-scan' if image_problem == 'unassociated' else writer.data3d[0]['guid'].value()
+    node.set('associatedData3DGuid', lib.StringNode(imf, guid))
     pose = lib.StructureNode(imf)
     node.set('pose', pose)
     for group, values in [('rotation', dict(w=1., x=0., y=0., z=0.)), ('translation', dict(x=0., y=0., z=0.))]:
         child = lib.StructureNode(imf)
         pose.set(group, child)
         for key, value in values.items():
+            if image_problem == 'invalid_pose' and key == 'w':
+                value = 2.
             child.set(key, lib.FloatNode(imf, value))
     rep = lib.StructureNode(imf)
-    node.set('sphericalRepresentation', rep)
+    node.set('visualReferenceRepresentation' if image_problem == 'reference_only' else 'sphericalRepresentation', rep)
     for key, value in dict(imageWidth=256, imageHeight=128).items():
         rep.set(key, lib.IntegerNode(imf, value))
     for key in ('pixelWidth', 'pixelHeight'):
+        if image_problem == 'missing_parameters' and key == 'pixelHeight':
+            continue
         rep.set(key, lib.FloatNode(imf, np.pi/128))
     stream = io.BytesIO()
     Image.new('RGB', (256, 128), (130, 140, 150)).save(stream, format='PNG')
@@ -53,6 +61,30 @@ class Backend:
     def predict_tile(self, image, classes):
         self.calls += 1
         return np.full((len(classes), image.height, image.width), .9, np.float32)
+
+
+@pytest.mark.parametrize('problem', ['no_images', 'unassociated', 'invalid_pose', 'reference_only', 'missing_parameters'])
+def test_unusable_input_stops_before_point_store_and_sam(tmp_path, monkeypatch, problem):
+    source = tmp_path/'invalid.e57'
+    small_project(source, problem)
+    before = file_hash(source)
+    config = dict(source=str(source), output=str(tmp_path/'out'), cache=str(tmp_path/'cache'))
+    def forbidden(*args, **kwargs):
+        pytest.fail('Rejected input must not build the point store, hash the model or load SAM')
+    monkeypatch.setattr('e57cls.pipeline.run.build_store', forbidden)
+    monkeypatch.setattr('e57cls.pipeline.run.file_hash', forbidden)
+    with pytest.raises(InputNotClassifiable, match='vor der Punktverarbeitung abgebrochen'):
+        execute(config, forbidden, listen=False)
+    output = Path(config['output'])
+    report = json.loads((output/'inspect_report.json').read_text(encoding='utf-8'))
+    assert not report['scans'][0]['classification_eligible_metadata']
+    events = [json.loads(line) for line in (output/'events.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert events[-1]['code'] == 'input_rejected'
+    assert ('keine eingebetteten Kamerabilder' if problem == 'no_images' else 'enthält Bilder') in events[-1]['detail']
+    assert [e['phase'] for e in events if e['event'] == 'phase_started'] == ['inspection']
+    assert not (Path(config['cache'])/'scan_store').exists()
+    assert not list(output.glob('*.las'))
+    assert file_hash(source) == before
 
 
 @pytest.mark.parametrize('state,expected',[(4,100),(2,68)])

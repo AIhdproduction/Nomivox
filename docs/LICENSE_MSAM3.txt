@@ -1,0 +1,153 @@
+AIhdproduction Education and Research License 1.0
+Effective date: 2026-10-09
+
+Copyright (c) 2026 AIhdproduction. All rights reserved except as expressly
+granted below.
+
+1. Scope and ownership
+
+This license applies to the original code, scripts, configuration and
+documentation of the Metashape SAM 3 Point Cloud Classifier (the "Software")
+made available by AIhdproduction (the "Licensor"), except material identified
+as being under separate terms.
+
+The Licensor retains its copyright and other intellectual property rights
+in the Software. This license grants permission to use the Software; it
+does not transfer ownership. It does not claim ownership of third-party
+software, models, methods, user data or user-created results. Contributors
+retain ownership of their original contributions unless separately agreed.
+No right to use the Licensor's names or marks to imply endorsement is granted.
+
+2. Free permission for noncommercial education and research
+
+Subject to this license, the Licensor grants you a worldwide, nonexclusive,
+royalty-free license to access, run, copy, study and modify the Software
+solely for noncommercial education and noncommercial research. No individual
+request, registration or license fee is required for these permitted uses.
+
+Permitted uses include school and university teaching, coursework, student
+projects, theses, academic research and independent noncommercial research.
+Ordinary tuition, salaries, scholarships and general research grants do not
+by themselves make these activities commercial. Publishing academic papers
+through publishers that charge fees does not by itself make the underlying
+research commercial.
+
+The purpose and circumstances of the activity determine eligibility, not
+merely the user's status as a student, school, university or nonprofit.
+Commercial activities described in section 3 are not covered by this grant.
+
+3. Commercial and other uses require prior written permission
+
+You must obtain the Licensor's express written permission before using the
+Software for a commercial purpose, including:
+
+- paid client work, consulting, surveying or data-processing services;
+- internal business operations or commercial research and development;
+- developing, incorporating into, or operating a commercial product,
+  hosted service, API or software-as-a-service offering;
+- generating results for sale, paid delivery or commercial exploitation;
+- commissioned research or work intended to develop a commercial product
+  or provide a business with a specific commercial deliverable, even if
+  performed by a school, university or nonprofit.
+
+Any use outside section 2 also requires prior written permission. A
+commercial license may be free or paid and may include separately agreed
+conditions. Submitting a request, receiving no reply, or having public
+access to the repository does not constitute permission. A separate written
+agreement takes precedence only to the extent expressly stated in it.
+
+Request permission from AIhdproduction through the project's issue tracker:
+https://github.com/AIhdproduction/metashape-sam3-classifier/issues
+State the intended use and the person or organization requesting permission.
+Do not post confidential project or client information in a public issue.
+
+4. Copies, modifications and redistribution
+
+You may share original or modified copies without charge for the purposes
+permitted by section 2, including through a public source-code repository,
+provided that you:
+
+- include this complete license, the copyright notice and the applicable
+  THIRD_PARTY_NOTICES.md with every copy or distribution;
+- clearly identify modifications and do not present them as the Licensor's
+  original release;
+- retain this license for the Licensor's material and do not grant recipients
+  broader rights to that material than this license permits; and
+- inform recipients that commercial and other uses outside section 2 require
+  separate written permission from the Licensor.
+
+Recipients receive their permission to use the Licensor's material directly
+under this license. You may not sell, commercially sublicense or relicense
+that material without the Licensor's prior written permission. Your changes
+do not remove the restrictions on the underlying Software.
+
+5. Input data and generated results
+
+You retain any rights you hold in your input data and generated results,
+including classified LAS/LAZ point clouds, masks, labels, legends, reports,
+diagnostic images and other exported files.
+The Licensor acquires no ownership of those materials merely because you use
+the Software. This statement does not create intellectual property rights
+where none exist or remove rights held by other parties.
+
+The Software license does not automatically become the copyright license
+of a generated result. You may publish and share results of permitted
+noncommercial education and research, including in papers, theses and
+research datasets, subject to rights in the input data and applicable
+third-party terms. Merely sharing such results does not require distributing
+the Software or model weights.
+
+As a condition of the permission granted here, your generation of results
+for a commercial purpose and your subsequent commercial exploitation of
+results generated under this license require prior written permission from
+the Licensor. This is a condition on your licensed use, not a claim of
+ownership over results or a separate license imposed on every recipient
+of a result.
+
+When publishing research or educational results produced with the Software,
+acknowledge "Metashape SAM 3 Point Cloud Classifier, AIhdproduction" and link
+to https://github.com/AIhdproduction/metashape-sam3-classifier where practical.
+Third-party acknowledgments, including those required by Meta, also apply.
+
+6. Third-party components
+
+This license covers only rights the Licensor is entitled to grant. SAM 3,
+Agisoft Metashape and other dependencies remain subject to their own licenses.
+This license neither replaces nor relaxes those terms,
+and permission from the Licensor does not grant permission on behalf of
+their respective owners. Restrictions here do not relicense third-party
+components.
+
+SAM 3 code and model weights are subject to Meta's SAM License. Neither is
+included in this repository. The installer (install.bat) downloads the SAM 3
+code and the other dependencies from their upstream sources; users obtain
+the model weights separately and must accept and comply with the applicable
+Meta terms. See THIRD_PARTY_NOTICES.md for the pinned upstream license,
+the dependency licenses and the model access link.
+
+7. No warranty; limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+"AS IS", WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+NO ACCURACY OF CLASSIFICATION RESULTS OR FITNESS FOR SURVEYING OR OTHER
+PROFESSIONAL DECISIONS IS GUARANTEED. YOU ARE RESPONSIBLE FOR CHECKING RESULTS.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR AND CONTRIBUTORS
+ARE NOT LIABLE FOR CLAIMS, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE
+OR ITS USE. THESE EXCLUSIONS DO NOT APPLY TO LIABILITY OR RIGHTS THAT CANNOT
+LAWFULLY BE EXCLUDED OR LIMITED. NO SUPPORT OR MAINTENANCE IS PROMISED.
+
+8. Termination and reserved rights
+
+Your permissions under this license terminate if you breach its conditions.
+You must then stop using and distributing the Software unless the Licensor
+reinstates your permission in writing. Ownership, third-party rights, the
+disclaimers and any obligations arising before termination remain unaffected.
+Compliant recipients of previously distributed copies retain their own rights
+under this license. Mandatory statutory rights remain unaffected.
+
+All permissions not expressly granted are reserved. This is a custom
+source-available license with purpose restrictions, not an open-source license.
+The English text in this LICENSE file is authoritative; summaries and
+translations are explanatory only.

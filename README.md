@@ -61,7 +61,10 @@ does not perform registration or automatically correct inaccurate camera poses.
    does not make them compatible with SAM 3.
 6. Run **`install.bat`** again to check that setup is ready, then double-click
    **[`start_classifier.bat`](start_classifier.bat)** to open the application.
-7. Select an E57 file. **Classification starts automatically after selection.**
+7. Select an E57 file. **Images and camera metadata are checked first.** If no scan
+   has usable associated images and camera data, a warning explains what is missing
+   and the run stops before point-cache creation or SAM loading. Point RGB colors
+   alone are insufficient. Otherwise, classification starts automatically.
 
 The installer uses [scripts/install.ps1](scripts/install.ps1) and saves its log to
 `.cache/install.log`. It can install packages before the model is available and

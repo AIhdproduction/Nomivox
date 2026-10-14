@@ -4,7 +4,7 @@ import time
 import pytest
 from pathlib import Path
 from PySide6.QtCore import QProcess,QCoreApplication,QEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication,QMessageBox
 from e57cls.gui.window import MainWindow,tr
 
 
@@ -13,6 +13,34 @@ def qt_application():
     app = QApplication.instance() or QApplication([])
     yield app
     QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_rejected_input_shows_warning_and_scan_counts(tmp_path, qt_application, monkeypatch):
+    report = dict(scan_count=1, image_count=0, record_count=123, images=[], metadata={},
+                  scans=[dict(metadata={'name':'without images'}, record_count=123,
+                              image_indices=[], pose_status='valid', classification_eligible_metadata=False)])
+    (tmp_path/'inspect_report.json').write_text(json.dumps(report), encoding='utf-8')
+    window = MainWindow(tmp_path/'input.e57', auto_start=False)
+    window.config = {'output':str(tmp_path)}
+    messages = []
+    monkeypatch.setattr(QMessageBox, 'open', lambda box: messages.append(box.text()))
+    try:
+        detail = tr('input_no_images')
+        window.handle_event(dict(event='error', code='input_rejected', detail=detail))
+        window.worker_finished(1,QProcess.ExitStatus.NormalExit)
+        assert messages == [detail]
+        assert window.phase.text() == tr('input_rejected')
+        assert window.result_label.text() == detail
+        assert window.scan_table.item(0,2).text() == '123'
+        assert window.scan_table.item(0,3).text() == '0'
+        assert window.scan_table.item(0,7).text() == tr('not_classifiable')
+        assert "'points'" not in window.log.toPlainText()
+        assert not window.resume_button.isEnabled()
+        assert window.select_button.isEnabled()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 
 def test_reflection_eta_uses_parent_phase_and_never_shows_zero(qt_application):

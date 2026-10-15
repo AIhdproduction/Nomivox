@@ -23,7 +23,7 @@ class PromptClass:
 
 
 class SAM3Backend:
-    def __init__(self, checkpoint: Path, device: str = "cuda:0", batch: int = 8,
+    def __init__(self, checkpoint: Path, device: str = "cuda:0", batch: int | str = "auto",
                  memory_fraction: float = .85):
         import torch
         from sam3.model_builder import build_sam3_image_model
@@ -32,12 +32,15 @@ class SAM3Backend:
             raise FileNotFoundError(f"SAM 3 checkpoint missing: {checkpoint}")
         if not torch.cuda.is_available() or not device.startswith("cuda"):
             raise RuntimeError("SAM 3 requires a CUDA GPU")
-        if not 0 < memory_fraction <= 1 or batch < 1:
+        if not 0 < memory_fraction <= 1 or (batch != 'auto' and (not isinstance(batch, int) or batch < 1)):
             raise ValueError("Invalid GPU memory fraction or prompt batch")
         self.torch = torch
         self.device = torch.device(device)
         torch.cuda.set_per_process_memory_fraction(memory_fraction, self.device)
-        self.batch = batch
+        self.auto_batch = batch == 'auto'
+        self.batch = 1 if self.auto_batch else batch
+        self.max_auto_batch = 64
+        self.memory_fraction = memory_fraction
         self.calls = 0
         self.reductions = []
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -81,9 +84,48 @@ class SAM3Backend:
                 self.reductions.append({"kind": "prompt_batch", "before": old, "after": self.batch})
                 LOG.warning("CUDA OOM: reducing prompt batch from %d to %d", old, self.batch)
 
-    def _predict(self, image, classes):
+    def _grounding(self, state, start, end):
         from sam3.model.data_misc import FindStage
         torch = self.torch
+        find = FindStage(img_ids=torch.zeros(end-start, dtype=torch.long, device=self.device),
+                         text_ids=torch.arange(start, end, device=self.device),
+                         input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
+                         input_points=None, input_points_mask=None)
+        self.calls += 1
+        outputs = self.model.forward_grounding(backbone_out=state["backbone_out"], find_input=find,
+                                               geometric_prompt=self.model._get_dummy_prompt(num_prompts=end-start), find_target=None)
+        required = ("semantic_seg", "pred_masks", "pred_logits", "presence_logit_dec")
+        if any(key not in outputs or outputs[key].shape[0] != end-start for key in required):
+            raise RuntimeError("Unexpected SAM 3 batched grounding contract")
+        return outputs
+
+    def _choose_auto_batch(self, state, prompt_count):
+        """Calibrate once on the actual tile, retaining the configured VRAM reserve."""
+        gc.collect()
+        self.torch.cuda.empty_cache()
+        low, high, best = 1, min(prompt_count, self.max_auto_batch), 1
+        while low <= high:
+            candidate = (low+high)//2
+            try:
+                outputs = self._grounding(state, 0, candidate)
+                del outputs
+                self.torch.cuda.synchronize(self.device)
+                self.torch.cuda.empty_cache()
+                best, low = candidate, candidate+1
+            except self.torch.cuda.OutOfMemoryError:
+                gc.collect()
+                self.torch.cuda.empty_cache()
+                high = candidate-1
+        self.batch = best
+        self.auto_batch = False
+        self.reductions.append({"kind": "auto_prompt_batch", "selected": best,
+                                "memory_fraction": self.memory_fraction})
+        LOG.info("Auto-selected prompt batch %d with %.0f%% GPU memory budget", best,
+                 self.memory_fraction*100)
+
+    def _predict(self, image, classes):
+        torch = self.torch
+        required = ("semantic_seg", "pred_masks", "pred_logits", "presence_logit_dec")
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=self.dtype):
             state = self.processor.set_image(image)
             result = np.zeros((len(classes), image.height, image.width), np.float32)
@@ -93,18 +135,11 @@ class SAM3Backend:
                 self._text_features = self.model.backbone.forward_text(list(prompts), device=str(self.device))
                 self._text_key = prompts
             state["backbone_out"].update(self._text_features)
+            if self.auto_batch:
+                self._choose_auto_batch(state, len(prompts))
             for start in range(0, len(prompts), self.batch):
                 end = min(len(prompts), start+self.batch)
-                find = FindStage(img_ids=torch.zeros(end-start, dtype=torch.long, device=self.device),
-                                 text_ids=torch.arange(start, end, device=self.device),
-                                 input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
-                                 input_points=None, input_points_mask=None)
-                self.calls += 1
-                outputs = self.model.forward_grounding(backbone_out=state["backbone_out"], find_input=find,
-                                                       geometric_prompt=self.model._get_dummy_prompt(num_prompts=end-start), find_target=None)
-                required = ("semantic_seg", "pred_masks", "pred_logits", "presence_logit_dec")
-                if any(k not in outputs or outputs[k].shape[0] != end-start for k in required):
-                    raise RuntimeError("Unexpected SAM 3 batched grounding contract")
+                outputs = self._grounding(state, start, end)
                 for offset, index in enumerate(indices[start:end]):
                     single = {k: outputs[k][offset:offset+1] for k in required}
                     probability = self._probabilities(single, (image.height, image.width), classes[index].instance_threshold)

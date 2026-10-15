@@ -43,7 +43,7 @@ def test_rejected_input_shows_warning_and_scan_counts(tmp_path, qt_application, 
         QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 
-def test_reflection_eta_uses_parent_phase_and_never_shows_zero(qt_application):
+def test_reflection_eta_uses_parent_phase_and_measured_segmentation_rate(qt_application):
     app = qt_application
     window = MainWindow(Path('test.e57'),auto_start=False)
     try:
@@ -57,15 +57,18 @@ def test_reflection_eta_uses_parent_phase_and_never_shows_zero(qt_application):
         window.update_clock()
         assert window.phase_key == 'mirror'
         assert tr('remaining',duration='7 min') in window.bottom.text()
-        assert tr('total_remaining',duration='43 min') in window.bottom.text()
+        assert tr('total_estimate_pending') in window.bottom.text()
         window.handle_event(dict(event='progress',phase='mirror_masks',fraction=.7,image=7,image_count=10))
         window.update_clock()
         assert tr('remaining',duration='5 min') in window.bottom.text()
-        assert tr('total_remaining',duration='36 min') in window.bottom.text()
-        window.handle_event(dict(event='phase_started',phase='segmentation',elapsed_seconds=600))
+        assert tr('total_estimate_pending') in window.bottom.text()
+        window.handle_event(dict(event='phase_started',phase='segmentation',elapsed_seconds=400))
+        window.handle_event(dict(event='phase_started',phase='scene',elapsed_seconds=500,scan=2))
+        window.handle_event(dict(event='progress',phase='segmentation',fraction=.5,scan=2,scan_count=4))
         window.update_clock()
-        assert tr('estimate_pending') in window.bottom.text()
-        assert tr('total_remaining',duration='36 min') in window.bottom.text()
+        assert window.estimate_phase == 'segmentation'
+        assert tr('remaining',duration='4 min') in window.bottom.text()
+        assert tr('total_remaining',duration='6 min') in window.bottom.text()
     finally:
         window.close()
         window.deleteLater()

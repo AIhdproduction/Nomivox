@@ -48,6 +48,11 @@ class MainWindow(QMainWindow):
         self.phase_starts = {}
         self.phase_key = ''
         self.phase_fraction = 0.
+        # A ``scene`` is a sub-step of segmentation.  Keep its display state
+        # separate from the root phase used for time estimation, otherwise each
+        # scene event resets the stopwatch and makes the estimate far too low.
+        self.estimate_phase = ''
+        self.estimate_fraction = 0.
         self.setWindowTitle(tr('app_title'))
         self.resize(1180,800)
         root = QWidget()
@@ -71,8 +76,10 @@ class MainWindow(QMainWindow):
         self.timer.start(1000)
         self.load_table()
         self.set_running(False)
+        # Opening a file must never immediately consume GPU time.  The first
+        # page makes the user choose the intended workflow and classes first.
         if auto_start:
-            QTimer.singleShot(100,self.start_run)
+            self.bottom.setText(tr('setup_required'))
 
     def tab(self,title):
         widget = QWidget()
@@ -88,6 +95,15 @@ class MainWindow(QMainWindow):
 
     def input_tab(self):
         _,layout = self.tab('tab_input')
+        mode_form = QFormLayout()
+        self.processing_mode = QComboBox()
+        self.processing_mode.addItem(tr('mode_classify_and_filter'),'classify_and_filter')
+        self.processing_mode.addItem(tr('mode_filter_only'),'filter_only')
+        mode_form.addRow(tr('processing_mode'),self.processing_mode)
+        self.mode_hint = QLabel(tr('mode_classify_and_filter_hint'))
+        self.mode_hint.setWordWrap(True)
+        mode_form.addRow('',self.mode_hint)
+        layout.addLayout(mode_form)
         self.input_path = QLineEdit(str(self.source))
         self.input_path.setReadOnly(True)
         layout.addWidget(self.input_path)
@@ -141,6 +157,11 @@ class MainWindow(QMainWindow):
         hint = QLabel(tr('mirror_limits')+' '+tr('mirror_preservation'))
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        prompts_hint = QLabel(tr('prompts_hint'))
+        prompts_hint.setWordWrap(True)
+        layout.addWidget(prompts_hint)
+        self.processing_mode.currentIndexChanged.connect(self.update_processing_mode)
+        self.update_processing_mode()
 
     def settings_tab(self):
         self.settings_widget,layout = self.tab('tab_settings')
@@ -158,9 +179,14 @@ class MainWindow(QMainWindow):
         self.controls = {}
         specifications = {
             'image_scale':(.1,1.,.05),'tile_overlap':(0.,.8,.05),'min_observations':(1,100,1),
-            'voxel_size':(.001,1.,.005),'tile_size':(336,1512,16),'prompt_batch':(1,64,1),
+            'voxel_size':(.001,1.,.005),'tile_size':(336,1512,16),
             'instance_confidence':(0.,1.,.05),'mask_confidence':(0.,1.,.05),'boundary_margin':(0,16,1),
             'min_winning_share':(0.,1.,.05),'view_size':(64,1512,16),'view_fov':(30,120,5),
+            'component_min_voxels':(1,1000,1),'cable_component_min_voxels':(1,1000,1),
+            'cable_component_min_span':(.01,10.,.01),'electrical_component_min_voxels':(1,1000,1),
+            'electrical_component_min_span':(.01,10.,.01),'class_transfer_radius':(.001,.1,.001),
+            'vegetation_ground_cell_size':(.02,2.,.01),'vegetation_ground_band':(.005,.5,.005),
+            'building_boundary_cell_size':(.05,2.,.05),'building_boundary_min_height':(.1,10.,.1),
             'visibility_abs':(.001,.5,.01),'visibility_rel':(0.,.1,.005),'depth_width':(256,8192,256),
             'gpu_memory_fraction':(.1,1.,.05),'scene_sky_outdoor':(0.,1.,.01),
             'scene_ceiling_outdoor_max':(0.,1.,.01),'scene_ceiling_indoor':(0.,1.,.01),
@@ -173,8 +199,9 @@ class MainWindow(QMainWindow):
             'mirror_mask_confidence':(0.,1.,.05),'mirror_fit_tolerance':(.001,.1,.005),
             'mirror_plane_tolerance':(.001,.2,.005),'reflection_prompt_agreement':(1,8,1),
             'mirror_merge_angle':(.1,10.,.5),'mirror_merge_distance':(.001,.1,.005),
+            'mirror_image_scale':(.1,1.,.05),'mirror_view_size':(336,1512,16),
             'mirror_max_range':(1.,100.,1.),'mirror_min_pixels':(10,10000,10),'mirror_mask_width':(512,4096,128),
-            'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1)}
+            'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1),'reflection_neighbor_radius':(.01,.5,.01)}
         for key,(low,high,step) in specifications.items():
             widget = QSpinBox() if isinstance(low,int) else QDoubleSpinBox()
             if isinstance(widget,QDoubleSpinBox):
@@ -184,6 +211,11 @@ class MainWindow(QMainWindow):
             widget.setValue(DEFAULTS[key])
             self.controls[key] = widget
             form.addRow(tr('setting_'+key),widget)
+        self.prompt_batch = QComboBox()
+        self.prompt_batch.addItem(tr('prompt_batch_auto'), 'auto')
+        for value in (1, 2, 4, 8, 12, 16, 24, 32, 48, 64):
+            self.prompt_batch.addItem(str(value), value)
+        form.addRow(tr('setting_prompt_batch'),self.prompt_batch)
         self.profile.currentIndexChanged.connect(self.apply_profile)
         self.output_format = QComboBox()
         for key in ('las','laz'):
@@ -203,6 +235,15 @@ class MainWindow(QMainWindow):
         self.stairs_priority = QCheckBox(tr('stairs_priority'))
         self.stairs_priority.setChecked(DEFAULTS['stairs_priority'])
         form.addRow(self.stairs_priority)
+        self.component_cleanup = QCheckBox(tr('component_cleanup'))
+        self.component_cleanup.setChecked(DEFAULTS['component_cleanup'])
+        form.addRow(self.component_cleanup)
+        self.vegetation_base_to_ground = QCheckBox(tr('vegetation_base_to_ground'))
+        self.vegetation_base_to_ground.setChecked(DEFAULTS['vegetation_base_to_ground'])
+        form.addRow(self.vegetation_base_to_ground)
+        self.building_enclosure = QCheckBox(tr('building_enclosure'))
+        self.building_enclosure.setChecked(DEFAULTS['building_enclosure'])
+        form.addRow(self.building_enclosure)
 
     def run_tab(self):
         _,layout = self.tab('tab_run')
@@ -238,12 +279,19 @@ class MainWindow(QMainWindow):
         self.watching = True
         self.watch_offset = 0
         self.preset = json.loads(Path(self.config['preset']).read_text(encoding='utf-8'))
+        processing_mode = self.config.get('processing_mode','classify_and_filter')
+        self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))
         self.load_table()
         for key,widget in self.controls.items():
             widget.setValue(self.config.get(key,DEFAULTS[key]))
+        saved_batch = self.config.get('prompt_batch',DEFAULTS['prompt_batch'])
+        self.prompt_batch.setCurrentIndex(max(0,self.prompt_batch.findData(saved_batch)))
         self.mirror.setChecked(self.config.get('mirror_analysis',False))
         self.glass.setChecked(self.config.get('glass_analysis',False))
         self.stairs_priority.setChecked(self.config.get('stairs_priority',False))
+        self.component_cleanup.setChecked(self.config.get('component_cleanup',DEFAULTS['component_cleanup']))
+        self.vegetation_base_to_ground.setChecked(self.config.get('vegetation_base_to_ground',DEFAULTS['vegetation_base_to_ground']))
+        self.building_enclosure.setChecked(self.config.get('building_enclosure',DEFAULTS['building_enclosure']))
         self.scene_mode.setCurrentIndex(self.scene_mode.findData(self.config['scene_mode']))
         self.read_inspection()
         self.set_running(True)
@@ -327,7 +375,7 @@ class MainWindow(QMainWindow):
         self.validate()
 
     def validate(self):
-        errors,warnings = validate_preset(self.preset)
+        errors,warnings = validate_preset(self.preset, require_active_classes=self.processing_mode.currentData() == 'classify_and_filter')
         messages = [tr('validation_'+e.split(':')[0])+(': '+e.split(':',1)[1] if ':' in e else '') for e in errors+warnings]
         self.validation.setText('\n'.join(messages) if messages else tr('preset_valid'))
         if hasattr(self,'start_button'):
@@ -335,10 +383,35 @@ class MainWindow(QMainWindow):
         return not errors
 
     def add_class(self):
-        code = next((c for c in range(64,256) if c not in {x['code'] for x in self.preset['classes']}|{68}),64)
-        self.preset['classes'].append(dict(id='class_'+uuid4().hex[:6],name_de=tr('new_class'),name_en='New class',code=code,
-            color='#888888',scene='both',enabled=False,prompts=['object'],min_instance_conf=None,min_mask_conf=None))
+        name,ok = QInputDialog.getText(self,tr('add_class'),tr('class_name'))
+        if not ok or not name.strip():
+            return
+        used = {item['code'] for item in self.preset['classes']}
+        suggested = next((code for code in range(23,61) if code not in used),23)
+        code,ok = QInputDialog.getInt(self,tr('add_class'),tr('class_code'),suggested,23,60)
+        if not ok:
+            return
+        if code in used:
+            QMessageBox.warning(self,tr('app_title'),tr('class_code_taken',code=code))
+            return
+        normalized = ''.join(char if char.isalnum() else '_' for char in name.lower()).strip('_')
+        ident = (normalized or 'class')+'_'+uuid4().hex[:6]
+        self.preset['classes'].append(dict(id=ident,name_de=name.strip(),name_en=name.strip(),code=code,
+            color='#888888',scene='both',enabled=True,prompts=['object'],min_instance_conf=None,min_mask_conf=None))
         self.load_table()
+
+    def update_processing_mode(self):
+        filter_only = self.processing_mode.currentData() == 'filter_only'
+        self.mode_hint.setText(tr('mode_filter_only_hint') if filter_only else tr('mode_classify_and_filter_hint'))
+        if hasattr(self,'class_widget'):
+            self.class_widget.setEnabled(not filter_only and self.process.state() == QProcess.ProcessState.NotRunning)
+            self.mirror.setChecked(True if filter_only else self.mirror.isChecked())
+            self.mirror.setEnabled(not filter_only)
+            self.glass.setChecked(True if filter_only else self.glass.isChecked())
+            self.glass.setEnabled(not filter_only)
+            self.extra.setEnabled(not filter_only)
+        if hasattr(self,'start_button'):
+            self.validate()
 
     def remove_class(self):
         row = self.class_table.currentRow()
@@ -375,7 +448,7 @@ class MainWindow(QMainWindow):
         self.load_table()
 
     def apply_profile(self):
-        scale,overlap,observations = {'fast':(.5,.1,1),'balanced':(.75,.2,1),'high':(1.,.3,2)}[self.profile.currentData()]
+        scale,overlap,observations = {'fast':(.6,.2,1),'balanced':(.9,.3,1),'high':(1.,.35,1)}[self.profile.currentData()]
         for key,value in [('image_scale',scale),('tile_overlap',overlap),('min_observations',observations)]:
             self.controls[key].setValue(value)
 
@@ -386,7 +459,7 @@ class MainWindow(QMainWindow):
             self.input_path.setText(path)
             self.config = None
             self.overrides = {}
-            self.start_run()
+            self.bottom.setText(tr('setup_required'))
 
     def override_scene(self,row,column):
         if column != 6 or self.process.state() != QProcess.ProcessState.NotRunning:
@@ -403,9 +476,13 @@ class MainWindow(QMainWindow):
             return
         try:
             settings = {key:widget.value() for key,widget in self.controls.items()}
-            settings.update(source=str(self.source),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
+            settings['prompt_batch'] = self.prompt_batch.currentData()
+            settings.update(source=str(self.source),processing_mode=self.processing_mode.currentData(),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
                 mirror_analysis=self.mirror.isChecked(),glass_analysis=self.glass.isChecked(),
-                stairs_priority=self.stairs_priority.isChecked(),extra_no_reflection=self.extra.isChecked(),format=self.output_format.currentData(),
+                stairs_priority=self.stairs_priority.isChecked(),component_cleanup=self.component_cleanup.isChecked(),
+                vegetation_base_to_ground=self.vegetation_base_to_ground.isChecked(),
+                building_enclosure=self.building_enclosure.isChecked(),
+                extra_no_reflection=self.extra.isChecked(),format=self.output_format.currentData(),
                 diagnostics=self.diagnostics.currentData(),cache=self.cache_path.text(),gpu_device=self.gpu.text(),strict=self.strict.isChecked(),
                 scene_overrides=self.overrides)
             self.config = resolve_config(settings)
@@ -431,6 +508,8 @@ class MainWindow(QMainWindow):
         self.phase_starts = {}
         self.phase_fraction = 0.
         self.phase_key = ''
+        self.estimate_phase = ''
+        self.estimate_fraction = 0.
         self.finished_ok = False
         self.input_rejected = False
         env = QProcessEnvironment.systemEnvironment()
@@ -476,6 +555,8 @@ class MainWindow(QMainWindow):
                 self.source = Path(config['source'])
                 self.input_path.setText(str(self.source))
                 self.preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
+                processing_mode = config.get('processing_mode','classify_and_filter')
+                self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))
                 self.load_table()
                 self.launch_worker()
             except Exception as error:
@@ -504,8 +585,14 @@ class MainWindow(QMainWindow):
     def handle_event(self,event):
         kind = event['event']
         if kind == 'phase_started':
-            self.phase_starts[event['phase']] = event.get('elapsed_seconds',0)
-            self.phase_fraction = 0.
+            started_phase = event['phase']
+            self.phase_starts[started_phase] = event.get('elapsed_seconds',0)
+            # Only pipeline root phases have a meaningful duration.  Scene
+            # detection is performed once per scan inside segmentation.
+            if started_phase in ('inspection','mirror','segmentation','voting','output'):
+                self.estimate_phase = started_phase
+                self.estimate_fraction = 0.
+                self.phase_fraction = 0.
         if kind in ('phase_started','progress'):
             self.phase_key = event.get('phase','')
             if self.phase_key in ('mirror_masks','mirror_evidence'):
@@ -516,6 +603,10 @@ class MainWindow(QMainWindow):
             self.phase_fraction = fraction
             self.phase_progress.setValue(round(fraction*1000))
             phase = event.get('phase')
+            estimate_phase = 'mirror' if phase in ('mirror_masks','mirror_evidence') else phase
+            if estimate_phase in ('inspection','mirror','segmentation','voting','output'):
+                self.estimate_phase = estimate_phase
+                self.estimate_fraction = fraction
             overall = (.3+.6*fraction if phase == 'segmentation' else .9+.1*fraction if phase == 'output'
                        else .03+.27*fraction if phase in ('mirror_masks','mirror_evidence') else .03*fraction)
             self.current_fraction = max(self.current_fraction,overall)
@@ -577,7 +668,7 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText(str(error))
 
     def set_running(self,running):
-        self.class_widget.setEnabled(not running)
+        self.class_widget.setEnabled(not running and self.processing_mode.currentData() != 'filter_only')
         self.settings_widget.setEnabled(not running)
         self.select_button.setEnabled(not running)
         self.saved_button.setEnabled(not running)
@@ -613,15 +704,32 @@ class MainWindow(QMainWindow):
             return
         elapsed = max(0,int(time.monotonic()-self.started))
         import math
-        beginning = self.phase_starts.get(self.phase_key)
+        # The currently displayed phase can be ``scene`` while the work is
+        # still part of segmentation.  Use the root phase and its last genuine
+        # progress value for both estimates.
+        beginning = self.phase_starts.get(self.estimate_phase)
         phase_elapsed = max(0,elapsed-beginning) if beginning is not None else 0
-        remaining = (max(1,math.ceil(phase_elapsed*(1-self.phase_fraction)/self.phase_fraction/60))
-                     if beginning is not None and phase_elapsed >= 5 and .01 < self.phase_fraction < 1 else None)
-        # Overall progress uses fixed phase weights, so this is a rough extrapolation.
-        total_remaining = (max(1,math.ceil(elapsed*(1-self.current_fraction)/self.current_fraction/60))
-                           if elapsed >= 5 and .01 < self.current_fraction < 1 else None)
-        if total_remaining is not None and remaining is not None:
-            total_remaining = max(total_remaining,remaining)
+        remaining_seconds = (phase_elapsed*(1-self.estimate_fraction)/self.estimate_fraction
+                             if beginning is not None and phase_elapsed >= 5 and .01 < self.estimate_fraction < 1 else None)
+        remaining = max(1,math.ceil(remaining_seconds/60)) if remaining_seconds is not None else None
+
+        if self.estimate_phase == 'segmentation' and remaining_seconds is not None:
+            # Mirror/glass analysis has no fixed relation to SAM segmentation:
+            # a difficult mirror job can take longer than all regular images.
+            # Once real segmentation work has progressed, extrapolate solely
+            # from its measured rate and reserve a small, bounded allowance for
+            # voting and file output.  This is deliberately independent of the
+            # fixed UI progress-bar weights.
+            tail_seconds = max(120, min(900, phase_elapsed * .12))
+            total_remaining = max(1,math.ceil((remaining_seconds+tail_seconds)/60))
+        elif self.estimate_phase == 'output' and remaining is not None:
+            total_remaining = remaining
+        else:
+            # Before segmentation yields its first measurable progress there
+            # is no defensible forecast for the remaining SAM work.  Showing a
+            # made-up number from weighted UI progress is more misleading than
+            # waiting until a rate can be measured.
+            total_remaining = None
         self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+
                             (tr('remaining',duration=format_duration(remaining*60)) if remaining is not None else tr('estimate_pending'))+' · '+
                             (tr('total_remaining',duration=format_duration(total_remaining*60)) if total_remaining is not None else tr('total_estimate_pending')))

@@ -550,8 +550,8 @@
         "electrical wiring",
         "electrical cable"
       ],
-      "min_instance_conf": null,
-      "min_mask_conf": null
+      "min_instance_conf": 0.35,
+      "min_mask_conf": 0.5
     },
     {
       "id": "electrical",
@@ -569,8 +569,8 @@
         "fuse box",
         "electrical outlet"
       ],
-      "min_instance_conf": null,
-      "min_mask_conf": null
+      "min_instance_conf": 0.45,
+      "min_mask_conf": 0.6
     },
     {
       "id": "hvac",
@@ -738,7 +738,12 @@
       "prompts": [
         "mirror",
         "bathroom mirror",
-        "wall mirror"
+        "wall mirror",
+        "full length mirror",
+        "mirrored cabinet",
+        "mirrored door",
+        "glass-fronted cabinet",
+        "oven door glass"
       ],
       "output": false
     },
@@ -748,7 +753,36 @@
       "prompts": [
         "window glass",
         "glass window pane",
-        "windowpane"
+        "windowpane",
+        "glass facade",
+        "glass door",
+        "sliding glass door",
+        "shop window",
+        "glass storefront",
+        "transparent glass panel"
+      ],
+      "output": false
+    },
+    {
+      "id": "reflective_mask",
+      "name_en": "Reflective surface",
+      "prompts": [
+        "reflective surface",
+        "reflection in water",
+        "still water surface",
+        "reflecting pool",
+        "reflective metal panel",
+        "polished metal",
+        "glossy black surface",
+        "reflective glass panel",
+        "reflective insulation",
+        "reflective insulation foil",
+        "foil faced insulation",
+        "radiant barrier foil",
+        "aluminized insulation",
+        "aluminum foil",
+        "aluminium foil",
+        "aluminum foil surface"
       ],
       "output": false
     }

@@ -84,14 +84,18 @@ class DirectIndex:
         self.origin, self.block = np.asarray(origin), block
         self.cache = OrderedDict()
 
-    def add(self, points, scan):
+    def add(self, points, scan, commit=True):
         bins = np.floor((points-self.origin)/self.block).astype(np.int64)
         unique, inverse = np.unique(bins, axis=0, return_inverse=True)
         order = np.argsort(inverse, kind='stable')
         offsets = np.r_[0, np.cumsum(np.bincount(inverse))]
         self.db.executemany('INSERT INTO fragments VALUES(?,?,?,?,?)',
                            ((*map(int,cell), scan, np.ascontiguousarray(points[order[offsets[i]:offsets[i+1]]], dtype='<f8').tobytes()) for i,cell in enumerate(unique)))
-        self.db.commit()
+        # The multiscan reflection check can index millions of temporary points.
+        # Its caller may keep one transaction open; queries on this connection
+        # still see those rows, while avoiding one disk sync per input chunk.
+        if commit:
+            self.db.commit()
 
     def nearby(self, points, radius, exclude_scan=None):
         result = np.zeros(len(points), bool)

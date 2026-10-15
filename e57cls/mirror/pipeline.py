@@ -5,14 +5,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_fill_holes, binary_erosion, label, distance_transform_edt
-from scipy.spatial import ConvexHull, QhullError
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 from e57cls.files import atomic_json, file_hash
 from e57cls.geometry.cameras import Pose, plan_views
 from e57cls.geometry.images import render_view
 from e57cls.geometry.planes import fit_plane
 from e57cls.seg.backend import PromptClass
 from e57cls.seg.cache import segment_view
-from e57cls.mirror.evidence import Plane, Registry
+from e57cls.mirror.evidence import DirectIndex, Plane, Registry
 
 
 @dataclass
@@ -59,7 +59,8 @@ class MirrorAnalysis:
         self.directory.mkdir(parents=True,exist_ok=True)
         self.registry,self.images,self.paths = Registry(),{},{}
         self.report = {'policy':'masked_depth','state_labels':{'0':'outside_or_in_front','1':'on_surface',
-                       '2':'behind_surface_inside_own_mask','3':'unused','4':'mask_without_reliable_plane'},
+                       '2':'behind_surface_inside_own_mask','3':'directly_seen_by_another_scan',
+                       '4':'mask_without_reliable_plane'},
                        'images':[],'scans':{}}
 
     def membership(self,image_index,uv):
@@ -88,6 +89,35 @@ class MirrorAnalysis:
         codes[states == 2] = 68
         return codes,states
 
+    def expand_same_scan_reflections(self, world, states, origin, image_indices, tree, reflected):
+        """Fill only local holes behind the *same* finite reflecting plane.
+
+        A candidate needs a proven class-68 neighbour from its own scan and both
+        rays must pass through one identical fitted plane.  This never transfers
+        reflection evidence between scanner positions or across unrelated planes.
+        """
+        candidates = np.flatnonzero(states == 0)
+        if not len(candidates) or tree is None:
+            return 0
+        distance, nearest = tree.query(world[candidates], distance_upper_bound=self.config['reflection_neighbor_radius'])
+        candidates, nearest = candidates[np.isfinite(distance)], nearest[np.isfinite(distance)]
+        if not len(candidates):
+            return 0
+        accepted = np.zeros(len(candidates), bool)
+        for image_index in image_indices:
+            for surface in self.images.get(image_index, []):
+                for plane in surface.planes.values():
+                    registry = Registry([plane])
+                    _, target = registry.rays(origin, world[candidates], self.config['mirror_plane_tolerance'])
+                    possible = (target == 4) & ~accepted
+                    if not possible.any():
+                        continue
+                    _, source = registry.rays(origin, reflected[nearest[possible]], self.config['mirror_plane_tolerance'])
+                    ids = np.flatnonzero(possible)
+                    accepted[ids[source == 4]] = True
+        states[candidates[accepted]] = 2
+        return int(accepted.sum())
+
     def close(self):
         self.images.clear()
 
@@ -106,14 +136,18 @@ def make_masks(reader,item,config,image_cache,mask_cache,model_hash,factory,cont
     phrases = [PromptClass(f'{cls.id}_{i}',(phrase,),cls.instance_threshold)
                for cls in prompts for i,phrase in enumerate(dict.fromkeys(cls.prompts))]
     probability = np.zeros((len(phrases),height,width),np.float32)
-    views = plan_views(camera,config['profile'],config['view_size'],config['view_fov']) or [None]
+    # Reflections are broad, planar surfaces.  Keep exactly the same view
+    # directions as the normal profile but use a single, smaller SAM tile per
+    # direction.  This is substantially faster while avoiding the coverage gap
+    # caused by switching the whole job to the ``fast`` profile.
+    views = plan_views(camera,config['profile'],config['mirror_view_size'],config['view_fov']) or [None]
     for view_index,view in enumerate(views):
         control.checkpoint()
         rendered,valid = render_view(image,image_mask,camera,view) if view else (image,image_mask>0 if image_mask is not None else np.ones(image.shape[:2],bool))
         info = asdict(view) if view else {'kind':camera.kind,'params':camera.params}
         info.update(mask_sha256=mask_hash,torch_version=version('torch'))
         scores,cached = segment_view(rendered,valid,phrases,factory,mask_cache,image_hash,info,model_hash,
-                                     config['image_scale'],config['tile_size'],config['tile_overlap'],control.checkpoint)
+                                     config['mirror_image_scale'],config['tile_size'],config['tile_overlap'],control.checkpoint)
         sh,sw = scores[0].shape
         size = [view.size,view.size] if view else [camera.width,camera.height]
         for row in range(0,height,32):
@@ -242,11 +276,91 @@ def fit_surfaces(store,camera,pose,mask,config,control,_allow_expand=True):
     return labels,planes,details
 
 
+def protect_direct_multiscan_points(analysis, stores, inspection, config, control):
+    """Keep a candidate if another scan observed it directly.
+
+    Each reflection candidate already has an image mask and a finite fitted
+    plane.  A genuine object behind a window, however, can satisfy those two
+    tests as well.  Build an exact, disk-backed index of points that were *not*
+    marked as reflections in their own scan, then preserve candidates which a
+    different scanner position measured at the same coordinates.  The index is
+    deliberately exact (not voxelized), so the confirmation radius retains its
+    intended geometric meaning.
+    """
+    if len(stores) < 2:
+        return {store.meta['scan_index']: 0 for store in stores}
+    # Avoid constructing a large temporary index in projects where the image /
+    # plane stage did not produce any reflection candidate.
+    if not any(analysis.report['scans'].get(str(store.meta['scan_index']), {}).get('counts', [0, 0, 0])[2]
+               for store in stores):
+        return {store.meta['scan_index']: 0 for store in stores}
+    index_path = analysis.directory/'direct_multiscan.sqlite'
+    index_path.unlink(missing_ok=True)
+    origin_value = config.get('voxel_origin')
+    if origin_value is None:
+        origin_value = Pose.from_dict(stores[0].meta['metadata']['pose']).translation
+    origin = np.asarray(origin_value, np.float64)
+    direct = DirectIndex(index_path, origin)
+    retained = {store.meta['scan_index']: 0 for store in stores}
+    try:
+        # A point already labelled class 68 by its own image/plane evidence is
+        # never used as confirmation for a different scan's candidate.
+        for store in stores:
+            scan = store.meta['scan_index']
+            pose = Pose.from_dict(store.meta['metadata']['pose'])
+            states = np.load(analysis.paths[scan], mmap_mode='r', allow_pickle=False)
+            try:
+                for start,xyz,valid in store.chunks():
+                    control.checkpoint()
+                    local = states[start:start+len(xyz)][valid]
+                    keep = (local == 0) | (local == 1)
+                    if np.any(keep):
+                        direct.add(pose.to_world(xyz[valid][keep]), scan, commit=False)
+            finally:
+                states._mmap.close()
+        # Only a scan other than the source scan can protect a candidate.  A
+        # state of 3 is deliberately not exported as class 68.
+        for store in stores:
+            scan = store.meta['scan_index']
+            pose = Pose.from_dict(store.meta['metadata']['pose'])
+            writable = np.load(analysis.paths[scan], mmap_mode='r+', allow_pickle=False)
+            try:
+                for start,xyz,valid in store.chunks():
+                    control.checkpoint()
+                    block = np.array(writable[start:start+len(xyz)], copy=True)
+                    local = block[valid]
+                    candidates = local == 2
+                    if np.any(candidates):
+                        world = pose.to_world(xyz[valid][candidates])
+                        confirmed = direct.nearby(world, config['mirror_confirmation_radius'], exclude_scan=scan)
+                        positions = np.flatnonzero(candidates)[confirmed]
+                        local[positions] = 3
+                        retained[scan] += len(positions)
+                    block[valid] = local
+                    writable[start:start+len(xyz)] = block
+                writable.flush()
+            finally:
+                writable._mmap.close()
+    finally:
+        direct.close()
+        # It is an exact, temporary disk index.  Keeping it after all states
+        # have been checked only wastes considerable disk space on large jobs.
+        index_path.unlink(missing_ok=True)
+    return retained
+
+
 def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,assets):
     analysis = MirrorAnalysis(work/'mirrors',config)
-    kinds = ['mirror_mask']+(['glass_mask'] if config['glass_analysis'] else [])
+    # Keep the narrow mirror and glass prompts separate from broadly reflective
+    # materials.  Each candidate still needs its own image mask and a confirmed
+    # plane before it can affect a point, which prevents a detected object from
+    # turning unrelated points into reflections.
+    kinds = ['mirror_mask', 'reflective_mask']+(['glass_mask'] if config['glass_analysis'] else [])
     auxiliary = {c['id']:c for c in preset['auxiliary']}
-    fallback = {'glass_mask':['window glass','glass window pane','windowpane']}
+    fallback = {
+        'glass_mask': ['window glass','glass window pane','glass door','glass facade'],
+        'reflective_mask': ['reflective surface','still water surface','polished metal'],
+    }
     prompts = [PromptClass(kind,tuple(auxiliary.get(kind,{}).get('prompts',fallback.get(kind,['mirror']))),config['instance_confidence']) for kind in kinds]
     output = Path(config['output'])/'diagnostics'/'reflections'
     output.mkdir(parents=True,exist_ok=True)
@@ -299,9 +413,58 @@ def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash
             out.flush()
         finally:
             out._mmap.close()
+        # One bounded same-scan expansion repairs sparse holes beside already
+        # proven reflection points.  It is intentionally non-recursive.
+        initial = np.load(temp, mmap_mode='r', allow_pickle=False)
+        reflected = []
+        try:
+            for start,xyz,valid in store.chunks():
+                block = initial[start:start+len(xyz)][valid]
+                if np.any(block == 2):
+                    reflected.append(pose.to_world(xyz[valid][block == 2]))
+            reflected = np.concatenate(reflected) if reflected else np.empty((0,3), np.float64)
+        finally:
+            initial._mmap.close()
+        expanded = 0
+        if len(reflected):
+            tree = cKDTree(reflected)
+            writable = np.load(temp, mmap_mode='r+', allow_pickle=False)
+            try:
+                for start,xyz,valid in store.chunks():
+                    block = np.array(writable[start:start+len(xyz)], copy=True)
+                    local = block[valid]
+                    world = pose.to_world(xyz[valid])
+                    expanded += analysis.expand_same_scan_reflections(world, local, pose.translation,
+                                                                       inspection['scans'][scan-1]['image_indices'], tree, reflected)
+                    block[valid] = local
+                    writable[start:start+len(xyz)] = block
+                writable.flush()
+            finally:
+                writable._mmap.close()
+            counts = np.zeros(5, np.int64)
+            verify = np.load(temp, mmap_mode='r', allow_pickle=False)
+            try:
+                for start in range(0, len(verify), 100000):
+                    counts += np.bincount(verify[start:start+100000], minlength=5)
+            finally:
+                verify._mmap.close()
         temp.replace(path)
         analysis.paths[scan] = path
-        analysis.report['scans'][str(scan)] = {'counts':counts.tolist(),'sha256':file_hash(path)}
+        analysis.report['scans'][str(scan)] = {'counts':counts.tolist(),'same_scan_neighbour_reflections':expanded,'sha256':file_hash(path)}
         control.event('progress',phase='mirror_evidence',scan=scan,scan_count=len(stores),fraction=.9+.1*number/len(stores))
+    retained = protect_direct_multiscan_points(analysis, stores, inspection, config, control)
+    # The direct check changes state 2 to state 3.  Re-count and fingerprint the
+    # final state files so the report describes exactly what will be exported.
+    for store in stores:
+        scan = store.meta['scan_index']
+        states = np.load(analysis.paths[scan], mmap_mode='r', allow_pickle=False)
+        try:
+            counts = np.zeros(5, np.int64)
+            for start in range(0, len(states), 100000):
+                counts += np.bincount(states[start:start+100000], minlength=5)
+        finally:
+            states._mmap.close()
+        analysis.report['scans'][str(scan)].update(
+            counts=counts.tolist(), directly_confirmed_by_other_scans=retained[scan], sha256=file_hash(analysis.paths[scan]))
     atomic_json(Path(config['output'])/'reflection_report.json',analysis.report)
     return analysis

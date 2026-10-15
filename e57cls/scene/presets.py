@@ -5,7 +5,7 @@ from collections import defaultdict
 STANDARD = set(range(1, 23)) - {8, 12}
 
 
-def validate_preset(preset):
+def validate_preset(preset, require_active_classes=True):
     errors, warnings = [], []
     ids, codes, prompts = set(), set(), defaultdict(list)
     if preset.get('schema_version') != 1 or preset.get('unclassified_code') != 1:
@@ -58,6 +58,6 @@ def validate_preset(preset):
         errors.append('missing_special_classes')
     if mapping.get('1', 1) != 1 or mapping.get('68', 68) != 68:
         errors.append('special_codes_cannot_be_remapped')
-    if not any(c.get('enabled', True) for c in entries):
+    if require_active_classes and not any(c.get('enabled', True) for c in entries):
         errors.append('no_active_classes')
     return errors, warnings

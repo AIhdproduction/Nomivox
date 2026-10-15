@@ -35,7 +35,9 @@ def test_low_quality_plane_requires_mirrored_geometry(tmp_path):
     direct = DirectIndex(tmp_path/'d.sqlite',np.zeros(3))
     points = np.array([[-2.,0,0],[-2.,.3,0]])
     assert label_points(registry,direct,[2,0,0],points,1).tolist() == [4,4]
-    direct.add(np.array([[2.,0,0]]),1)
+    # The pipeline keeps its temporary cross-scan index in one transaction;
+    # reads on that connection must still see newly indexed direct points.
+    direct.add(np.array([[2.,0,0]]),1,commit=False)
     assert label_points(registry,direct,[2,0,0],points,1).tolist() == [2,4]
     direct.close()
 

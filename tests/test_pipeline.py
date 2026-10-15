@@ -97,7 +97,8 @@ def test_reflection_export_and_uncertain_mask_semantics(tmp_path,monkeypatch,sta
     model=tmp_path/'model.pt'; model.write_bytes(b'fixture')
     config=resolve_config(dict(source=str(source),cache=str(tmp_path/'cache'),output=str(tmp_path/'output'),
                                preset=str(path),model=str(model),scene_mode='indoor',profile='fast',
-                               view_size=128,boundary_margin=0,depth_width=256,mirror_analysis=True))
+                               view_size=128,boundary_margin=0,depth_width=256,mirror_analysis=True,
+                               component_cleanup=False))
     class Analysis:
         registry=type('Registry',(),{'planes':[]})()
         report={'images':[],'scans':{}}
@@ -128,7 +129,8 @@ def test_full_pipeline_and_voting_only_rerun(tmp_path):
     model.write_bytes(b'synthetic backend')
     config = resolve_config(dict(source=str(source), cache=str(tmp_path/'c'), output=str(tmp_path/'out'),
                                  preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
-                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False))
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False,
+                                 component_cleanup=False))
     backend = Backend()
     report = execute(config, lambda: backend, listen=False)
     assert report['output']['record_count'] == 121

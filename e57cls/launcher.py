@@ -1,4 +1,4 @@
-"""Native E57 selection followed immediately by classification in a Qt worker."""
+"""Native E57 selection followed by an explicit workflow configuration."""
 import json
 from pathlib import Path
 import sys
@@ -25,7 +25,7 @@ def main():
             model = PROJECT/'models/sam3.pt'
         print(json.dumps({'python':sys.version.split()[0],'qt':version('PySide6'),
                           'cuda':torch.cuda.is_available(),'model_path':str(model),
-                          'model_present':model.is_file(),'available_stage':'classification','automatic_start':True}))
+                          'model_present':model.is_file(),'available_stage':'classification','automatic_start':False}))
         return 0
     state_path = PROJECT/'.cache/launcher.json'
     state = {}

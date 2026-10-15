@@ -37,11 +37,36 @@ class InputNotClassifiable(ValueError):
     """Input lacks the image/camera metadata required before expensive processing."""
 
 
-def select_classes(preset, mode):
+class UnclassifiedVotes:
+    """VoteStore-compatible source for reflection-only exports.
+
+    Reflection filtering deliberately does not invent semantic classes.  Points
+    that are retained therefore remain LAS class 1 and the mirror stage can
+    still mark proven virtual points as class 68 before they are removed.
+    """
+    priority_overrides = 0
+
+    @staticmethod
+    def lookup(keys):
+        return np.ones(len(keys), np.uint8), np.zeros(len(keys), np.uint8)
+
+    @staticmethod
+    def close():
+        return None
+
+
+def select_classes(preset, mode, building_enclosure=False):
     if mode == 'unsure':
         mode = 'indoor'
-    return [c for c in preset["classes"] if c.get("enabled", True)
-            and (mode not in ("indoor", "outdoor") or c["scene"] in (mode, "both"))]
+    selected = [c for c in preset["classes"] if c.get("enabled", True)
+                and (mode not in ("indoor", "outdoor") or c["scene"] in (mode, "both"))]
+    if building_enclosure:
+        # Both ground labels and facade evidence must be available from every
+        # scanner position.  The final spatial split happens after voting.
+        selected_ids = {c['id'] for c in selected}
+        selected.extend(c for c in preset['classes'] if c.get('enabled', True)
+                        and c['id'] in {'ground', 'floor', 'building', 'wall'} and c['id'] not in selected_ids)
+    return selected
 
 
 def image_assets(reader, item, cache):
@@ -213,6 +238,9 @@ def execute(config, backend_factory=None, listen=True):
     backend = None
     votes = None
     mirrors = None
+    cleanup_report = None
+    vegetation_report = None
+    building_report = None
     def factory():
         nonlocal backend
         if backend is None:
@@ -241,12 +269,13 @@ def execute(config, backend_factory=None, listen=True):
         if not stores:
             raise ValueError("E57 contains no scans")
         preset = json.loads(Path(config["preset"]).read_text(encoding="utf-8"))
-        errors, preset_warnings = validate_preset(preset)
+        semantic_run = config['processing_mode'] == 'classify_and_filter'
+        errors, preset_warnings = validate_preset(preset, require_active_classes=semantic_run)
         if errors:
             raise ValueError("Invalid preset: "+"; ".join(errors))
         warnings.extend({'code': 'preset_warning', 'detail': w} for w in preset_warnings)
         all_classes = [c for c in preset["classes"] if c.get("enabled", True)]
-        if not all_classes:
+        if semantic_run and not all_classes:
             raise ValueError("No active classes")
         config = {**config, "voxel_origin": [stores[0].meta["metadata"]["pose"]["translation"][k] for k in "xyz"]}
         model_hash = file_hash(Path(config["model"]))
@@ -259,7 +288,7 @@ def execute(config, backend_factory=None, listen=True):
         if previous.exists() and json.loads(previous.read_text(encoding="utf-8")).get("identity") != identity:
             raise ValueError("This output directory belongs to a different run; choose a new folder")
         atomic_json(previous, manifest)
-        rows = legend_rows(preset)
+        rows = legend_rows(preset if semantic_run else {**preset, 'classes': []})
         write_legends(output, rows)
         atomic_json(output/"scan_index.json", {str(s.meta["scan_index"]): {"guid": s.meta["metadata"].get("guid"), "name": s.meta["metadata"].get("name")} for s in stores})
         timings["inspection"] = time.monotonic()-started
@@ -284,77 +313,108 @@ def execute(config, backend_factory=None, listen=True):
                         warnings.append({'code':'reflection_plane_missing','scan':item['scan'],
                                          'image':item['image'],'mask_kind':item['kind']})
                 control.event('phase_finished',phase='mirror')
-            control.event("phase_started", phase="segmentation")
-            seg_start = time.monotonic()
-            for store in stores:
-                control.checkpoint()
-                scan = store.meta["scan_index"]
-                mode = config["scene_overrides"].get(str(scan), config["scene_mode"])
-                classes = select_classes(preset, mode)
-                if votes.completed(scan, identity):
-                    scan_results.append({"scan": scan, "scene": mode, "resumed": True})
-                    continue
-                try:
-                    scene = {'scene': mode, 'manual': True}
-                    if mode == 'both':
-                        control.event('phase_started', phase='scene', scan=scan)
-                        scene = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
-                                       factory, control, preset, image_assets, camera_depth)
-                        mode = scene['scene']
-                        classes = select_classes(preset, mode)
-                        atomic_json(work/f'scene_{scan:04d}.json', scene)
-                        control.event('scene', scan=scan, **scene)
-                        control.event('phase_finished', phase='scene', scan=scan)
-                        if mode in ('unsure', 'mixed'):
-                            warnings.append({'code': 'scene_unsure', 'scan': scan})
-                    if not classes:
-                        raise ValueError('No enabled classes for this scene')
-                    rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,
-                        mask_cache, model_hash, factory, control, classes, all_classes, identity, mirrors)
-                    def batches():
-                        reps = np.load(rep_path, mmap_mode="r", allow_pickle=False)
-                        weights = np.load(weights_path, mmap_mode="r", allow_pickle=False)
-                        try:
-                            for start in range(0, len(reps), 50_000):
-                                control.checkpoint()
-                                yield reps["key"][start:start+50_000], weights[start:start+50_000]
-                        finally:
-                            reps._mmap.close()
-                            weights._mmap.close()
-                    votes.add_scan(scan, identity, batches(), codes)
-                    scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
-                except Cancelled:
-                    raise
-                except Exception as error:
-                    if config["strict"]:
+            if semantic_run:
+                control.event("phase_started", phase="segmentation")
+                seg_start = time.monotonic()
+                for store in stores:
+                    control.checkpoint()
+                    scan = store.meta["scan_index"]
+                    mode = config["scene_overrides"].get(str(scan), config["scene_mode"])
+                    classes = select_classes(preset, mode, config['building_enclosure'])
+                    if votes.completed(scan, identity):
+                        scan_results.append({"scan": scan, "scene": mode, "resumed": True})
+                        continue
+                    try:
+                        scene = {'scene': mode, 'manual': True}
+                        if mode == 'both':
+                            control.event('phase_started', phase='scene', scan=scan)
+                            scene = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
+                                           factory, control, preset, image_assets, camera_depth)
+                            mode = scene['scene']
+                            classes = select_classes(preset, mode, config['building_enclosure'])
+                            atomic_json(work/f'scene_{scan:04d}.json', scene)
+                            control.event('scene', scan=scan, **scene)
+                            control.event('phase_finished', phase='scene', scan=scan)
+                            if mode in ('unsure', 'mixed'):
+                                warnings.append({'code': 'scene_unsure', 'scan': scan})
+                        if not classes:
+                            raise ValueError('No enabled classes for this scene')
+                        rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,
+                            mask_cache, model_hash, factory, control, classes, all_classes, identity, mirrors)
+                        def batches():
+                            reps = np.load(rep_path, mmap_mode="r", allow_pickle=False)
+                            weights = np.load(weights_path, mmap_mode="r", allow_pickle=False)
+                            try:
+                                for start in range(0, len(reps), 50_000):
+                                    control.checkpoint()
+                                    yield reps["key"][start:start+50_000], weights[start:start+50_000]
+                            finally:
+                                reps._mmap.close()
+                                weights._mmap.close()
+                        votes.add_scan(scan, identity, batches(), codes)
+                        scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
+                    except Cancelled:
                         raise
-                    LOG.exception("Scan %d failed; retaining original valid points as class 1", scan)
-                    skipped.append(scan)
-                    warning = {"code": "scan_failed", "scan": scan, "detail": str(error)}
-                    warnings.append(warning)
-                    control.event("warning", **warning)
-                    scan_results.append({"scan": scan, "scene": mode, "error": str(error)})
-        timings["segmentation"] = time.monotonic()-seg_start
-        if len(skipped) == len(stores):
-            raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
-        control.event("phase_finished", phase="segmentation")
-        control.event("phase_started", phase="voting")
-        vote_start = time.monotonic()
-        by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
-        priority = {'code': by_id['stairs'], 'over': [by_id[k] for k in ('floor','ceiling','ground') if k in by_id],
-                    'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
-        votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority)
-        timings["voting"] = time.monotonic()-vote_start
-        control.event("phase_finished", phase="voting")
+                    except Exception as error:
+                        if config["strict"]:
+                            raise
+                        LOG.exception("Scan %d failed; retaining original valid points as class 1", scan)
+                        skipped.append(scan)
+                        warning = {"code": "scan_failed", "scan": scan, "detail": str(error)}
+                        warnings.append(warning)
+                        control.event("warning", **warning)
+                        scan_results.append({"scan": scan, "scene": mode, "error": str(error)})
+                timings["segmentation"] = time.monotonic()-seg_start
+                if len(skipped) == len(stores):
+                    raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
+                control.event("phase_finished", phase="segmentation")
+                control.event("phase_started", phase="voting")
+                vote_start = time.monotonic()
+                by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
+                priority = {'code': by_id['stairs'], 'over': [by_id[k] for k in ('floor','ceiling','ground') if k in by_id],
+                            'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
+                votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority)
+                if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
+                    barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
+                    building_report = votes.split_ground_floor_by_building(
+                        by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
+                        config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                        config['building_boundary_max_cells'], control.checkpoint)
+                if config['component_cleanup']:
+                    cleanup_rules = []
+                    if 'cable' in by_id:
+                        cleanup_rules.append((by_id['cable'], config['cable_component_min_voxels'],
+                                              config['cable_component_min_span']))
+                    if 'electrical' in by_id:
+                        cleanup_rules.append((by_id['electrical'], config['electrical_component_min_voxels'],
+                                              config['electrical_component_min_span']))
+                    cleanup_report = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'],
+                                                                     cleanup_rules, control.checkpoint)
+                if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
+                    vegetation_report = votes.vegetation_bases_to_ground(
+                        by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
+                        config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
+                timings["voting"] = time.monotonic()-vote_start
+                control.event("phase_finished", phase="voting")
+            else:
+                # The mask/plane stage above has already done the only required
+                # SAM work.  Retained points are intentionally unclassified.
+                votes.close()
+                votes = UnclassifiedVotes()
+                scan_results = [{"scan": s.meta["scan_index"], "scene": "filter_only", "mode": "filter_only"} for s in stores]
         control.event("phase_started", phase="output")
         output_start = time.monotonic()
-        path = output/f"{source.stem}_classified.{config['format']}"
+        suffix = 'reflections_filtered' if not semantic_run else 'classified'
+        path = output/f"{source.stem}_{suffix}.{config['format']}"
         if path.exists():
             raise FileExistsError("Completed output exists; choose a new run directory")
         result = write_cloud(path, stores, votes, np.array(config["voxel_origin"]), config["voxel_size"],
                              inspection["metadata"].get("coordinateMetadata", ""), [r["code"] for r in rows], skipped,
                              control.checkpoint, lambda phase,fraction,scan: control.event("progress", phase=phase, fraction=fraction, scan=scan),
-                             mirror=mirrors.output if mirrors else None, no_reflection=config['extra_no_reflection'])
+                             mirror=mirrors.output if mirrors else None,
+                             no_reflection=config['extra_no_reflection'],
+                             primary_without_reflections=not semantic_run,
+                             class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.)
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}
@@ -368,6 +428,8 @@ def execute(config, backend_factory=None, listen=True):
                   "gpu_reductions": backend.reductions if backend else [], "seed": config["seed"],
                   "sampled_peak_rss_bytes": control.peak_rss, "sampled_peak_handles": control.peak_handles,
                   "stairs_priority_overrides": votes.priority_overrides,
+                  "component_cleanup": cleanup_report,
+                  "vegetation_base_to_ground": vegetation_report, "building_enclosure": building_report,
                   "reflection_analysis": mirrors.report if mirrors else None,
                   "time_policy": "GPS time is zero when time base is not verified",
                   "return_policy": "Return number/count are zero when unavailable",

@@ -1,7 +1,7 @@
 # Third-party notices
 
 PointSense - E57 SAM 3 Point Cloud Classifier is licensed under the
-AIhdproduction Education and Research License 1.0 in [LICENSE](LICENSE). That
+AIhdproduction Education and Research License 1.1 in [LICENSE](LICENSE). That
 license covers all code, scripts, presets and documentation in this repository.
 The components below are not part of the repository; they are downloaded during
 setup or obtained by the user and keep their own terms.
@@ -65,7 +65,7 @@ for that distribution as well.
 ## Provenance of the SAM adapter
 
 `e57cls/seg/backend.py` was developed from the SAM 3 backend of an earlier
-classifier by the same author, AIhdproduction. It is original AIhdproduction
+classifier by Domenic Hochstrasser, doing business as AIhdproduction. It is original AIhdproduction
 material, not third-party code, and is covered by [LICENSE](LICENSE) like the
 rest of this repository. The module-by-module reuse assessment is in
 [docs/reuse_map.md](docs/reuse_map.md). Agisoft Metashape is not a dependency of

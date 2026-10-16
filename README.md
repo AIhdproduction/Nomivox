@@ -8,9 +8,10 @@ The desktop interface is in German.
 This is a standalone Windows application. Metashape and Cyclone are not required
 to run the classifier.
 
-> **License:** source-available, not open source. Free for noncommercial
-> education and research; commercial and other uses require prior written
-> permission. SAM 3 is licensed separately by Meta. See
+> **License:** AIhdproduction Education and Research License 1.1;
+> source-available, not open source. Free for noncommercial education, research
+> and personal use; commercial and other uses require prior written permission.
+> SAM 3 is licensed separately by Meta. See
 > [License and provenance](#license-and-provenance).
 
 ## Features
@@ -365,11 +366,13 @@ automatically untrack files that Git already tracks.
 ## License and provenance
 
 Original project material is covered by the
-**AIhdproduction Education and Research License 1.0** in [LICENSE](LICENSE).
-The noncommercial education and research uses described there are permitted
-without a fee. Commercial and other uses outside that permission require prior
-written approval from AIhdproduction; request it through the
-[issue tracker](https://github.com/AIhdproduction/PointSense/issues). The English
+**AIhdproduction Education and Research License 1.1** in [LICENSE](LICENSE),
+licensed by Domenic Hochstrasser, doing business as AIhdproduction. The
+noncommercial education, noncommercial research and personal uses described
+there are permitted without a fee. Commercial and other uses outside that
+permission require prior written approval; request it by email at
+hdproduction.ch@gmail.com. Contributions fall under the Contributions section
+of [LICENSE](LICENSE); see [CONTRIBUTING.md](CONTRIBUTING.md). The English
 license text is authoritative. This is a source-available license with purpose
 restrictions, not an open-source license.
 

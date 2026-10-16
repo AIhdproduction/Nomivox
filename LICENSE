@@ -1,40 +1,50 @@
-AIhdproduction Education and Research License 1.0
-Effective date: 2026-10-13
+AIhdproduction Education and Research License 1.1
+Effective date: 2026-10-16
 
-Copyright (c) 2026 AIhdproduction. All rights reserved except as expressly
-granted below.
+Copyright (c) 2026 Domenic Hochstrasser, Wangen SZ, Switzerland, doing business
+as AIhdproduction. All rights reserved except as expressly granted below.
 
 1. Scope and ownership
 
 This license applies to the original code, scripts, class presets,
 configuration and documentation of PointSense - E57 SAM 3 Point Cloud
-Classifier (the "Software") made available by AIhdproduction (the "Licensor"),
-except material identified as being under separate terms.
+Classifier (the "Software") made available by Domenic Hochstrasser, Wangen SZ,
+Switzerland, doing business as AIhdproduction (the "Licensor"), except material
+identified as being under separate terms.
 
-The Licensor retains its copyright and other intellectual property rights
+The Licensor retains all copyright and other intellectual property rights
 in the Software. This license grants permission to use the Software; it
 does not transfer ownership. It does not claim ownership of third-party
-software, models, methods, user data or user-created results. Contributors
-retain ownership of their original contributions unless separately agreed.
+software, models, methods, user data or user-created results. Contributions
+are governed by section 5.
 No right to use the Licensor's names or marks to imply endorsement is granted.
 
-2. Free permission for noncommercial education and research
+2. Free permission for noncommercial education, research and personal use
 
 Subject to this license, the Licensor grants you a worldwide, nonexclusive,
 royalty-free license to access, run, copy, study and modify the Software
-solely for noncommercial education and noncommercial research. No individual
-request, registration or license fee is required for these permitted uses.
+solely for noncommercial education, noncommercial research and personal use.
+No individual request, registration or license fee is required for these
+permitted uses.
 
 Permitted uses include school and university teaching, coursework, student
-projects, theses, academic research and independent noncommercial research.
-Ordinary tuition, salaries, scholarships and general research grants do not
-by themselves make these activities commercial. Publishing academic papers
-through publishers that charge fees does not by itself make the underlying
-research commercial.
+projects, theses, academic research, independent noncommercial research and
+personal use. Personal use means use by a natural person for private, hobby or
+self-learning purposes with no commercial application. Use for or on behalf of
+an employer, a client, a business, or in any self-employed or freelance activity
+is never personal use. Ordinary tuition, salaries, scholarships and general
+research grants do not by themselves make these activities commercial.
+Publishing academic papers through publishers that charge fees does not by
+itself make the underlying research commercial.
 
 The purpose and circumstances of the activity determine eligibility, not
 merely the user's status as a student, school, university or nonprofit.
 Commercial activities described in section 3 are not covered by this grant.
+
+Use by or on behalf of a for-profit organization, including use by its employees,
+contractors, interns or agents in connection with that organization's activities,
+is commercial use by that organization, regardless of whether the individual
+installed the Software privately.
 
 3. Commercial and other uses require prior written permission
 
@@ -52,14 +62,17 @@ Software for a commercial purpose, including:
 
 Any use outside section 2 also requires prior written permission. A
 commercial license may be free or paid and may include separately agreed
-conditions. Submitting a request, receiving no reply, or having public
-access to the repository does not constitute permission. A separate written
-agreement takes precedence only to the extent expressly stated in it.
+conditions. Written permission means either (a) an agreement signed by the
+Licensor, or (b) an email sent from hdproduction.ch@gmail.com that expressly
+grants the requested use. Submitting a request, receiving no reply, or having
+public access to the repository does not constitute permission. A separate
+written agreement takes precedence only to the extent expressly stated in it.
 
-Request permission from AIhdproduction through the project's issue tracker:
-https://github.com/AIhdproduction/PointSense/issues
-State the intended use and the person or organization requesting permission.
-Do not post confidential project or client information in a public issue.
+Request permission by email to hdproduction.ch@gmail.com. State the intended
+use and the person or organization requesting permission. The project's issue
+tracker (https://github.com/AIhdproduction/PointSense/issues) may be used only
+for non-confidential technical questions. Do not send or post confidential
+project or client information in a public issue.
 
 4. Copies, modifications and redistribution
 
@@ -81,7 +94,18 @@ under this license. You may not sell, commercially sublicense or relicense
 that material without the Licensor's prior written permission. Your changes
 do not remove the restrictions on the underlying Software.
 
-5. Input data and generated results
+5. Contributions
+
+By submitting a contribution, including code, documentation, presets or other
+material, the contributor grants the Licensor a perpetual, worldwide,
+irrevocable, royalty-free, transferable and sublicensable license to use,
+modify, distribute and relicense the contribution under any terms, including
+commercial licenses. The contributor confirms that they hold the rights to
+grant this license and that the contribution contains no material of an employer
+or third party without permission. The Licensor is not obliged to accept or use
+any contribution.
+
+6. Input data and generated results
 
 You retain any rights you hold in your input data and generated results,
 including classified LAS/LAZ point clouds, masks, labels, legends, reports,
@@ -92,10 +116,10 @@ where none exist or remove rights held by other parties.
 
 The Software license does not automatically become the copyright license
 of a generated result. You may publish and share results of permitted
-noncommercial education and research, including in papers, theses and
-research datasets, subject to rights in the input data and applicable
-third-party terms. Merely sharing such results does not require distributing
-the Software or model weights.
+noncommercial education, noncommercial research and personal use, including in
+papers, theses and research datasets, subject to rights in the input data and
+applicable third-party terms. Merely sharing such results does not require
+distributing the Software or model weights.
 
 As a condition of the permission granted here, your generation of results
 for a commercial purpose and your subsequent commercial exploitation of
@@ -109,7 +133,7 @@ acknowledge "PointSense - E57 SAM 3 Point Cloud Classifier, AIhdproduction"
 and link to https://github.com/AIhdproduction/PointSense where practical.
 Third-party acknowledgments, including those required by Meta, also apply.
 
-6. Third-party components
+7. Third-party components
 
 This license covers only rights the Licensor is entitled to grant. SAM 3,
 PyTorch, PySide6/Qt, pye57, laspy and other dependencies remain subject to
@@ -125,7 +149,7 @@ the model weights separately and must accept and comply with the applicable
 Meta terms. See THIRD_PARTY_NOTICES.md for the pinned upstream license,
 the dependency licenses and the model access link.
 
-7. No warranty; limitation of liability
+8. No warranty; limitation of liability
 
 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
 "AS IS", WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
@@ -138,7 +162,14 @@ ARE NOT LIABLE FOR CLAIMS, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE
 OR ITS USE. THESE EXCLUSIONS DO NOT APPLY TO LIABILITY OR RIGHTS THAT CANNOT
 LAWFULLY BE EXCLUDED OR LIMITED. NO SUPPORT OR MAINTENANCE IS PROMISED.
 
-8. Termination and reserved rights
+9. Governing law and jurisdiction
+
+Swiss law applies, excluding its conflict-of-law rules and the United Nations
+Convention on Contracts for the International Sale of Goods (CISG). The exclusive
+place of jurisdiction is the competent courts of the Canton of Schwyz,
+Switzerland. The Licensor may also bring claims at the defendant's domicile.
+
+10. Termination and reserved rights
 
 Your permissions under this license terminate if you breach its conditions.
 You must then stop using and distributing the Software unless the Licensor

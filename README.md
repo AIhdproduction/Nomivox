@@ -1,4 +1,4 @@
-# PointSense — E57 SAM 3 Point Cloud Classifier
+# Nomivox — E57 SAM 3 Point Cloud Classifier
 
 Local classification of E57 point clouds using **SAM 3**, embedded scan images,
 and an NVIDIA GPU. The application detects objects in the images, transfers their
@@ -50,7 +50,7 @@ does not perform registration or automatically correct inaccurate camera poses.
 
 ## Installation and startup
 
-1. Extract or clone [AIhdproduction/PointSense](https://github.com/AIhdproduction/PointSense) into a local folder.
+1. Extract or clone [AIhdproduction/Nomivox](https://github.com/AIhdproduction/Nomivox) into a local folder.
 2. Install Python 3.12 and Git if they are not already available.
 3. Double-click **[`install.bat`](install.bat)**. It creates the local Python environment,
    installs or repairs the pinned dependencies, tests CUDA, and summarizes anything
@@ -378,13 +378,13 @@ restrictions, not an open-source license.
 
 | Material | Terms |
 |---|---|
-| All PointSense code, scripts, presets, and documentation in this repository | [LICENSE](LICENSE) |
+| All Nomivox code, scripts, presets, and documentation in this repository | [LICENSE](LICENSE) |
 | SAM 3 code and model weights (obtained separately, not in this repository) | Meta's SAM License, copy in [docs/LICENSE_SAM3.txt](docs/LICENSE_SAM3.txt) |
 | PyTorch, PySide6/Qt, pye57, and other installed packages | Their own licenses, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
 
-The two sets of terms apply side by side. Permission under the PointSense license
+The two sets of terms apply side by side. Permission under the Nomivox license
 does not extend Meta's terms, and Meta's SAM License does not lift the
-noncommercial restriction on PointSense itself. The SAM License has its own
+noncommercial restriction on Nomivox itself. The SAM License has its own
 conditions, including acknowledgment in research publications and trade-control
 and prohibited-use restrictions; read it before using the model.
 

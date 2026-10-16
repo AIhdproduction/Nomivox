@@ -1,7 +1,7 @@
 [project]
-name = "e57cls"
+name = "nomivox"
 version = "0.1.0"
-description = "Local E57 classifier with verified streaming geometry"
+description = "Nomivox – local E57 point cloud classifier with SAM 3"
 readme = "README.md"
 license = "LicenseRef-AIhdproduction-ERL-1.1"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]

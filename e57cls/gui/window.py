@@ -5,10 +5,13 @@ from pathlib import Path
 import time
 from uuid import uuid4
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QTabWidget,
     QLabel,QLineEdit,QPushButton,QComboBox,QTableWidget,QTableWidgetItem,QCheckBox,QPlainTextEdit,
-    QProgressBar,QFileDialog,QMessageBox,QDoubleSpinBox,QSpinBox,QScrollArea,QInputDialog)
+    QProgressBar,QFileDialog,QMessageBox,QDoubleSpinBox,QSpinBox,QScrollArea,QInputDialog,QFrame,
+    QListWidget,QToolButton)
 from e57cls.files import atomic_json
+from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
 from e57cls.scene.presets import validate_preset
 
@@ -53,21 +56,60 @@ class MainWindow(QMainWindow):
         # scene event resets the stopwatch and makes the estimate far too low.
         self.estimate_phase = ''
         self.estimate_fraction = 0.
+        # Applying the theme here keeps direct MainWindow construction in tests
+        # visually identical to the normal launcher path.
+        apply_theme()
         self.setWindowTitle(tr('app_title'))
-        self.resize(1180,800)
+        self.resize(1280,820)
         root = QWidget()
+        root.setObjectName('appRoot')
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(16,16,16,16)
+        layout.setSpacing(12)
+        header = QFrame()
+        header.setObjectName('headerBar')
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16,12,16,12)
+        wordmark = QLabel('Nomivox')
+        wordmark.setObjectName('wordmark')
+        subtitle = QLabel(tr('app_subtitle'))
+        subtitle.setObjectName('subtitle')
+        self.current_file = QLabel(self.source.name)
+        self.current_file.setObjectName('currentFile')
+        header_layout.addWidget(wordmark)
+        header_layout.addWidget(subtitle)
+        header_layout.addStretch()
+        header_layout.addWidget(self.current_file)
+        layout.addWidget(header)
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        sidebar = QFrame()
+        sidebar.setObjectName('sidebar')
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(6,8,6,8)
+        self.navigation = QListWidget()
+        self.navigation.setObjectName('navigation')
+        self.navigation.addItems([tr(key) for key in ('tab_input','tab_classes','tab_settings','tab_run')])
+        sidebar_layout.addWidget(self.navigation)
+        sidebar.setFixedWidth(190)
+        content.addWidget(sidebar)
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        self.tabs.tabBar().hide()
+        content.addWidget(self.tabs,1)
+        layout.addLayout(content,1)
         self.input_tab()
         self.classes_tab()
         self.settings_tab()
         self.run_tab()
+        self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self.navigation.setCurrentRow)
+        self.navigation.setCurrentRow(0)
         self.bottom = QLabel(tr('ready'))
         self.bottom.setWordWrap(True)
         self.bottom.setToolTip(tr('total_estimate_hint'))
         self.overall = QProgressBar()
         self.overall.setRange(0,1000)
+        self.overall.setTextVisible(False)
         layout.addWidget(self.overall)
         layout.addWidget(self.bottom)
         self.setCentralWidget(root)
@@ -84,6 +126,8 @@ class MainWindow(QMainWindow):
     def tab(self,title):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(12)
         self.tabs.addTab(widget,tr(title))
         return widget,layout
 
@@ -93,8 +137,49 @@ class MainWindow(QMainWindow):
         layout.addWidget(button)
         return button
 
+    def card(self, title):
+        frame = QFrame()
+        frame.setProperty('class','card')
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16,14,16,16)
+        layout.setSpacing(10)
+        heading = QLabel(tr(title))
+        heading.setObjectName('cardHeading')
+        layout.addWidget(heading)
+        return frame,layout
+
+    def configure_table(self, table):
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+
+    def settings_row(self, form, label, widget):
+        label_widget = QLabel(label)
+        label_widget.setMinimumWidth(260)
+        label_widget.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
+        form.addRow(label_widget,widget)
+
+    def color_swatch(self, value):
+        color = QColor(value)
+        if not color.isValid():
+            return None
+        pixmap = QPixmap(14,14)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawRoundedRect(0,0,13,13,3,3)
+        painter.end()
+        return pixmap
+
+    def set_hints_visible(self, visible):
+        self.class_hints.setVisible(visible)
+        self.hints_toggle.setArrowType(Qt.ArrowType.DownArrow if visible else Qt.ArrowType.RightArrow)
+
     def input_tab(self):
         _,layout = self.tab('tab_input')
+        frame,card = self.card('card_processing_mode')
         mode_form = QFormLayout()
         self.processing_mode = QComboBox()
         self.processing_mode.addItem(tr('mode_classify_and_filter'),'classify_and_filter')
@@ -102,29 +187,43 @@ class MainWindow(QMainWindow):
         mode_form.addRow(tr('processing_mode'),self.processing_mode)
         self.mode_hint = QLabel(tr('mode_classify_and_filter_hint'))
         self.mode_hint.setWordWrap(True)
+        self.mode_hint.setProperty('class','hint')
         mode_form.addRow('',self.mode_hint)
-        layout.addLayout(mode_form)
+        card.addLayout(mode_form)
+        layout.addWidget(frame)
+        frame,card = self.card('card_e57_file')
+        path_row = QHBoxLayout()
         self.input_path = QLineEdit(str(self.source))
         self.input_path.setReadOnly(True)
-        layout.addWidget(self.input_path)
-        self.select_button = self.button('select_another',self.select_source,layout)
+        path_row.addWidget(self.input_path,1)
+        self.select_button = self.button('select_another',self.select_source,path_row)
+        card.addLayout(path_row)
         hint = QLabel(tr('automatic_flow'))
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        hint.setProperty('class','hint')
+        card.addWidget(hint)
+        layout.addWidget(frame)
+        frame,card = self.card('card_overview')
         self.summary = QLabel(tr('summary_pending'))
-        layout.addWidget(self.summary)
+        card.addWidget(self.summary)
         self.scan_table = QTableWidget(0,8)
         self.scan_table.setHorizontalHeaderLabels([tr(k) for k in ('scan','name','point_count','images','representation','pose','scene','status')])
         self.scan_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.scan_table.cellDoubleClicked.connect(self.override_scene)
-        layout.addWidget(self.scan_table)
+        self.configure_table(self.scan_table)
+        card.addWidget(self.scan_table)
+        layout.addWidget(frame,1)
+        frame,card = self.card('card_metadata')
         self.metadata = QPlainTextEdit()
+        self.metadata.setObjectName('metadataView')
         self.metadata.setReadOnly(True)
         self.metadata.setMaximumHeight(150)
-        layout.addWidget(self.metadata)
+        card.addWidget(self.metadata)
+        layout.addWidget(frame)
 
     def classes_tab(self):
         self.class_widget,layout = self.tab('tab_classes')
+        frame,toolbar = self.card('card_class_filter')
         row = QHBoxLayout()
         row.addWidget(QLabel(tr('scene')))
         self.scene_mode = QComboBox()
@@ -134,32 +233,55 @@ class MainWindow(QMainWindow):
         self.scene_mode.currentIndexChanged.connect(self.filter_classes)
         for key,callback in [('load_preset',self.load_preset),('save_preset',self.save_preset),('duplicate_preset',self.save_preset),('reset_preset',self.reset_preset)]:
             self.button(key,callback,row)
-        layout.addLayout(row)
+        toolbar.addLayout(row)
+        layout.addWidget(frame)
+        frame,card = self.card('card_classes')
         self.class_table = QTableWidget(0,9)
         self.class_table.setHorizontalHeaderLabels([tr(k) for k in ('enabled','name','internal_name','code','color','prompts','scene','instance_threshold','mask_threshold')])
         self.class_table.itemChanged.connect(self.edit_class)
-        layout.addWidget(self.class_table)
+        self.configure_table(self.class_table)
+        self.class_table.setMinimumHeight(300)
+        card.addWidget(self.class_table,1)
         buttons = QHBoxLayout()
         self.button('add_class',self.add_class,buttons)
         self.button('remove_class',self.remove_class,buttons)
-        layout.addLayout(buttons)
+        buttons.addStretch()
+        card.addLayout(buttons)
+        layout.addWidget(frame,3)
+        frame,card = self.card('card_reflections')
         self.validation = QLabel()
         self.validation.setWordWrap(True)
-        layout.addWidget(self.validation)
+        card.addWidget(self.validation)
         self.mirror = QCheckBox(tr('mirror_enable'))
         self.mirror.setChecked(DEFAULTS['mirror_analysis'])
         self.glass = QCheckBox(tr('glass_enable'))
         self.glass.setChecked(DEFAULTS['glass_analysis'])
         self.extra = QCheckBox(tr('extra_no_reflection'))
-        layout.addWidget(self.mirror)
-        layout.addWidget(self.glass)
-        layout.addWidget(self.extra)
+        card.addWidget(self.mirror)
+        card.addWidget(self.glass)
+        card.addWidget(self.extra)
+        self.hints_toggle = QToolButton()
+        self.hints_toggle.setText(tr('toggle_hints'))
+        self.hints_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.hints_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.hints_toggle.setCheckable(True)
+        card.addWidget(self.hints_toggle)
+        self.class_hints = QWidget()
+        hints_layout = QVBoxLayout(self.class_hints)
+        hints_layout.setContentsMargins(0,0,0,0)
+        hints_layout.setSpacing(8)
         hint = QLabel(tr('mirror_limits')+' '+tr('mirror_preservation'))
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        hint.setProperty('class','hint')
+        hints_layout.addWidget(hint)
         prompts_hint = QLabel(tr('prompts_hint'))
         prompts_hint.setWordWrap(True)
-        layout.addWidget(prompts_hint)
+        prompts_hint.setProperty('class','hint')
+        hints_layout.addWidget(prompts_hint)
+        card.addWidget(self.class_hints)
+        self.hints_toggle.toggled.connect(self.set_hints_visible)
+        self.set_hints_visible(False)
+        layout.addWidget(frame)
         self.processing_mode.currentIndexChanged.connect(self.update_processing_mode)
         self.update_processing_mode()
 
@@ -168,14 +290,25 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         contents = QWidget()
-        form = QFormLayout(contents)
+        forms = QVBoxLayout(contents)
+        forms.setContentsMargins(0,0,0,0)
+        forms.setSpacing(12)
         scroll.setWidget(contents)
         layout.addWidget(scroll)
+        sections = {}
+        for key in ('settings_group_profile_output','settings_group_segmentation','settings_group_tuning_geometry',
+                    'settings_group_cleanup','settings_group_scene','settings_group_mirror_glass'):
+            frame,form = self.card(key)
+            forms.addWidget(frame)
+            sections[key] = QFormLayout()
+            sections[key].setSpacing(8)
+            sections[key].setLabelAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
+            form.addLayout(sections[key])
         self.profile = QComboBox()
         for key in ('fast','balanced','high'):
             self.profile.addItem(tr('profile_'+key),key)
         self.profile.setCurrentIndex(1)
-        form.addRow(tr('profile'),self.profile)
+        self.settings_row(sections['settings_group_profile_output'],tr('profile'),self.profile)
         self.controls = {}
         specifications = {
             'image_scale':(.1,1.,.05),'tile_overlap':(0.,.8,.05),'min_observations':(1,100,1),
@@ -202,6 +335,13 @@ class MainWindow(QMainWindow):
             'mirror_image_scale':(.1,1.,.05),'mirror_view_size':(336,1512,16),
             'mirror_max_range':(1.,100.,1.),'mirror_min_pixels':(10,10000,10),'mirror_mask_width':(512,4096,128),
             'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1),'reflection_neighbor_radius':(.01,.5,.01)}
+        groups = {
+            'settings_group_segmentation': {'image_scale','tile_overlap','tile_size','view_size','view_fov','instance_confidence','mask_confidence','boundary_margin','gpu_memory_fraction'},
+            'settings_group_tuning_geometry': {'min_observations','voxel_size','min_winning_share','visibility_abs','visibility_rel','depth_width','class_transfer_radius'},
+            'settings_group_cleanup': {'component_min_voxels','cable_component_min_voxels','cable_component_min_span','electrical_component_min_voxels','electrical_component_min_span','vegetation_ground_cell_size','vegetation_ground_band','building_boundary_cell_size','building_boundary_min_height','stairs_min_confidence'},
+            'settings_group_scene': {'scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor','scene_sky_indoor_max','scene_overhead_range','scene_plane_tolerance','scene_plane_fraction','scene_ceiling_supported','scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max','scene_sky_confidence','scene_ceiling_confidence'},
+            'settings_group_mirror_glass': {'mirror_mask_confidence','mirror_fit_tolerance','mirror_plane_tolerance','reflection_prompt_agreement','mirror_merge_angle','mirror_merge_distance','mirror_image_scale','mirror_view_size','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max','reflection_neighbor_radius'},
+        }
         for key,(low,high,step) in specifications.items():
             widget = QSpinBox() if isinstance(low,int) else QDoubleSpinBox()
             if isinstance(widget,QDoubleSpinBox):
@@ -210,69 +350,85 @@ class MainWindow(QMainWindow):
             widget.setSingleStep(step)
             widget.setValue(DEFAULTS[key])
             self.controls[key] = widget
-            form.addRow(tr('setting_'+key),widget)
+            group = next(name for name, keys in groups.items() if key in keys)
+            self.settings_row(sections[group],tr('setting_'+key),widget)
         self.prompt_batch = QComboBox()
         self.prompt_batch.addItem(tr('prompt_batch_auto'), 'auto')
         for value in (1, 2, 4, 8, 12, 16, 24, 32, 48, 64):
             self.prompt_batch.addItem(str(value), value)
-        form.addRow(tr('setting_prompt_batch'),self.prompt_batch)
+        self.settings_row(sections['settings_group_segmentation'],tr('setting_prompt_batch'),self.prompt_batch)
         self.profile.currentIndexChanged.connect(self.apply_profile)
         self.output_format = QComboBox()
         for key in ('las','laz'):
             self.output_format.addItem(key.upper()+' 1.4',key)
-        form.addRow(tr('output_format'),self.output_format)
+        self.settings_row(sections['settings_group_profile_output'],tr('output_format'),self.output_format)
         self.diagnostics = QComboBox()
         for key in ('off','sample','all'):
             self.diagnostics.addItem(tr('diagnostics_'+key),key)
         self.diagnostics.setCurrentIndex(1)
-        form.addRow(tr('diagnostics'),self.diagnostics)
+        self.settings_row(sections['settings_group_profile_output'],tr('diagnostics'),self.diagnostics)
         self.cache_path = QLineEdit(str(PROJECT/'.cache'))
         self.gpu = QLineEdit('cuda:0')
-        form.addRow(tr('cache_folder'),self.cache_path)
-        form.addRow(tr('gpu_device'),self.gpu)
+        self.settings_row(sections['settings_group_profile_output'],tr('cache_folder'),self.cache_path)
+        self.settings_row(sections['settings_group_profile_output'],tr('gpu_device'),self.gpu)
         self.strict = QCheckBox(tr('strict_mode'))
-        form.addRow(self.strict)
+        sections['settings_group_profile_output'].addRow(self.strict)
         self.stairs_priority = QCheckBox(tr('stairs_priority'))
         self.stairs_priority.setChecked(DEFAULTS['stairs_priority'])
-        form.addRow(self.stairs_priority)
+        sections['settings_group_cleanup'].addRow(self.stairs_priority)
         self.component_cleanup = QCheckBox(tr('component_cleanup'))
         self.component_cleanup.setChecked(DEFAULTS['component_cleanup'])
-        form.addRow(self.component_cleanup)
+        sections['settings_group_cleanup'].addRow(self.component_cleanup)
         self.vegetation_base_to_ground = QCheckBox(tr('vegetation_base_to_ground'))
         self.vegetation_base_to_ground.setChecked(DEFAULTS['vegetation_base_to_ground'])
-        form.addRow(self.vegetation_base_to_ground)
+        sections['settings_group_cleanup'].addRow(self.vegetation_base_to_ground)
         self.building_enclosure = QCheckBox(tr('building_enclosure'))
         self.building_enclosure.setChecked(DEFAULTS['building_enclosure'])
-        form.addRow(self.building_enclosure)
+        sections['settings_group_cleanup'].addRow(self.building_enclosure)
+        forms.addStretch()
 
     def run_tab(self):
         _,layout = self.tab('tab_run')
+        frame,card = self.card('card_actions')
         buttons = QHBoxLayout()
         self.start_button = self.button('start',self.start_run,buttons)
+        self.start_button.setProperty('role','primary')
         self.pause_button = self.button('pause',lambda:self.command('pause'),buttons)
         self.cancel_button = self.button('cancel',lambda:self.command('cancel'),buttons)
+        self.cancel_button.setProperty('role','danger')
         self.resume_button = self.button('resume',self.resume,buttons)
         self.saved_button = self.button('resume_saved',self.resume_saved,buttons)
-        layout.addLayout(buttons)
+        buttons.addStretch()
+        card.addLayout(buttons)
+        layout.addWidget(frame)
+        frame,card = self.card('card_status')
         self.phase = QLabel(tr('ready'))
+        self.phase.setObjectName('cardHeading')
         self.details = QLabel()
         self.phase_progress = QProgressBar()
         self.phase_progress.setRange(0,1000)
-        layout.addWidget(self.phase)
-        layout.addWidget(self.details)
-        layout.addWidget(self.phase_progress)
+        card.addWidget(self.phase)
+        card.addWidget(self.details)
+        card.addWidget(self.phase_progress)
+        layout.addWidget(frame)
+        frame,card = self.card('card_log')
         self.log = QPlainTextEdit()
+        self.log.setObjectName('logView')
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(800)
-        layout.addWidget(self.log)
+        card.addWidget(self.log)
+        layout.addWidget(frame,1)
+        frame,card = self.card('card_results')
         self.result_label = QLabel()
         self.result_label.setWordWrap(True)
-        layout.addWidget(self.result_label)
+        card.addWidget(self.result_label)
         buttons = QHBoxLayout()
         self.open_output = self.button('open_output',lambda:self.open_file(''),buttons)
         self.open_report = self.button('open_report',lambda:self.open_file('report.html'),buttons)
         self.open_log = self.button('open_log',lambda:self.open_file('log.txt'),buttons)
-        layout.addLayout(buttons)
+        buttons.addStretch()
+        card.addLayout(buttons)
+        layout.addWidget(frame)
 
     def watch(self,output):
         self.config = json.loads((Path(output)/'run.json').read_text(encoding='utf-8'))
@@ -340,7 +496,10 @@ class MainWindow(QMainWindow):
                       '' if c.get('min_instance_conf') is None else str(c['min_instance_conf']),
                       '' if c.get('min_mask_conf') is None else str(c['min_mask_conf'])]
             for col,value in enumerate(values,1):
-                self.class_table.setItem(row,col,QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col == 4:
+                    item.setData(Qt.ItemDataRole.DecorationRole,self.color_swatch(value))
+                self.class_table.setItem(row,col,item)
         self.class_table.resizeColumnsToContents()
         self.loading = False
         self.filter_classes()
@@ -372,12 +531,19 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     pass
             c[key] = value
+            if key == 'color':
+                self.loading = True
+                item.setData(Qt.ItemDataRole.DecorationRole,self.color_swatch(value))
+                self.loading = False
         self.validate()
 
     def validate(self):
         errors,warnings = validate_preset(self.preset, require_active_classes=self.processing_mode.currentData() == 'classify_and_filter')
         messages = [tr('validation_'+e.split(':')[0])+(': '+e.split(':',1)[1] if ':' in e else '') for e in errors+warnings]
         self.validation.setText('\n'.join(messages) if messages else tr('preset_valid'))
+        self.validation.setProperty('status','danger' if errors else 'warning' if warnings else 'success')
+        self.validation.style().unpolish(self.validation)
+        self.validation.style().polish(self.validation)
         if hasattr(self,'start_button'):
             self.start_button.setEnabled(not errors and self.process.state() == QProcess.ProcessState.NotRunning)
         return not errors
@@ -457,6 +623,7 @@ class MainWindow(QMainWindow):
         if path:
             self.source = Path(path)
             self.input_path.setText(path)
+            self.current_file.setText(self.source.name)
             self.config = None
             self.overrides = {}
             self.bottom.setText(tr('setup_required'))
@@ -554,6 +721,7 @@ class MainWindow(QMainWindow):
                 self.config = config
                 self.source = Path(config['source'])
                 self.input_path.setText(str(self.source))
+                self.current_file.setText(self.source.name)
                 self.preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
                 processing_mode = config.get('processing_mode','classify_and_filter')
                 self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))

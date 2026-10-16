@@ -7,7 +7,7 @@ as AIhdproduction. All rights reserved except as expressly granted below.
 1. Scope and ownership
 
 This license applies to the original code, scripts, class presets,
-configuration and documentation of PointSense - E57 SAM 3 Point Cloud
+configuration and documentation of Nomivox - E57 SAM 3 Point Cloud
 Classifier (the "Software") made available by Domenic Hochstrasser, Wangen SZ,
 Switzerland, doing business as AIhdproduction (the "Licensor"), except material
 identified as being under separate terms.
@@ -70,7 +70,7 @@ written agreement takes precedence only to the extent expressly stated in it.
 
 Request permission by email to hdproduction.ch@gmail.com. State the intended
 use and the person or organization requesting permission. The project's issue
-tracker (https://github.com/AIhdproduction/PointSense/issues) may be used only
+tracker (https://github.com/AIhdproduction/Nomivox/issues) may be used only
 for non-confidential technical questions. Do not send or post confidential
 project or client information in a public issue.
 
@@ -129,8 +129,8 @@ ownership over results or a separate license imposed on every recipient
 of a result.
 
 When publishing research or educational results produced with the Software,
-acknowledge "PointSense - E57 SAM 3 Point Cloud Classifier, AIhdproduction"
-and link to https://github.com/AIhdproduction/PointSense where practical.
+acknowledge "Nomivox - E57 SAM 3 Point Cloud Classifier, AIhdproduction"
+and link to https://github.com/AIhdproduction/Nomivox where practical.
 Third-party acknowledgments, including those required by Meta, also apply.
 
 7. Third-party components

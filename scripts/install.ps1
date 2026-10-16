@@ -25,7 +25,7 @@ function Test-Python312([string]$Command, [string[]]$Prefix = @()) {
 }
 
 Write-Host ''
-Write-Host '=== PointSense - Installation ==='
+Write-Host '=== Nomivox - Installation ==='
 Write-Host 'Richtet die Python-Umgebung und alle Projektpakete lokal ein.'
 Write-Host 'Der erste Download kann mehrere GB umfassen und einige Zeit dauern.'
 if ($CheckOnly) { Write-Host 'Pruefmodus: Es werden keine Pakete installiert.' }

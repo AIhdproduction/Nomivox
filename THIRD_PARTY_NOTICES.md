@@ -1,6 +1,6 @@
 # Third-party notices
 
-PointSense - E57 SAM 3 Point Cloud Classifier is licensed under the
+Nomivox - E57 SAM 3 Point Cloud Classifier is licensed under the
 AIhdproduction Education and Research License 1.1 in [LICENSE](LICENSE). That
 license covers all code, scripts, presets and documentation in this repository.
 The components below are not part of the repository; they are downloaded during
@@ -13,7 +13,7 @@ Python environment. The package versions and the SAM 3 source revision that
 
 ## SAM 3 by Meta
 
-PointSense uses SAM 3 for text-prompted image segmentation. We acknowledge the
+Nomivox uses SAM 3 for text-prompted image segmentation. We acknowledge the
 SAM Materials provided by Meta.
 
 - Source: https://github.com/facebookresearch/sam3
@@ -26,9 +26,9 @@ SAM Materials provided by Meta.
 
 The installer obtains the SAM 3 source directly from the upstream repository.
 Users download the checkpoint themselves into `models/` and comply with the
-applicable model access and license terms. The PointSense license does not
+applicable model access and license terms. The Nomivox license does not
 replace or relax Meta's SAM License, and the SAM License does not lift the
-purpose restrictions on PointSense itself.
+purpose restrictions on Nomivox itself.
 
 The SAM License has its own conditions. Among others, research publications
 that use the SAM Materials must acknowledge them, and the license contains
@@ -69,4 +69,4 @@ classifier by Domenic Hochstrasser, doing business as AIhdproduction. It is orig
 material, not third-party code, and is covered by [LICENSE](LICENSE) like the
 rest of this repository. The module-by-module reuse assessment is in
 [docs/reuse_map.md](docs/reuse_map.md). Agisoft Metashape is not a dependency of
-PointSense.
+Nomivox.

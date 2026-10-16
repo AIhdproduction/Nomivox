@@ -6,10 +6,12 @@ import sys
 
 def main():
     from PySide6.QtWidgets import QApplication,QFileDialog
+    from e57cls.gui.theme import apply_theme
     from e57cls.pipeline.config import PROJECT
     from e57cls.gui.window import MainWindow,tr
     from e57cls.files import atomic_json
     app = QApplication(sys.argv)
+    apply_theme(app)
     if len(sys.argv) == 3 and sys.argv[1] == '--watch':
         output = Path(sys.argv[2])
         config = json.loads((output/'run.json').read_text(encoding='utf-8'))

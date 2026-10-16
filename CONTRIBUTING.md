@@ -1,4 +1,4 @@
-# Contributing to PointSense
+# Contributing to Nomivox
 
 Contributions are welcome. Every contribution is subject to the Contributions
 section of [LICENSE](LICENSE).

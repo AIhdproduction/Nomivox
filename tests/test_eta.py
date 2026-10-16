@@ -1,0 +1,77 @@
+import json
+
+from e57cls.gui.eta import DEFAULT_PROFILE, RunEstimator, load_profile, save_profile
+
+
+def estimator(**kwargs):
+    return RunEstimator(applies={stage: True for stage in DEFAULT_PROFILE}, **kwargs)
+
+
+def test_initial_estimate_uses_counts_and_defaults():
+    value = estimator(unit_counts={'mirror_masks': 10, 'mirror_evidence': 12, 'segmentation': 10})
+    value.phase_started('mirror', 0)
+    total, maximum, stage, stage_maximum = value.remaining(0)
+    assert (total, maximum, stage, stage_maximum) == (4716.0, 12212.0, 400.0, 700.0)
+
+
+def test_recalibration_blends_average_and_converges_maximum():
+    value = estimator(unit_counts={'mirror_masks': 0, 'mirror_evidence': 0, 'segmentation': 10})
+    value.phase_started('segmentation', 0)
+    for scan, timestamp in enumerate((0, 100, 200, 300), 1):
+        value.progress('segmentation', timestamp, scan=scan)
+    average, maximum = value.per_unit('segmentation')
+    assert average == 187.5
+    assert maximum == 286.0
+
+
+def test_current_stage_accounts_for_partial_unit_time():
+    value = RunEstimator(applies={'segmentation': True}, unit_counts={'segmentation': 10})
+    value.phase_started('segmentation', 0)
+    value.progress('segmentation', 0, scan=1)
+    total, maximum, stage, stage_maximum = value.remaining(100)
+    assert (stage, stage_maximum) == (2650.0, 4620.0)
+    assert (total, maximum) == (2980.0, 5280.0)
+
+
+def test_mirror_stage_transition_uses_last_mask_progress_for_evidence_start():
+    value = RunEstimator(applies={'mirror_masks': True, 'mirror_evidence': True},
+                         unit_counts={'mirror_masks': 2, 'mirror_evidence': 2})
+    value.phase_started('mirror', 0)
+    value.progress('mirror_masks', 10, image=1)
+    value.progress('mirror_masks', 20, image=2)
+    value.progress('mirror_masks', 30, image=2)
+    value.progress('mirror_evidence', 50, scan=1, scan_count=2)
+    assert value.measurements['mirror_masks'] == [20.0, 10.0]
+    assert value.measurements['mirror_evidence'] == [20.0]
+
+
+def test_resumed_segmentation_uses_remaining_eligible_scan_indices():
+    value = RunEstimator(applies={'segmentation': True}, unit_counts={'segmentation': 10})
+    value.set_unit_indices('segmentation',range(1,11))
+    value.phase_started('segmentation', 0)
+    value.progress('segmentation', 0, scan=6)
+    _, _, stage, stage_maximum = value.remaining(0)
+    assert (stage, stage_maximum) == (1375.0, 2360.0)
+
+
+def test_skipped_stages_for_mirror_off_and_filter_only():
+    value = RunEstimator(applies={'mirror_masks': False, 'mirror_evidence': False, 'segmentation': False})
+    assert value.remaining(0) == (60.0, 120.0, 60.0, 120.0)
+
+
+def test_profile_save_and_load_round_trip(tmp_path):
+    path = tmp_path/'timing_profile.json'
+    value = RunEstimator(applies={'segmentation': True}, unit_counts={'segmentation': 3})
+    value.measurements['segmentation'] = [120.0, 180.0, 240.0]
+    save_profile(path, value)
+    profile = load_profile(path)
+    assert profile['segmentation']['avg_seconds'] == 180.0
+    assert profile['segmentation']['max_seconds'] == 240.0
+    assert profile['segmentation']['units'] == 3
+    assert profile['mirror_masks'] == DEFAULT_PROFILE['mirror_masks']
+
+
+def test_corrupt_profile_is_ignored(tmp_path):
+    path = tmp_path/'timing_profile.json'
+    path.write_text('{broken', encoding='utf-8')
+    assert load_profile(path) == DEFAULT_PROFILE

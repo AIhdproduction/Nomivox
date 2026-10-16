@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QForm
     QProgressBar,QFileDialog,QMessageBox,QDoubleSpinBox,QSpinBox,QScrollArea,QInputDialog,QFrame,
     QListWidget,QToolButton)
 from e57cls.files import atomic_json
+from e57cls.gui.eta import RunEstimator, load_profile, save_profile
 from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
 from e57cls.scene.presets import validate_preset
@@ -30,7 +31,7 @@ def format_duration(seconds, include_seconds=False):
 class MainWindow(QMainWindow):
     def __init__(self, source, auto_start=True):
         super().__init__()
-        self.source = Path(source)
+        self.source = Path(source) if source else None
         self.preset = json.loads((PROJECT/'presets/default.json').read_text(encoding='utf-8'))
         self.config = None
         self.process = QProcess(self)
@@ -41,6 +42,8 @@ class MainWindow(QMainWindow):
         self.process.errorOccurred.connect(self.process_error)
         self.pending = b''
         self.started = 0
+        self.elapsed_at_event = None
+        self.elapsed_event_clock = None
         self.current_fraction = 0
         self.finished_ok = False
         self.input_rejected = False
@@ -56,6 +59,8 @@ class MainWindow(QMainWindow):
         # scene event resets the stopwatch and makes the estimate far too low.
         self.estimate_phase = ''
         self.estimate_fraction = 0.
+        self.estimator = RunEstimator()
+        self.timing_profile_path = None
         # Applying the theme here keeps direct MainWindow construction in tests
         # visually identical to the normal launcher path.
         apply_theme()
@@ -74,7 +79,7 @@ class MainWindow(QMainWindow):
         wordmark.setObjectName('wordmark')
         subtitle = QLabel(tr('app_subtitle'))
         subtitle.setObjectName('subtitle')
-        self.current_file = QLabel(self.source.name)
+        self.current_file = QLabel(self.source.name if self.source else tr('no_source_file'))
         self.current_file.setObjectName('currentFile')
         header_layout.addWidget(wordmark)
         header_layout.addWidget(subtitle)
@@ -116,11 +121,12 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_clock)
         self.timer.start(1000)
-        self.load_table()
         self.set_running(False)
+        self.load_table()
         # Opening a file must never immediately consume GPU time.  The first
         # page makes the user choose the intended workflow and classes first.
-        if auto_start:
+        self.update_source_ui()
+        if auto_start and self.source:
             self.bottom.setText(tr('setup_required'))
 
     def tab(self,title):
@@ -136,6 +142,36 @@ class MainWindow(QMainWindow):
         button.clicked.connect(callback)
         layout.addWidget(button)
         return button
+
+    def launcher_state(self):
+        try:
+            return json.loads((PROJECT/'.cache/launcher.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError):
+            return {}
+
+    def selection_directory(self):
+        if self.source:
+            return self.source.parent
+        return Path(self.launcher_state().get('last_folder',PROJECT))
+
+    def save_last_folder(self):
+        if self.source:
+            state = self.launcher_state()
+            atomic_json(PROJECT/'.cache/launcher.json',{**state,'last_folder':str(self.source.parent)})
+
+    def update_source_ui(self):
+        selected = self.source is not None
+        self.current_file.setText(self.source.name if selected else tr('no_source_file'))
+        self.input_path.setText(str(self.source) if selected else '')
+        self.select_button.setText(tr('select_another') if selected else tr('select_source'))
+        self.select_button.setProperty('role',None if selected else 'primary')
+        self.select_button.style().unpolish(self.select_button)
+        self.select_button.style().polish(self.select_button)
+        self.no_source_hint.setVisible(not selected)
+        if hasattr(self,'bottom'):
+            self.bottom.setText(tr('setup_required') if selected else tr('no_source'))
+        if hasattr(self,'start_button'):
+            self.validate()
 
     def card(self, title):
         frame = QFrame()
@@ -193,11 +229,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(frame)
         frame,card = self.card('card_e57_file')
         path_row = QHBoxLayout()
-        self.input_path = QLineEdit(str(self.source))
+        self.input_path = QLineEdit(str(self.source) if self.source else '')
         self.input_path.setReadOnly(True)
+        self.input_path.setPlaceholderText(tr('no_source_file'))
         path_row.addWidget(self.input_path,1)
         self.select_button = self.button('select_another',self.select_source,path_row)
         card.addLayout(path_row)
+        self.no_source_hint = QLabel(tr('no_source_hint'))
+        self.no_source_hint.setWordWrap(True)
+        self.no_source_hint.setProperty('status','warning')
+        card.addWidget(self.no_source_hint)
+        self.image_requirement_hint = QLabel(tr('images_required_hint'))
+        self.image_requirement_hint.setWordWrap(True)
+        self.image_requirement_hint.setProperty('class','hint')
+        card.addWidget(self.image_requirement_hint)
         hint = QLabel(tr('automatic_flow'))
         hint.setWordWrap(True)
         hint.setProperty('class','hint')
@@ -432,6 +477,9 @@ class MainWindow(QMainWindow):
 
     def watch(self,output):
         self.config = json.loads((Path(output)/'run.json').read_text(encoding='utf-8'))
+        self.reset_estimator()
+        self.elapsed_at_event = None
+        self.elapsed_event_clock = None
         self.watching = True
         self.watch_offset = 0
         self.preset = json.loads(Path(self.config['preset']).read_text(encoding='utf-8'))
@@ -545,7 +593,9 @@ class MainWindow(QMainWindow):
         self.validation.style().unpolish(self.validation)
         self.validation.style().polish(self.validation)
         if hasattr(self,'start_button'):
-            self.start_button.setEnabled(not errors and self.process.state() == QProcess.ProcessState.NotRunning)
+            can_start = self.source is not None and not errors and self.process.state() == QProcess.ProcessState.NotRunning
+            self.start_button.setEnabled(can_start)
+            self.start_button.setToolTip('' if self.source else tr('start_no_source_tooltip'))
         return not errors
 
     def add_class(self):
@@ -619,14 +669,13 @@ class MainWindow(QMainWindow):
             self.controls[key].setValue(value)
 
     def select_source(self):
-        path,_ = QFileDialog.getOpenFileName(self,tr('select_input'),str(self.source.parent),'E57 (*.e57)')
+        path,_ = QFileDialog.getOpenFileName(self,tr('select_input'),str(self.selection_directory()),'E57 (*.e57)')
         if path:
-            self.source = Path(path)
-            self.input_path.setText(path)
-            self.current_file.setText(self.source.name)
+            self.source = Path(path).resolve()
             self.config = None
             self.overrides = {}
-            self.bottom.setText(tr('setup_required'))
+            self.save_last_folder()
+            self.update_source_ui()
 
     def override_scene(self,row,column):
         if column != 6 or self.process.state() != QProcess.ProcessState.NotRunning:
@@ -639,7 +688,7 @@ class MainWindow(QMainWindow):
             self.scan_table.setItem(row,6,QTableWidgetItem(mode))
 
     def start_run(self):
-        if self.watching or self.process.state() != QProcess.ProcessState.NotRunning or not self.validate():
+        if self.source is None or self.watching or self.process.state() != QProcess.ProcessState.NotRunning or not self.validate():
             return
         try:
             settings = {key:widget.value() for key,widget in self.controls.items()}
@@ -661,7 +710,8 @@ class MainWindow(QMainWindow):
             atomic_json(output/'preset.json',self.preset)
             self.config['preset'] = str(output/'preset.json')
             atomic_json(output/'run.json',self.config)
-            atomic_json(PROJECT/'.cache/launcher.json',{'last_folder':str(self.source.parent),'last_config':str(output/'run.json')})
+            state = self.launcher_state()
+            atomic_json(PROJECT/'.cache/launcher.json',{**state,'last_folder':str(self.source.parent),'last_config':str(output/'run.json')})
             self.launch_worker()
         except Exception as error:
             self.log.appendPlainText(str(error))
@@ -671,12 +721,15 @@ class MainWindow(QMainWindow):
         import sys
         self.pending = b''
         self.started = time.monotonic()
+        self.elapsed_at_event = None
+        self.elapsed_event_clock = None
         self.current_fraction = 0
         self.phase_starts = {}
         self.phase_fraction = 0.
         self.phase_key = ''
         self.estimate_phase = ''
         self.estimate_fraction = 0.
+        self.reset_estimator()
         self.finished_ok = False
         self.input_rejected = False
         env = QProcessEnvironment.systemEnvironment()
@@ -691,6 +744,16 @@ class MainWindow(QMainWindow):
         self.result_label.setText(tr('result_location',path=self.config['output']))
         self.tabs.setCurrentIndex(3)
         self.process.start(sys.executable,['-m','e57cls','run','--config',str(Path(self.config['output'])/'run.json')])
+
+    def reset_estimator(self):
+        cache = Path(self.config['cache'])
+        self.timing_profile_path = cache/'timing_profile.json'
+        applies = {
+            'mirror_masks': bool(self.config.get('mirror_analysis',False)),
+            'mirror_evidence': bool(self.config.get('mirror_analysis',False)),
+            'segmentation': self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
+        }
+        self.estimator = RunEstimator(applies=applies,profile=load_profile(self.timing_profile_path))
 
     def command(self,command):
         self.process.write((json.dumps({'version':1,'command':command})+'\n').encode())
@@ -707,10 +770,13 @@ class MainWindow(QMainWindow):
             self.launch_worker()
 
     def resume_saved(self):
-        path,_ = QFileDialog.getOpenFileName(self,tr('resume_saved'),str(self.source.parent/'klassifiziert'),'JSON (*.json)')
+        directory = self.source.parent/'klassifiziert' if self.source else self.selection_directory()
+        path,_ = QFileDialog.getOpenFileName(self,tr('resume_saved'),str(directory),'JSON (*.json)')
         if path:
             try:
                 config = json.loads(Path(path).read_text(encoding='utf-8'))
+                self.source = Path(config['source'])
+                self.update_source_ui()
                 if (Path(config['output'])/'report.json').exists():
                     self.config = config
                     self.finished_ok = True
@@ -719,9 +785,6 @@ class MainWindow(QMainWindow):
                     self.open_file('report.html')
                     return
                 self.config = config
-                self.source = Path(config['source'])
-                self.input_path.setText(str(self.source))
-                self.current_file.setText(self.source.name)
                 self.preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
                 processing_mode = config.get('processing_mode','classify_and_filter')
                 self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))
@@ -752,9 +815,17 @@ class MainWindow(QMainWindow):
 
     def handle_event(self,event):
         kind = event['event']
+        fallback = self.current_elapsed()
+        timestamp = event.get('elapsed_seconds',fallback)
+        if not isinstance(timestamp,(int,float)):
+            timestamp = fallback
+        else:
+            self.elapsed_at_event = float(timestamp)
+            self.elapsed_event_clock = time.monotonic()
         if kind == 'phase_started':
             started_phase = event['phase']
             self.phase_starts[started_phase] = event.get('elapsed_seconds',0)
+            self.estimator.phase_started(started_phase,timestamp)
             # Only pipeline root phases have a meaningful duration.  Scene
             # detection is performed once per scan inside segmentation.
             if started_phase in ('inspection','mirror','segmentation','voting','output'):
@@ -781,11 +852,16 @@ class MainWindow(QMainWindow):
             self.overall.setValue(round(self.current_fraction*1000))
             self.details.setText(tr('progress_detail',scan=event.get('scan','–'),scans=event.get('scan_count','–'),
                 image=event.get('image','–'),images=event.get('image_count','–'),view=event.get('view','–'),views=event.get('view_count','–')))
-        elif kind == 'phase_finished' and event.get('phase') == 'inspection':
-            self.read_inspection()
+            self.estimator.progress(phase,timestamp,**{key:value for key,value in event.items()
+                                                       if key not in ('event','phase','elapsed_seconds')})
+        elif kind == 'phase_finished':
+            self.estimator.phase_finished(event.get('phase',''),timestamp)
+            if event.get('phase') == 'inspection':
+                self.read_inspection()
         elif kind == 'scene':
             self.scan_table.setItem(event['scan']-1,6,QTableWidgetItem(tr('scene_'+event['scene'])))
         elif kind == 'state':
+            self.estimator.state(event['state'],timestamp)
             self.phase.setText(STRINGS.get('state_'+event['state'],tr('state_running')))
             self.resume_button.setEnabled(event['state'] == 'paused')
             self.pause_button.setEnabled(event['state'] == 'running')
@@ -814,6 +890,11 @@ class MainWindow(QMainWindow):
             self.result_label.setText(tr('result_ready',path=event['output']))
             elapsed = int(event.get('elapsed_seconds',0))
             self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+tr('run_done'))
+            if self.timing_profile_path:
+                try:
+                    save_profile(self.timing_profile_path,self.estimator)
+                except Exception as error:
+                    self.log.appendPlainText(str(error))
         if kind != 'progress':
             self.log.appendPlainText(json.dumps(event,ensure_ascii=False))
 
@@ -832,6 +913,12 @@ class MainWindow(QMainWindow):
                     self.scan_table.setItem(row,col,QTableWidgetItem(str(value)))
             self.scan_table.resizeColumnsToContents()
             self.metadata.setPlainText(json.dumps(report['metadata'],ensure_ascii=False,indent=2)[:30000])
+            self.estimator.set_unit_count('mirror_masks',sum(bool(scan['image_indices']) for scan in report['scans']))
+            self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
+            self.estimator.set_unit_count('segmentation',sum(bool(scan['classification_eligible_metadata']) for scan in report['scans']))
+            self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
+            self.estimator.set_unit_indices('segmentation',[index for index,scan in enumerate(report['scans'],1)
+                                                            if scan['classification_eligible_metadata']])
         except Exception as error:
             self.log.appendPlainText(str(error))
 
@@ -840,13 +927,15 @@ class MainWindow(QMainWindow):
         self.settings_widget.setEnabled(not running)
         self.select_button.setEnabled(not running)
         self.saved_button.setEnabled(not running)
-        self.start_button.setEnabled(not running)
+        self.start_button.setEnabled(not running and self.source is not None)
         self.pause_button.setEnabled(running)
         self.cancel_button.setEnabled(running)
         self.resume_button.setEnabled(not running and self.config is not None and not self.finished_ok and not self.input_rejected)
         self.open_output.setEnabled(self.config is not None)
         self.open_log.setEnabled(self.config is not None)
         self.open_report.setEnabled(self.config is not None and (Path(self.config['output'])/'report.html').exists())
+        if not running:
+            self.validate()
 
     def worker_finished(self,code,status):
         self.read_stdout()
@@ -870,37 +959,16 @@ class MainWindow(QMainWindow):
     def update_clock(self):
         if self.finished_ok or not self.started or (not self.watching and self.process.state() == QProcess.ProcessState.NotRunning):
             return
-        elapsed = max(0,int(time.monotonic()-self.started))
-        import math
-        # The currently displayed phase can be ``scene`` while the work is
-        # still part of segmentation.  Use the root phase and its last genuine
-        # progress value for both estimates.
-        beginning = self.phase_starts.get(self.estimate_phase)
-        phase_elapsed = max(0,elapsed-beginning) if beginning is not None else 0
-        remaining_seconds = (phase_elapsed*(1-self.estimate_fraction)/self.estimate_fraction
-                             if beginning is not None and phase_elapsed >= 5 and .01 < self.estimate_fraction < 1 else None)
-        remaining = max(1,math.ceil(remaining_seconds/60)) if remaining_seconds is not None else None
-
-        if self.estimate_phase == 'segmentation' and remaining_seconds is not None:
-            # Mirror/glass analysis has no fixed relation to SAM segmentation:
-            # a difficult mirror job can take longer than all regular images.
-            # Once real segmentation work has progressed, extrapolate solely
-            # from its measured rate and reserve a small, bounded allowance for
-            # voting and file output.  This is deliberately independent of the
-            # fixed UI progress-bar weights.
-            tail_seconds = max(120, min(900, phase_elapsed * .12))
-            total_remaining = max(1,math.ceil((remaining_seconds+tail_seconds)/60))
-        elif self.estimate_phase == 'output' and remaining is not None:
-            total_remaining = remaining
-        else:
-            # Before segmentation yields its first measurable progress there
-            # is no defensible forecast for the remaining SAM work.  Showing a
-            # made-up number from weighted UI progress is more misleading than
-            # waiting until a rate can be measured.
-            total_remaining = None
+        elapsed = self.current_elapsed()
+        remaining = self.estimator.remaining(elapsed)
         self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+
-                            (tr('remaining',duration=format_duration(remaining*60)) if remaining is not None else tr('estimate_pending'))+' · '+
-                            (tr('total_remaining',duration=format_duration(total_remaining*60)) if total_remaining is not None else tr('total_estimate_pending')))
+                            (tr('remaining',duration=format_duration(remaining[2]),max_duration=format_duration(remaining[3])) if remaining is not None else tr('estimate_pending'))+' · '+
+                            (tr('total_remaining',duration=format_duration(remaining[0]),max_duration=format_duration(remaining[1])) if remaining is not None else tr('total_estimate_pending')))
+
+    def current_elapsed(self):
+        if self.elapsed_at_event is not None and self.elapsed_event_clock is not None:
+            return max(0.,self.elapsed_at_event+time.monotonic()-self.elapsed_event_clock)
+        return max(0.,time.monotonic()-self.started) if self.started else 0.
 
     def open_file(self,name):
         if self.config:

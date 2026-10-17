@@ -101,9 +101,11 @@ class DirectIndex:
         result = np.zeros(len(points), bool)
         bins = np.floor((points-self.origin)/self.block).astype(np.int64)
         unique, inverse = np.unique(bins, axis=0, return_inverse=True)
+        order = np.argsort(inverse, kind='stable')
+        offsets = np.r_[0, np.cumsum(np.bincount(inverse))]
         reach = int(np.ceil(radius/self.block))
         for i,cell in enumerate(unique):
-            ids = np.flatnonzero(inverse == i)
+            ids = order[offsets[i]:offsets[i+1]]
             for delta in product(range(-reach,reach+1), repeat=3):
                 key = tuple(map(int, cell+delta))
                 for rowid, scan, blob in self.db.execute('SELECT rowid,scan,points FROM fragments WHERE x=? AND y=? AND z=?', key):
@@ -111,7 +113,7 @@ class DirectIndex:
                         continue
                     if rowid not in self.cache:
                         self.cache[rowid] = cKDTree(np.frombuffer(blob, '<f8').reshape(-1,3))
-                        if len(self.cache) > 24:
+                        if len(self.cache) > 64:
                             self.cache.popitem(last=False)
                     tree = self.cache[rowid]
                     self.cache.move_to_end(rowid)

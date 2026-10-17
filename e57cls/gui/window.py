@@ -1,7 +1,10 @@
 """German Qt interface; expensive operations execute in a separate QProcess."""
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
+import shutil
+import sys
 import time
 from uuid import uuid4
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
@@ -40,6 +43,12 @@ class MainWindow(QMainWindow):
         self.process.readyReadStandardError.connect(self.read_stderr)
         self.process.finished.connect(self.worker_finished)
         self.process.errorOccurred.connect(self.process_error)
+        self.preview_process = QProcess(self)
+        self.preview_process.setWorkingDirectory(str(PROJECT))
+        self.preview_process.finished.connect(self.preview_finished)
+        self.preview_process.errorOccurred.connect(self.preview_error)
+        self.preview_key = None
+        self.preview_process_key = None
         self.pending = b''
         self.started = 0
         self.elapsed_at_event = None
@@ -126,6 +135,8 @@ class MainWindow(QMainWindow):
         # Opening a file must never immediately consume GPU time.  The first
         # page makes the user choose the intended workflow and classes first.
         self.update_source_ui()
+        if self.source:
+            QTimer.singleShot(0,self.start_preview)
         if auto_start and self.source:
             self.bottom.setText(tr('setup_required'))
 
@@ -172,6 +183,107 @@ class MainWindow(QMainWindow):
             self.bottom.setText(tr('setup_required') if selected else tr('no_source'))
         if hasattr(self,'start_button'):
             self.validate()
+
+    def set_summary_status(self,text,status=None):
+        self.summary.setText(text)
+        self.summary.setProperty('status',status)
+        self.summary.style().unpolish(self.summary)
+        self.summary.style().polish(self.summary)
+
+    def clear_inspection(self):
+        self.scan_table.setRowCount(0)
+        self.metadata.clear()
+
+    def preview_cache(self):
+        return Path(self.cache_path.text()).expanduser().resolve()/'preview'
+
+    def source_preview_key(self):
+        if self.source is None:
+            return None
+        source = self.source.resolve()
+        try:
+            stat = source.stat()
+            value = f'{source}|{stat.st_size}|{stat.st_mtime_ns}'
+        except OSError:
+            value = f'{source}|missing'
+        return sha256(value.encode('utf-8')).hexdigest()
+
+    def preview_directory(self,key):
+        return self.preview_cache()/key
+
+    def process_environment(self,cache):
+        cache = Path(cache)
+        env = QProcessEnvironment.systemEnvironment()
+        for key,value in {'PYTHONUNBUFFERED':'1','PYTHONUTF8':'1','PYTHONDONTWRITEBYTECODE':'1',
+                          'OMP_NUM_THREADS':'4','MKL_NUM_THREADS':'4','TEMP':str(cache/'temp'),
+                          'TMP':str(cache/'temp')}.items():
+            env.insert(key,value)
+        (cache/'temp').mkdir(parents=True,exist_ok=True)
+        return env
+
+    def preview_report_complete(self,path):
+        try:
+            report = json.loads(path.read_text(encoding='utf-8'))
+            return all(key in report for key in ('scan_count','image_count','record_count','scans','images','metadata'))
+        except (OSError,ValueError,TypeError):
+            return False
+
+    def start_preview(self):
+        if self.watching or self.source is None:
+            return
+        self.stop_preview()
+        key = self.source_preview_key()
+        if key is None:
+            return
+        self.preview_key = key
+        directory = self.preview_directory(key)
+        report_path = directory/'inspect_report.json'
+        self.clear_inspection()
+        if self.preview_report_complete(report_path):
+            if self.read_inspection(report_path):
+                return
+            shutil.rmtree(directory,ignore_errors=True)
+        elif directory.exists():
+            shutil.rmtree(directory,ignore_errors=True)
+        self.set_summary_status(tr('summary_loading'))
+        self.preview_progress.show()
+        self.preview_progress.setRange(0,0)
+        self.preview_process_key = key
+        self.preview_process.setProcessEnvironment(self.process_environment(self.preview_cache().parent))
+        self.preview_process.start(sys.executable,['-m','e57cls','inspect',str(self.source),'--out',str(directory),'--sample-points','0'])
+
+    def stop_preview(self):
+        self.preview_key = None
+        self.preview_process_key = None
+        self.preview_progress.hide()
+        if self.preview_process.state() != QProcess.ProcessState.NotRunning:
+            self.preview_process.kill()
+            self.preview_process.waitForFinished(5000)
+
+    def preview_finished(self,code,status):
+        key = self.preview_process_key
+        self.preview_process_key = None
+        if key is None or key != self.preview_key or key != self.source_preview_key():
+            return
+        self.preview_progress.hide()
+        report_path = self.preview_directory(key)/'inspect_report.json'
+        if code == 0 and self.preview_report_complete(report_path) and self.read_inspection(report_path):
+            return
+        details = bytes(self.preview_process.readAllStandardError()).decode(errors='replace').strip()
+        if details:
+            self.log.appendPlainText(details)
+        self.set_summary_status(tr('summary_failed'),'warning')
+
+    def preview_error(self,error):
+        if self.preview_process_key is None:
+            return
+        details = self.preview_process.errorString()
+        if details:
+            self.log.appendPlainText(details)
+        if error == QProcess.ProcessError.FailedToStart:
+            self.preview_process_key = None
+            self.preview_progress.hide()
+            self.set_summary_status(tr('summary_failed'),'warning')
 
     def card(self, title):
         frame = QFrame()
@@ -249,8 +361,12 @@ class MainWindow(QMainWindow):
         card.addWidget(hint)
         layout.addWidget(frame)
         frame,card = self.card('card_overview')
-        self.summary = QLabel(tr('summary_pending'))
+        self.summary = QLabel(tr('summary_no_source'))
         card.addWidget(self.summary)
+        self.preview_progress = QProgressBar()
+        self.preview_progress.setTextVisible(False)
+        self.preview_progress.hide()
+        card.addWidget(self.preview_progress)
         self.scan_table = QTableWidget(0,8)
         self.scan_table.setHorizontalHeaderLabels([tr(k) for k in ('scan','name','point_count','images','representation','pose','scene','status')])
         self.scan_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -358,11 +474,13 @@ class MainWindow(QMainWindow):
         specifications = {
             'image_scale':(.1,1.,.05),'tile_overlap':(0.,.8,.05),'min_observations':(1,100,1),
             'voxel_size':(.001,1.,.005),'tile_size':(336,1512,16),
-            'instance_confidence':(0.,1.,.05),'mask_confidence':(0.,1.,.05),'boundary_margin':(0,16,1),
+            'instance_confidence':(.2,1.,.05),'mask_confidence':(.2,1.,.05),'boundary_margin':(0,16,1),
             'min_winning_share':(0.,1.,.05),'view_size':(64,1512,16),'view_fov':(30,120,5),
             'component_min_voxels':(1,1000,1),'cable_component_min_voxels':(1,1000,1),
             'cable_component_min_span':(.01,10.,.01),'electrical_component_min_voxels':(1,1000,1),
             'electrical_component_min_span':(.01,10.,.01),'class_transfer_radius':(.001,.1,.001),
+            'surface_tie_share':(.5,1.,.01),'door_depth_limit':(.05,10.,.05),'door_max_width':(.1,10.,.1),'door_max_height':(.1,10.,.1),
+            'geometry_fill_min_area':(.01,1000.,.01),'geometry_fill_max_gap':(.01,2.,.01),'geometry_fill_tolerance':(.001,.2,.001),'geometry_fill_max_planes':(1,2000,1),
             'vegetation_ground_cell_size':(.02,2.,.01),'vegetation_ground_band':(.005,.5,.005),
             'building_boundary_cell_size':(.05,2.,.05),'building_boundary_min_height':(.1,10.,.1),
             'visibility_abs':(.001,.5,.01),'visibility_rel':(0.,.1,.005),'depth_width':(256,8192,256),
@@ -372,20 +490,22 @@ class MainWindow(QMainWindow):
             'scene_plane_tolerance':(.001,.1,.005),'scene_plane_fraction':(.1,1.,.05),
             'scene_ceiling_supported':(0.,1.,.01),'scene_upper_returns_indoor':(0.,1.,.05),
             'scene_open_sky_outdoor':(0.,1.,.01),'scene_open_sky_indoor_max':(0.,1.,.01),
-            'scene_sky_confidence':(0.,1.,.05),'scene_ceiling_confidence':(0.,1.,.05),
-            'stairs_min_confidence':(0.,1.,.05),
-            'mirror_mask_confidence':(0.,1.,.05),'mirror_fit_tolerance':(.001,.1,.005),
+            'scene_sky_confidence':(.2,1.,.05),'scene_ceiling_confidence':(.2,1.,.05),
+            'stairs_min_confidence':(.2,1.,.05),'stairs_plane_tolerance':(.001,.2,.001),
+            'stairs_planar_fraction':(.1,1.,.05),'stairs_min_rise':(.01,2.,.01),
+            'mirror_mask_confidence':(.2,1.,.05),'mirror_fit_tolerance':(.001,.1,.005),
             'mirror_plane_tolerance':(.001,.2,.005),'reflection_prompt_agreement':(1,8,1),
             'mirror_merge_angle':(.1,10.,.5),'mirror_merge_distance':(.001,.1,.005),
             'mirror_image_scale':(.1,1.,.05),'mirror_view_size':(336,1512,16),
             'mirror_max_range':(1.,100.,1.),'mirror_min_pixels':(10,10000,10),'mirror_mask_width':(512,4096,128),
-            'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1),'reflection_neighbor_radius':(.01,.5,.01)}
+            'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1),'reflection_neighbor_radius':(.01,.5,.01),
+            'mirror_shape_min_iou':(.1,1.,.01),'mirror_shape_max_growth':(1.,3.,.01),'mirror_edge_search':(0.,.5,.01)}
         groups = {
             'settings_group_segmentation': {'image_scale','tile_overlap','tile_size','view_size','view_fov','instance_confidence','mask_confidence','boundary_margin','gpu_memory_fraction'},
-            'settings_group_tuning_geometry': {'min_observations','voxel_size','min_winning_share','visibility_abs','visibility_rel','depth_width','class_transfer_radius'},
-            'settings_group_cleanup': {'component_min_voxels','cable_component_min_voxels','cable_component_min_span','electrical_component_min_voxels','electrical_component_min_span','vegetation_ground_cell_size','vegetation_ground_band','building_boundary_cell_size','building_boundary_min_height','stairs_min_confidence'},
+            'settings_group_tuning_geometry': {'min_observations','voxel_size','min_winning_share','surface_tie_share','door_depth_limit','door_max_width','door_max_height','visibility_abs','visibility_rel','depth_width','class_transfer_radius'},
+            'settings_group_cleanup': {'component_min_voxels','cable_component_min_voxels','cable_component_min_span','electrical_component_min_voxels','electrical_component_min_span','vegetation_ground_cell_size','vegetation_ground_band','building_boundary_cell_size','building_boundary_min_height','geometry_fill_min_area','geometry_fill_max_gap','geometry_fill_tolerance','geometry_fill_max_planes','stairs_min_confidence','stairs_plane_tolerance','stairs_planar_fraction','stairs_min_rise'},
             'settings_group_scene': {'scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor','scene_sky_indoor_max','scene_overhead_range','scene_plane_tolerance','scene_plane_fraction','scene_ceiling_supported','scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max','scene_sky_confidence','scene_ceiling_confidence'},
-            'settings_group_mirror_glass': {'mirror_mask_confidence','mirror_fit_tolerance','mirror_plane_tolerance','reflection_prompt_agreement','mirror_merge_angle','mirror_merge_distance','mirror_image_scale','mirror_view_size','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max','reflection_neighbor_radius'},
+            'settings_group_mirror_glass': {'mirror_mask_confidence','mirror_fit_tolerance','mirror_plane_tolerance','reflection_prompt_agreement','mirror_merge_angle','mirror_merge_distance','mirror_image_scale','mirror_view_size','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max','reflection_neighbor_radius','mirror_shape_min_iou','mirror_shape_max_growth','mirror_edge_search'},
         }
         for key,(low,high,step) in specifications.items():
             widget = QSpinBox() if isinstance(low,int) else QDoubleSpinBox()
@@ -406,7 +526,28 @@ class MainWindow(QMainWindow):
         self.output_format = QComboBox()
         for key in ('las','laz'):
             self.output_format.addItem(key.upper()+' 1.4',key)
+        self.output_format.addItem(tr('output_format_e57'), 'e57')
+        self.output_format.setCurrentIndex(max(0, self.output_format.findData(DEFAULTS['format'])))
+        self.output_format.setToolTip(tr('output_format_e57_tooltip'))
         self.settings_row(sections['settings_group_profile_output'],tr('output_format'),self.output_format)
+        self.point_reduction = QSpinBox()
+        self.point_reduction.setRange(0,95)
+        self.point_reduction.setSuffix(' %')
+        self.point_reduction.setValue(round(DEFAULTS['point_reduction']*100))
+        self.point_reduction.setToolTip(tr('point_reduction_tooltip'))
+        self.settings_row(sections['settings_group_profile_output'],tr('point_reduction'),self.point_reduction)
+        self.output_density = QComboBox()
+        self.output_density.addItem(tr('output_density_reduced'), 'reduced')
+        self.output_density.addItem(tr('output_density_original'), 'original')
+        self.output_density.setCurrentIndex(max(0, self.output_density.findData(DEFAULTS['output_density'])))
+        self.settings_row(sections['settings_group_profile_output'],tr('output_density'),self.output_density)
+        self.cache_cleanup = QComboBox()
+        for key in ('all', 'keep_masks', 'keep_all'):
+            self.cache_cleanup.addItem(tr('cache_cleanup_'+key), key)
+        self.cache_cleanup.setCurrentIndex(max(0, self.cache_cleanup.findData(DEFAULTS['cache_cleanup'])))
+        self.settings_row(sections['settings_group_profile_output'],tr('cache_cleanup'),self.cache_cleanup)
+        self.point_reduction.valueChanged.connect(self.update_output_density)
+        self.update_output_density()
         self.diagnostics = QComboBox()
         for key in ('off','sample','all'):
             self.diagnostics.addItem(tr('diagnostics_'+key),key)
@@ -421,15 +562,27 @@ class MainWindow(QMainWindow):
         self.stairs_priority = QCheckBox(tr('stairs_priority'))
         self.stairs_priority.setChecked(DEFAULTS['stairs_priority'])
         sections['settings_group_cleanup'].addRow(self.stairs_priority)
+        self.stairs_geometry_check = QCheckBox(tr('stairs_geometry_check'))
+        self.stairs_geometry_check.setChecked(DEFAULTS['stairs_geometry_check'])
+        sections['settings_group_cleanup'].addRow(self.stairs_geometry_check)
         self.component_cleanup = QCheckBox(tr('component_cleanup'))
         self.component_cleanup.setChecked(DEFAULTS['component_cleanup'])
         sections['settings_group_cleanup'].addRow(self.component_cleanup)
+        self.surface_tie_break = QCheckBox(tr('surface_tie_break'))
+        self.surface_tie_break.setChecked(DEFAULTS['surface_tie_break'])
+        sections['settings_group_cleanup'].addRow(self.surface_tie_break)
+        self.geometry_fill = QCheckBox(tr('geometry_fill'))
+        self.geometry_fill.setChecked(DEFAULTS['geometry_fill'])
+        sections['settings_group_cleanup'].addRow(self.geometry_fill)
         self.vegetation_base_to_ground = QCheckBox(tr('vegetation_base_to_ground'))
         self.vegetation_base_to_ground.setChecked(DEFAULTS['vegetation_base_to_ground'])
         sections['settings_group_cleanup'].addRow(self.vegetation_base_to_ground)
         self.building_enclosure = QCheckBox(tr('building_enclosure'))
         self.building_enclosure.setChecked(DEFAULTS['building_enclosure'])
         sections['settings_group_cleanup'].addRow(self.building_enclosure)
+        self.mirror_shape_regularize = QCheckBox(tr('mirror_shape_regularize'))
+        self.mirror_shape_regularize.setChecked(DEFAULTS['mirror_shape_regularize'])
+        sections['settings_group_mirror_glass'].addRow(self.mirror_shape_regularize)
         forms.addStretch()
 
     def run_tab(self):
@@ -476,6 +629,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(frame)
 
     def watch(self,output):
+        self.stop_preview()
         self.config = json.loads((Path(output)/'run.json').read_text(encoding='utf-8'))
         self.reset_estimator()
         self.elapsed_at_event = None
@@ -493,9 +647,17 @@ class MainWindow(QMainWindow):
         self.mirror.setChecked(self.config.get('mirror_analysis',False))
         self.glass.setChecked(self.config.get('glass_analysis',False))
         self.stairs_priority.setChecked(self.config.get('stairs_priority',False))
+        self.stairs_geometry_check.setChecked(self.config.get('stairs_geometry_check',DEFAULTS['stairs_geometry_check']))
         self.component_cleanup.setChecked(self.config.get('component_cleanup',DEFAULTS['component_cleanup']))
+        self.surface_tie_break.setChecked(self.config.get('surface_tie_break',DEFAULTS['surface_tie_break']))
+        self.geometry_fill.setChecked(self.config.get('geometry_fill',DEFAULTS['geometry_fill']))
         self.vegetation_base_to_ground.setChecked(self.config.get('vegetation_base_to_ground',DEFAULTS['vegetation_base_to_ground']))
         self.building_enclosure.setChecked(self.config.get('building_enclosure',DEFAULTS['building_enclosure']))
+        self.mirror_shape_regularize.setChecked(self.config.get('mirror_shape_regularize',DEFAULTS['mirror_shape_regularize']))
+        self.output_format.setCurrentIndex(max(0, self.output_format.findData(self.config.get('format',DEFAULTS['format']))))
+        self.point_reduction.setValue(round(100*self.config.get('point_reduction',DEFAULTS['point_reduction'])))
+        self.output_density.setCurrentIndex(max(0, self.output_density.findData(self.config.get('output_density',DEFAULTS['output_density']))))
+        self.cache_cleanup.setCurrentIndex(max(0, self.cache_cleanup.findData(self.config.get('cache_cleanup',DEFAULTS['cache_cleanup']))))
         self.scene_mode.setCurrentIndex(self.scene_mode.findData(self.config['scene_mode']))
         self.read_inspection()
         self.set_running(True)
@@ -668,14 +830,22 @@ class MainWindow(QMainWindow):
         for key,value in [('image_scale',scale),('tile_overlap',overlap),('min_observations',observations)]:
             self.controls[key].setValue(value)
 
+    def update_output_density(self):
+        identical = self.point_reduction.value() == 0
+        self.output_density.setEnabled(not identical)
+        if identical:
+            self.output_density.setCurrentIndex(self.output_density.findData('reduced'))
+
     def select_source(self):
         path,_ = QFileDialog.getOpenFileName(self,tr('select_input'),str(self.selection_directory()),'E57 (*.e57)')
         if path:
             self.source = Path(path).resolve()
             self.config = None
             self.overrides = {}
+            self.inspection_report = None
             self.save_last_folder()
             self.update_source_ui()
+            self.start_preview()
 
     def override_scene(self,row,column):
         if column != 6 or self.process.state() != QProcess.ProcessState.NotRunning:
@@ -691,15 +861,19 @@ class MainWindow(QMainWindow):
         if self.source is None or self.watching or self.process.state() != QProcess.ProcessState.NotRunning or not self.validate():
             return
         try:
+            self.stop_preview()
             settings = {key:widget.value() for key,widget in self.controls.items()}
             settings['prompt_batch'] = self.prompt_batch.currentData()
             settings.update(source=str(self.source),processing_mode=self.processing_mode.currentData(),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
                 mirror_analysis=self.mirror.isChecked(),glass_analysis=self.glass.isChecked(),
-                stairs_priority=self.stairs_priority.isChecked(),component_cleanup=self.component_cleanup.isChecked(),
+                stairs_priority=self.stairs_priority.isChecked(),stairs_geometry_check=self.stairs_geometry_check.isChecked(),component_cleanup=self.component_cleanup.isChecked(),
+                surface_tie_break=self.surface_tie_break.isChecked(),geometry_fill=self.geometry_fill.isChecked(),
                 vegetation_base_to_ground=self.vegetation_base_to_ground.isChecked(),
                 building_enclosure=self.building_enclosure.isChecked(),
+                mirror_shape_regularize=self.mirror_shape_regularize.isChecked(),
                 extra_no_reflection=self.extra.isChecked(),format=self.output_format.currentData(),
-                diagnostics=self.diagnostics.currentData(),cache=self.cache_path.text(),gpu_device=self.gpu.text(),strict=self.strict.isChecked(),
+                point_reduction=self.point_reduction.value()/100,output_density=self.output_density.currentData(),
+                diagnostics=self.diagnostics.currentData(),cache_cleanup=self.cache_cleanup.currentData(),cache=self.cache_path.text(),gpu_device=self.gpu.text(),strict=self.strict.isChecked(),
                 scene_overrides=self.overrides)
             self.config = resolve_config(settings)
             output = Path(self.config['output'])
@@ -718,7 +892,7 @@ class MainWindow(QMainWindow):
             self.phase.setText(tr('launch_failed'))
 
     def launch_worker(self):
-        import sys
+        self.cache_cleanup_freed = 0
         self.pending = b''
         self.started = time.monotonic()
         self.elapsed_at_event = None
@@ -732,13 +906,7 @@ class MainWindow(QMainWindow):
         self.reset_estimator()
         self.finished_ok = False
         self.input_rejected = False
-        env = QProcessEnvironment.systemEnvironment()
-        for key,value in {'PYTHONUNBUFFERED':'1','PYTHONUTF8':'1','PYTHONDONTWRITEBYTECODE':'1',
-                          'OMP_NUM_THREADS':'4','MKL_NUM_THREADS':'4','TEMP':str(Path(self.config['cache'])/'temp'),
-                          'TMP':str(Path(self.config['cache'])/'temp')}.items():
-            env.insert(key,value)
-        Path(self.config['cache'],'temp').mkdir(parents=True,exist_ok=True)
-        self.process.setProcessEnvironment(env)
+        self.process.setProcessEnvironment(self.process_environment(self.config['cache']))
         self.set_running(True)
         self.phase.setText(tr('state_running'))
         self.result_label.setText(tr('result_location',path=self.config['output']))
@@ -754,6 +922,7 @@ class MainWindow(QMainWindow):
             'segmentation': self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
         }
         self.estimator = RunEstimator(applies=applies,profile=load_profile(self.timing_profile_path))
+        self.apply_inspection_counts()
 
     def command(self,command):
         self.process.write((json.dumps({'version':1,'command':command})+'\n').encode())
@@ -867,6 +1036,8 @@ class MainWindow(QMainWindow):
             self.pause_button.setEnabled(event['state'] == 'running')
         elif kind == 'warning':
             self.log.appendPlainText(STRINGS.get(event.get('code'),tr('technical_warning')))
+        elif kind == 'cache_cleanup':
+            self.cache_cleanup_freed = event.get('freed_bytes', 0)
         elif kind == 'error':
             if event.get('code') == 'input_rejected':
                 self.input_rejected = True
@@ -887,7 +1058,8 @@ class MainWindow(QMainWindow):
             self.current_fraction = 1
             self.overall.setValue(1000)
             self.phase.setText(tr('run_done'))
-            self.result_label.setText(tr('result_ready',path=event['output']))
+            freed = getattr(self, 'cache_cleanup_freed', 0)/1_000_000_000
+            self.result_label.setText(tr('result_ready',path=event['output'])+f'\nZwischenspeicher freigegeben: {freed:.2f} GB')
             elapsed = int(event.get('elapsed_seconds',0))
             self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+tr('run_done'))
             if self.timing_profile_path:
@@ -898,10 +1070,11 @@ class MainWindow(QMainWindow):
         if kind != 'progress':
             self.log.appendPlainText(json.dumps(event,ensure_ascii=False))
 
-    def read_inspection(self):
+    def read_inspection(self,path=None):
         try:
-            report = json.loads((Path(self.config['output'])/'inspect_report.json').read_text(encoding='utf-8'))
-            self.summary.setText(tr('input_summary',scans=report['scan_count'],images=report['image_count'],points=report['record_count']))
+            report_path = Path(path) if path is not None else Path(self.config['output'])/'inspect_report.json'
+            report = json.loads(report_path.read_text(encoding='utf-8'))
+            self.set_summary_status(tr('input_summary',scans=report['scan_count'],images=report['image_count'],points=report['record_count']))
             self.scan_table.setRowCount(len(report['scans']))
             for row,scan in enumerate(report['scans']):
                 meta = scan['metadata']
@@ -913,14 +1086,23 @@ class MainWindow(QMainWindow):
                     self.scan_table.setItem(row,col,QTableWidgetItem(str(value)))
             self.scan_table.resizeColumnsToContents()
             self.metadata.setPlainText(json.dumps(report['metadata'],ensure_ascii=False,indent=2)[:30000])
-            self.estimator.set_unit_count('mirror_masks',sum(bool(scan['image_indices']) for scan in report['scans']))
-            self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
-            self.estimator.set_unit_count('segmentation',sum(bool(scan['classification_eligible_metadata']) for scan in report['scans']))
-            self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
-            self.estimator.set_unit_indices('segmentation',[index for index,scan in enumerate(report['scans'],1)
-                                                            if scan['classification_eligible_metadata']])
+            self.inspection_report = report
+            self.apply_inspection_counts()
+            return True
         except Exception as error:
             self.log.appendPlainText(str(error))
+            return False
+
+    def apply_inspection_counts(self):
+        report = getattr(self,'inspection_report',None)
+        if report is None:
+            return
+        self.estimator.set_unit_count('mirror_masks',sum(bool(scan['image_indices']) for scan in report['scans']))
+        self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
+        self.estimator.set_unit_count('segmentation',sum(bool(scan['classification_eligible_metadata']) for scan in report['scans']))
+        self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
+        self.estimator.set_unit_indices('segmentation',[index for index,scan in enumerate(report['scans'],1)
+                                                        if scan['classification_eligible_metadata']])
 
     def set_running(self,running):
         self.class_widget.setEnabled(not running and self.processing_mode.currentData() != 'filter_only')
@@ -977,6 +1159,7 @@ class MainWindow(QMainWindow):
                 os.startfile(str(path))
 
     def closeEvent(self,event):
+        self.stop_preview()
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.closing = True
             self.command('cancel')

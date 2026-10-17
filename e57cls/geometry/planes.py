@@ -2,12 +2,12 @@
 import numpy as np
 
 
-def fit_plane(points, tolerance=.02, seed=42, trials=200, min_fraction=.5, horizontal=False):
+def fit_plane(points, tolerance=.02, seed=42, trials=200, min_fraction=.5, horizontal=False, sample_limit=20_000):
     points = np.asarray(points, np.float64)
     if len(points) < 12:
         return None
     rng = np.random.default_rng(seed)
-    sample = points[rng.choice(len(points), min(len(points), 20000), replace=False)]
+    sample = points[rng.choice(len(points), min(len(points), sample_limit), replace=False)]
     origin = sample.mean(axis=0)
     centered = sample-origin
     best = np.zeros(len(sample), bool)

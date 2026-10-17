@@ -71,8 +71,8 @@ def sample_summary(chunk) -> dict:
 
 
 def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
-    if not 1 <= sample_points <= 1_000_000:
-        raise ValueError("Sample size must be between 1 and 1000000")
+    if not 0 <= sample_points <= 1_000_000:
+        raise ValueError("Sample size must be between 0 and 1000000")
     source = source.resolve(strict=True)
     before = source.stat()
     started = time.monotonic()
@@ -88,15 +88,20 @@ def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
             scan = {"index": index + 1, "metadata": item, **points,
                     "pose_status": pose_status(item.get("pose")), "image_indices": [],
                     "unit": "metre", "sample": None, "classification_eligible_metadata": False}
-            try:
-                generator = reader.chunks(index, sample_points, sample_points)
+            if sample_points == 0:
+                # The GUI preview needs metadata only.  A non-null marker keeps
+                # eligibility checks equivalent to an empty point sample.
+                scan["sample"] = {"records_read": 0}
+            else:
                 try:
-                    chunk = next(generator, None)
-                    scan["sample"] = sample_summary(chunk) if chunk is not None else {"records_read": 0}
-                finally:
-                    generator.close()
-            except (RuntimeError, ValueError) as error:
-                issues.append({"code": "point_sample_failed", "scan": index + 1, "detail": str(error)})
+                    generator = reader.chunks(index, sample_points, sample_points)
+                    try:
+                        chunk = next(generator, None)
+                        scan["sample"] = sample_summary(chunk) if chunk is not None else {"records_read": 0}
+                    finally:
+                        generator.close()
+                except (RuntimeError, ValueError) as error:
+                    issues.append({"code": "point_sample_failed", "scan": index + 1, "detail": str(error)})
             scans.append(scan)
         guid_map = {}
         for scan in scans:

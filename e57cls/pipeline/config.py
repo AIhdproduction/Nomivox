@@ -4,19 +4,29 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+from e57cls.seg.cache import SCORE_FLOOR
+
 PROJECT = Path(__file__).resolve().parents[2]
 DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "scene_mode": "both", "profile": "balanced", "image_scale": .90,
             "tile_size": 1008, "tile_overlap": .3, "prompt_batch": "auto", "instance_confidence": .4,
-            "mask_confidence": .6, "boundary_margin": 3, "voxel_size": .02, "min_observations": 1,
-            "min_winning_share": .55, "view_size": 1512, "view_fov": 95, "visibility_abs": .03,
+            "mask_confidence": .5, "boundary_margin": 2, "voxel_size": .02, "min_observations": 1,
+            "min_winning_share": .50, "surface_tie_break": True, "surface_tie_share": .55,
+            "surface_normal_radius": .06, "view_size": 1512, "view_fov": 95, "visibility_abs": .03,
             "visibility_rel": .01, "depth_width": 4096, "gpu_device": "cuda:0", "gpu_memory_fraction": .85,
             "mirror_analysis": True, "glass_analysis": True, "reflection_policy": "masked_depth",
-            "extra_no_reflection": False, "format": "las", "strict": False,
+            "extra_no_reflection": False, "format": "laz", "output_density": "reduced",
+            "point_reduction": .40, "strict": False,
+            "cache_cleanup": "all",
             "seed": 42, "scene_overrides": {}, "diagnostics": "sample",
             "component_cleanup": True, "component_min_voxels": 12,
             "cable_component_min_voxels": 8, "cable_component_min_span": .20,
             "electrical_component_min_voxels": 8, "electrical_component_min_span": .06,
             "class_transfer_radius": .01,
+            "depth_gate_classes": ["door"], "door_depth_limit": 1.0,
+            "door_max_width": 1.4, "door_max_height": 2.6,
+            "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "floor", "ground", "road", "sidewalk"],
+            "geometry_fill_min_area": .5, "geometry_fill_max_gap": .30, "geometry_fill_tolerance": .02,
+            "geometry_fill_max_planes": 400,
             "vegetation_base_to_ground": True, "vegetation_ground_cell_size": .10,
             "vegetation_ground_band": .04,
             "building_enclosure": True, "building_boundary_cell_size": .25,
@@ -27,6 +37,8 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "scen
             "scene_open_sky_outdoor": .10, "scene_open_sky_indoor_max": .05,
             "scene_sky_confidence": .65, "scene_ceiling_confidence": .5,
             "stairs_priority": True, "stairs_min_confidence": .65,
+            "stairs_priority_over": ["floor", "ground"], "stairs_geometry_check": True,
+            "stairs_plane_tolerance": .03, "stairs_planar_fraction": .85, "stairs_min_rise": .25,
             # Reflection masks keep the complete angular coverage of a panorama,
             # but do not need the much more expensive classification resolution.
             # A 1008 px view at 75 % scale fits in one SAM tile instead of the
@@ -36,7 +48,9 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "scen
             "mirror_fit_tolerance": .02, "mirror_plane_tolerance": .03,
             "mirror_confirmation_radius": .05, "mirror_merge_angle": 3., "mirror_merge_distance": .03,
             "mirror_max_range": 30., "mirror_min_pixels": 40, "mirror_frame_band": 10, "mirror_frame_band_max": 30,
-            "reflection_neighbor_radius": .05}
+            "reflection_neighbor_radius": .05,
+            "mirror_shape_regularize": True, "mirror_shape_kinds": ["mirror_mask", "glass_mask"],
+            "mirror_shape_min_iou": .75, "mirror_shape_max_growth": 1.35, "mirror_edge_search": .10}
 
 
 def resolve_config(config: dict, base: Path = PROJECT):
@@ -54,8 +68,15 @@ def resolve_config(config: dict, base: Path = PROJECT):
     for key, default in defaults.items():
         path = Path(value.get(key, default))
         value[key] = str((base/path).resolve() if not path.is_absolute() else path.resolve())
-    if value["format"] not in ("las", "laz") or value["scene_mode"] not in ("indoor", "outdoor", "both"):
+    if value["format"] not in ("las", "laz", "e57") or value["scene_mode"] not in ("indoor", "outdoor", "both"):
         raise ValueError("Invalid output format or scene mode")
+    if value["output_density"] not in ("reduced", "original"):
+        raise ValueError("Invalid output density")
+    if value["cache_cleanup"] not in ("all", "keep_masks", "keep_all"):
+        raise ValueError("Invalid cache cleanup mode")
+    if (not isinstance(value["point_reduction"], (int, float)) or isinstance(value["point_reduction"], bool)
+            or not 0 <= value["point_reduction"] <= .95):
+        raise ValueError("Invalid point reduction")
     if value["processing_mode"] not in ("classify_and_filter", "filter_only"):
         raise ValueError("Invalid processing mode")
     # A reflection-only run has no useful result without this analysis.  Keep this
@@ -65,9 +86,13 @@ def resolve_config(config: dict, base: Path = PROJECT):
     for key in ("image_scale", "mirror_image_scale", "gpu_memory_fraction"):
         if not 0 < value[key] <= 1:
             raise ValueError(f"Invalid {key}")
-    for key in ("instance_confidence", "mask_confidence", "min_winning_share"):
+    for key in ("instance_confidence", "mask_confidence", "min_winning_share", "surface_tie_share",
+                "mirror_shape_min_iou"):
         if not 0 <= value[key] <= 1:
             raise ValueError(f"Invalid {key}")
+    for key in ("instance_confidence", "mask_confidence"):
+        if value[key] < SCORE_FLOOR:
+            raise ValueError(f"{key} must be at least {SCORE_FLOOR}")
     if not 0 <= value["tile_overlap"] < 1 or not .001 <= value["voxel_size"] <= 1:
         raise ValueError("Invalid overlap or voxel size")
     if not 1 <= value["min_observations"] <= 65535 or not 0 <= value["boundary_margin"] <= 16:
@@ -90,19 +115,39 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'scene_sky_confidence','scene_ceiling_confidence','stairs_min_confidence'):
         if not 0 <= value[key] <= 1:
             raise ValueError(f'Invalid {key}')
+    for key in ('mirror_mask_confidence', 'scene_sky_confidence', 'scene_ceiling_confidence', 'stairs_min_confidence'):
+        if value[key] < SCORE_FLOOR:
+            raise ValueError(f'{key} must be at least {SCORE_FLOOR}')
     for key in ('scene_overhead_range','scene_plane_tolerance','mirror_fit_tolerance',
                 'mirror_plane_tolerance','mirror_confirmation_radius','mirror_merge_angle',
-                'mirror_merge_distance','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max'):
+                'mirror_merge_distance','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max',
+                'mirror_shape_max_growth','mirror_edge_search'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
-    if not isinstance(value['component_cleanup'], bool):
+    for key in ('stairs_plane_tolerance', 'stairs_min_rise'):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 < value[key] < float('inf')):
+            raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['stairs_planar_fraction'], (int, float)) or isinstance(value['stairs_planar_fraction'], bool)
+            or not 0 <= value['stairs_planar_fraction'] <= 1):
+        raise ValueError('Invalid stairs planar fraction')
+    if not isinstance(value['stairs_priority_over'], list) or not all(isinstance(item, str) for item in value['stairs_priority_over']):
+        raise ValueError('Invalid stairs priority classes')
+    if (not isinstance(value['component_cleanup'], bool) or not isinstance(value['surface_tie_break'], bool)
+            or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
+            or not isinstance(value['mirror_shape_regularize'], bool)):
         raise ValueError('Invalid component cleanup setting')
-    for key in ('component_min_voxels','cable_component_min_voxels','electrical_component_min_voxels'):
-        if not isinstance(value[key], int) or value[key] < 1:
+    for key in ('component_min_voxels','cable_component_min_voxels','electrical_component_min_voxels','geometry_fill_max_planes'):
+        if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
             raise ValueError(f'Invalid {key}')
-    for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius','reflection_neighbor_radius'):
+    for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius','reflection_neighbor_radius',
+                'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
+                'geometry_fill_max_gap','geometry_fill_tolerance'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['depth_gate_classes'], list) or not all(isinstance(item, str) for item in value['depth_gate_classes'])
+            or not isinstance(value['geometry_fill_classes'], list) or not all(isinstance(item, str) for item in value['geometry_fill_classes'])):
+        raise ValueError('Invalid geometry class list')
     if not isinstance(value['vegetation_base_to_ground'], bool):
         raise ValueError('Invalid vegetation ground setting')
     for key in ('vegetation_ground_cell_size','vegetation_ground_band'):
@@ -120,6 +165,9 @@ def resolve_config(config: dict, base: Path = PROJECT):
         raise ValueError('Unsupported reflection policy')
     if not isinstance(value['reflection_prompt_agreement'],int) or not 1 <= value['reflection_prompt_agreement'] <= 8:
         raise ValueError('Invalid reflection prompt agreement')
+    if (not isinstance(value['mirror_shape_kinds'], list)
+            or not all(isinstance(item, str) for item in value['mirror_shape_kinds'])):
+        raise ValueError('Invalid mirror shape kinds')
     return value
 
 

@@ -47,6 +47,7 @@ def test_added_classes_are_scene_scoped_and_have_english_prompts():
     assert {'toilet','bathtub','washbasin'} <= set(indoor[63]['prompts'])
     assert 75 in outdoor and 75 not in indoor and 'manhole cover' in outdoor[75]['prompts']
     assert 95 in outdoor and 95 not in indoor and 'tree trunk' in outdoor[95]['prompts']
+    assert 105 in outdoor and 105 in indoor and outdoor[105]['scene'] == 'both'
     assert 'tree trunk' not in outdoor[5]['prompts']
 
 

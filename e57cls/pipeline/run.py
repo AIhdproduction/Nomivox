@@ -7,19 +7,23 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
-from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.ndimage import label, maximum_filter, minimum_filter
 
 from e57cls.files import atomic_json, atomic_text, file_hash
 from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_to_camera
 from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
+from e57cls.geometry.fill import extract_planes
 from e57cls.io.inspector import inspect_file, markdown
 from e57cls.io.reader import E57Reader
-from e57cls.io.store import build_store, load_scan
+from e57cls.io.store import build_store, load_scan, reduced_store
 from e57cls.output.las import write_cloud
+from e57cls.output.e57 import write_e57
+from e57cls.output.classify import selected_count
 from e57cls.output.reports import legend_rows, write_legends, write_report
 from e57cls.output.diagnostics import save_overlay
 from e57cls.pipeline.control import Cancelled, Control
@@ -31,6 +35,38 @@ from e57cls.scene.detect import detect
 from e57cls.mirror.pipeline import build as build_mirrors
 
 LOG = logging.getLogger(__name__)
+
+
+def cleanup_run_cache(cache: Path, source_hash: str, identity: str, mask_cache: MaskCache, mode: str) -> dict:
+    """Remove only cache artifacts owned by the completed run."""
+    result = {"mode": mode, "freed_bytes": 0, "removed_paths_count": 0}
+    if mode == "keep_all":
+        return result
+    cache = cache.resolve()
+    targets = [cache/"scan_store"/source_hash, cache/"votes"/identity, cache/"geometry"/source_hash]
+    if mode == "all":
+        targets.extend(mask_cache.used_paths)
+    failures = []
+    for target in targets:
+        try:
+            target = Path(target).resolve()
+            if not target.is_relative_to(cache) or target == cache:
+                raise ValueError("refusing to remove path outside cache")
+            if not target.exists():
+                continue
+            if target.is_dir():
+                size = sum(item.stat().st_size for item in target.rglob("*") if item.is_file())
+                shutil.rmtree(target)
+            else:
+                size = target.stat().st_size
+                target.unlink()
+            result["freed_bytes"] += size
+            result["removed_paths_count"] += 1
+        except Exception as error:
+            failures.append({"path": str(target), "detail": str(error)})
+    if failures:
+        result["incomplete"] = failures
+    return result
 
 
 class InputNotClassifiable(ValueError):
@@ -112,7 +148,7 @@ def evidence_map(scores, classes, config):
     ids = {c['id']: i for i,c in enumerate(classes)}
     if config['stairs_priority'] and 'stairs' in ids:
         stair = ids['stairs']
-        competitors = [ids[k] for k in ('floor','ceiling','ground') if k in ids]
+        competitors = [ids[key] for key in config['stairs_priority_over'] if key in ids]
         preferred = np.isin(labels,competitors) & (stacked[stair] >= config['stairs_min_confidence'])
         labels[preferred] = stair
         confidence[preferred] = stacked[stair][preferred]
@@ -129,6 +165,41 @@ def evidence_map(scores, classes, config):
     return labels, confidence
 
 
+def depth_gate_representatives(labels, pixels, camera_range, world, chosen, classes, config):
+    """Return representatives which must not cast a depth-gated class vote.
+
+    ``pixels`` and ``chosen`` describe only visible/projectable representatives.
+    A rejected representative deliberately gets no fallback label from this
+    view: semantic masks have exactly one label per pixel.
+    """
+    blocked = np.zeros(len(chosen), bool)
+    report = {'components': 0, 'rejected_representatives': 0}
+    targets = {index for index, item in enumerate(classes) if item['id'] in config['depth_gate_classes']}
+    if not targets or not len(chosen):
+        return blocked, report
+    structure = np.ones((3, 3), np.uint8)
+    for target in sorted(targets):
+        components, count = label(labels == target, structure=structure)
+        for component in range(1, count+1):
+            ids = np.flatnonzero((chosen == target) & (components[pixels[:, 1], pixels[:, 0]] == component))
+            if len(ids) < 10:
+                continue
+            report['components'] += 1
+            reference = float(np.percentile(camera_range[ids], 10))
+            keep = ids[camera_range[ids] <= reference+config['door_depth_limit']]
+            reject = np.setdiff1d(ids, keep, assume_unique=True)
+            if len(keep):
+                core = keep[camera_range[keep] <= reference+.15]
+                core = core if len(core) else keep
+                center = np.median(world[core], axis=0)
+                horizontal = np.linalg.norm(world[keep, :2]-center[:2], axis=1) <= config['door_max_width']/2
+                vertical = np.abs(world[keep, 2]-center[2]) <= config['door_max_height']/2
+                reject = np.unique(np.r_[reject, keep[~(horizontal & vertical)]])
+            blocked[reject] = True
+            report['rejected_representatives'] += int(len(reject))
+    return blocked, report
+
+
 def classify_scan(reader, store, inspection, config, work, image_cache, mask_cache,
                   model_hash, factory, control, classes, all_classes, identity, mirrors=None):
     scan = store.meta["scan_index"]
@@ -143,7 +214,8 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
     global_columns = np.array([by_id[c["id"]] for c in classes])
     prompt_classes = [PromptClass(c["id"], tuple(c["prompts"]), c.get("min_instance_conf") if c.get("min_instance_conf") is not None else config["instance_confidence"]) for c in classes]
     scan_pose = Pose.from_dict(store.meta["metadata"]["pose"])
-    stats = {"hits": 0, "misses": 0, "views": 0, "representatives": count}
+    stats = {"hits": 0, "misses": 0, "views": 0, "representatives": count,
+             "depth_gate": {'components': 0, 'rejected_representatives': 0, 'seconds': 0.}}
     rep_states = None
     try:
         if mirrors:
@@ -180,6 +252,43 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
                 if config['diagnostics'] == 'all' or (config['diagnostics'] == 'sample' and view_index == 0):
                     save_overlay(config['output'],scan,item['index'],view_index,rendered,labels,classes)
                 h, w = labels.shape
+                # Build a small per-view gate map before accumulating votes.
+                # The geometry is evaluated only for labels which can be gated
+                # (normally ``door``), keeping other semantic classes fast.
+                blocked = np.zeros(count, bool)
+                target_indices = {index for index, item in enumerate(classes) if item['id'] in config['depth_gate_classes']}
+                if target_indices:
+                    gate_started = time.monotonic()
+                    gate_ids, gate_pixels, gate_ranges, gate_world, gate_labels = [], [], [], [], []
+                    for start in range(0, count, 50_000):
+                        control.checkpoint()
+                        world = reps['xyz'][start:start+50_000]
+                        camera_points = camera_pose.from_world(world)
+                        camera_uv, camera_range, camera_valid = camera.project(camera_points)
+                        visible = depth_buffer.visible(camera_uv*np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height]),
+                                                       camera_range, camera_valid, config['visibility_abs'], config['visibility_rel'])
+                        if mirrors:
+                            visible &= rep_states[start:start+50_000] != 2
+                        uv, _, projected = view.project(camera_points) if view else (camera_uv, camera_range, camera_valid)
+                        size = np.array([view.size, view.size] if view else [camera.width, camera.height])
+                        ids = np.flatnonzero(visible & projected)
+                        if not len(ids):
+                            continue
+                        pixels = np.floor(uv[ids]*np.array([w, h])/size).astype(int)
+                        pixels[:, 0] = pixels[:, 0].clip(0, w-1)
+                        pixels[:, 1] = pixels[:, 1].clip(0, h-1)
+                        chosen = labels[pixels[:, 1], pixels[:, 0]]
+                        take = np.isin(chosen, list(target_indices))
+                        if take.any():
+                            gate_ids.append(start+ids[take]); gate_pixels.append(pixels[take]); gate_ranges.append(camera_range[ids[take]])
+                            gate_world.append(world[ids[take]]); gate_labels.append(chosen[take])
+                    if gate_ids:
+                        local, gate_report = depth_gate_representatives(labels, np.concatenate(gate_pixels), np.concatenate(gate_ranges),
+                                                                         np.concatenate(gate_world), np.concatenate(gate_labels), classes, config)
+                        blocked[np.concatenate(gate_ids)[local]] = True
+                        for key, value in gate_report.items():
+                            stats['depth_gate'][key] += value
+                    stats['depth_gate']['seconds'] += time.monotonic()-gate_started
                 for start in range(0, count, 50_000):
                     control.checkpoint()
                     world = reps["xyz"][start:start+50_000]
@@ -198,7 +307,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
                     pixels[:, 0] = pixels[:, 0].clip(0, w-1)
                     pixels[:, 1] = pixels[:, 1].clip(0, h-1)
                     chosen = labels[pixels[:, 1], pixels[:, 0]]
-                    accepted = chosen >= 0
+                    accepted = (chosen >= 0) & ~blocked[start+ids]
                     columns = global_columns[chosen[accepted]]
                     weights[start+ids[accepted], columns] = np.maximum(weights[start+ids[accepted], columns],
                         confidence[pixels[accepted, 1], pixels[accepted, 0]])
@@ -241,6 +350,10 @@ def execute(config, backend_factory=None, listen=True):
     cleanup_report = None
     vegetation_report = None
     building_report = None
+    stairs_geometry_report = None
+    surface_tie_report = None
+    geometry_fill_report = None
+    geometry_planes = None
     def factory():
         nonlocal backend
         if backend is None:
@@ -265,7 +378,8 @@ def execute(config, backend_factory=None, listen=True):
             raise InputNotClassifiable(strings[reason])
         store_report = build_store(source, cache/"scan_store", progress=lambda s,n,t: control.checkpoint())
         atomic_json(output/"store_report.json", store_report)
-        stores = [load_scan(Path(item["path"]), store_report["source_sha256"], verify_hashes=False) for item in store_report["scans"]]
+        full_stores = [load_scan(Path(item["path"]), store_report["source_sha256"], verify_hashes=False) for item in store_report["scans"]]
+        stores = [reduced_store(store, config["point_reduction"], config["seed"]) for store in full_stores]
         if not stores:
             raise ValueError("E57 contains no scans")
         preset = json.loads(Path(config["preset"]).read_text(encoding="utf-8"))
@@ -309,6 +423,9 @@ def execute(config, backend_factory=None, listen=True):
                 timings['mirror'] = time.monotonic()-mirror_start
                 warnings.append({'code':'mirror_limits'})
                 for item in mirrors.report['images']:
+                    if item.get('failed'):
+                        warnings.append({'code':'mirror_image_failed','scan':item['scan'],
+                                         'image':item['image'],'mask_kind':item['kind'],'detail':item['error']})
                     if any(not region['accepted'] for region in item['regions']):
                         warnings.append({'code':'reflection_plane_missing','scan':item['scan'],
                                          'image':item['image'],'mask_kind':item['kind']})
@@ -352,6 +469,11 @@ def execute(config, backend_factory=None, listen=True):
                                 reps._mmap.close()
                                 weights._mmap.close()
                         votes.add_scan(scan, identity, batches(), codes)
+                        # The committed SQLite vote rows are the resume boundary.
+                        # Representatives remain useful for diagnostics, but these
+                        # large per-scan intermediates are no longer needed.
+                        weights_path.unlink(missing_ok=True)
+                        (work/f"scan_{scan:04d}"/"mirror_rep.npy").unlink(missing_ok=True)
                         scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
                     except Cancelled:
                         raise
@@ -371,15 +493,27 @@ def execute(config, backend_factory=None, listen=True):
                 control.event("phase_started", phase="voting")
                 vote_start = time.monotonic()
                 by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
-                priority = {'code': by_id['stairs'], 'over': [by_id[k] for k in ('floor','ceiling','ground') if k in by_id],
+                priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
                             'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
                 votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority)
+                if config['surface_tie_break']:
+                    tie_started = time.monotonic()
+                    surface_tie_report = votes.resolve_surface_ties(
+                        by_id, np.array(config['voxel_origin']), config['voxel_size'], config['surface_tie_share'],
+                        config['surface_normal_radius'], config['min_observations'],
+                        [store.meta['metadata']['pose']['translation']['z'] for store in stores], control.checkpoint)
+                    timings['surface_ties'] = time.monotonic()-tie_started
                 if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
                     barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
                     building_report = votes.split_ground_floor_by_building(
                         by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
                         config['building_boundary_max_cells'], control.checkpoint)
+                if config['stairs_geometry_check'] and 'stairs' in by_id:
+                    stairs_geometry_report = votes.reject_planar_stairs(
+                        by_id['stairs'], np.array(config['voxel_origin']), config['voxel_size'],
+                        config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
+                        config['seed'], codes, control.checkpoint)
                 if config['component_cleanup']:
                     cleanup_rules = []
                     if 'cable' in by_id:
@@ -394,6 +528,12 @@ def execute(config, backend_factory=None, listen=True):
                     vegetation_report = votes.vegetation_bases_to_ground(
                         by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
                         config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
+                if config['geometry_fill']:
+                    fill_started = time.monotonic()
+                    geometry_planes = work/'planes.npz'
+                    geometry_fill_report = extract_planes(votes, by_id, np.array(config['voxel_origin']), config['voxel_size'],
+                                                         config, geometry_planes, control.checkpoint)
+                    timings['geometry_fill_planes'] = time.monotonic()-fill_started
                 timings["voting"] = time.monotonic()-vote_start
                 control.event("phase_finished", phase="voting")
             else:
@@ -408,18 +548,26 @@ def execute(config, backend_factory=None, listen=True):
         path = output/f"{source.stem}_{suffix}.{config['format']}"
         if path.exists():
             raise FileExistsError("Completed output exists; choose a new run directory")
-        result = write_cloud(path, stores, votes, np.array(config["voxel_origin"]), config["voxel_size"],
-                             inspection["metadata"].get("coordinateMetadata", ""), [r["code"] for r in rows], skipped,
-                             control.checkpoint, lambda phase,fraction,scan: control.event("progress", phase=phase, fraction=fraction, scan=scan),
-                             mirror=mirrors.output if mirrors else None,
-                             no_reflection=config['extra_no_reflection'],
-                             primary_without_reflections=not semantic_run,
-                             class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.)
+        writer = write_e57 if config["format"] == "e57" else write_cloud
+        output_args = (path, source, stores, votes, np.array(config["voxel_origin"]), config["voxel_size"], [r["code"] for r in rows], skipped,
+                       control.checkpoint, lambda phase,fraction,scan: control.event("progress", phase=phase, fraction=fraction, scan=scan)) if writer is write_e57 else (
+                       path, stores, votes, np.array(config["voxel_origin"]), config["voxel_size"], inspection["metadata"].get("coordinateMetadata", ""),
+                       [r["code"] for r in rows], skipped, control.checkpoint,
+                       lambda phase,fraction,scan: control.event("progress", phase=phase, fraction=fraction, scan=scan))
+        result = writer(*output_args, mirror=mirrors.output if mirrors else None,
+                        no_reflection=config['extra_no_reflection'], primary_without_reflections=not semantic_run,
+                        class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.,
+                        output_density=config['output_density'],
+                        geometry_planes=geometry_planes if semantic_run and config['geometry_fill'] else None,
+                        geometry_fill_tolerance=config['geometry_fill_tolerance'])
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}
         if any(omitted.values()):
             warnings.append({"code": "attributes_omitted"})
+        result.update(point_reduction=config["point_reduction"], output_density=config["output_density"],
+                      computed_points=sum(selected_count(store, "reduced") for store in stores),
+                      output_points=result["record_count"], format=config["format"])
         report = {"schema_version": 1, "input": inspection["source"], "input_sha256": input_hash,
                   "output": result, "scans": scan_results, "skipped_scans": skipped, "warnings": warnings,
                   "invalid_counts": {str(s.meta["scan_index"]): s.meta["invalid_count"] for s in stores},
@@ -428,13 +576,36 @@ def execute(config, backend_factory=None, listen=True):
                   "gpu_reductions": backend.reductions if backend else [], "seed": config["seed"],
                   "sampled_peak_rss_bytes": control.peak_rss, "sampled_peak_handles": control.peak_handles,
                   "stairs_priority_overrides": votes.priority_overrides,
+                  "stairs_geometry": stairs_geometry_report,
+                  "surface_ties": surface_tie_report,
                   "component_cleanup": cleanup_report,
                   "vegetation_base_to_ground": vegetation_report, "building_enclosure": building_report,
+                  "depth_gate": {str(item['scan']): item.get('depth_gate', {}) for item in scan_results if 'scan' in item},
+                  "geometry_fill": {**(geometry_fill_report or {'planes': {}}),
+                                    'filled_points': result.get('geometry_fill_counts', {}),
+                                    'confidence': 96},
+                  "mask_cache_behavior": "Mask identities include the prompts of one class. Removing doorway invalidates only door masks; other class masks remain reusable.",
                   "reflection_analysis": mirrors.report if mirrors else None,
                   "time_policy": "GPS time is zero when time base is not verified",
                   "return_policy": "Return number/count are zero when unavailable",
                   "created_utc": datetime.now(timezone.utc).isoformat()}
         write_report(output, report, rows)
+        # Output writers have completed their read-back verification and the
+        # report is durable before run-owned cache is removed.  Closing first
+        # matters on Windows, where memmaps and SQLite keep file handles open.
+        if mirrors:
+            mirrors.close()
+            mirrors = None
+        if votes:
+            votes.close()
+            votes = None
+        cleanup = cleanup_run_cache(cache, input_hash, identity, mask_cache, config['cache_cleanup'])
+        report['cache_cleanup'] = {key: value for key, value in cleanup.items() if key != 'incomplete'}
+        if cleanup.get('incomplete'):
+            warnings.append({'code': 'cache_cleanup_incomplete', 'detail': cleanup['incomplete']})
+            report['warnings'] = warnings
+        write_report(output, report, rows)
+        control.event('cache_cleanup', **report['cache_cleanup'])
         control.event("phase_finished", phase="output")
         control.event("finished", output=str(path), report=str(output/"report.html"))
         return report

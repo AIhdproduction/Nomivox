@@ -1,18 +1,14 @@
 """LAS 1.4 streaming output with preserved RGB and explicit scan membership."""
 
-from collections import OrderedDict
 from itertools import product
 from pathlib import Path
-import sqlite3
-import tempfile
 
 import laspy
 from laspy.vlrs.known import WktCoordinateSystemVlr
 import numpy as np
-from scipy.spatial import cKDTree
 
 from e57cls.geometry.cameras import Pose
-from e57cls.vote.engine import voxel_keys
+from e57cls.output.classify import ClassPointIndex as SharedClassPointIndex, ClassifiedSource, output_chunks, selected_count
 
 
 def make_header(stores, crs_wkt="", scale=.001):
@@ -49,61 +45,15 @@ def scaled_attribute(values, limits, low_key, high_key):
     return np.rint(np.clip((values-limits[low_key])/(limits[high_key]-limits[low_key]), 0, 1)*65535).astype(np.uint16)
 
 
-class ClassPointIndex:
-    """Disk-backed, bounded lookup for direct semantic neighbours."""
-    def __init__(self, path, origin, block=.05):
-        self.db = sqlite3.connect(path)
-        self.db.execute('CREATE TABLE fragments(x INTEGER,y INTEGER,z INTEGER,points BLOB,codes BLOB)')
-        self.db.execute('CREATE INDEX spatial ON fragments(x,y,z)')
-        self.origin, self.block, self.cache = np.asarray(origin), block, OrderedDict()
-
-    def add(self, points, codes):
-        if not len(points):
-            return
-        bins = np.floor((points-self.origin)/self.block).astype(np.int64)
-        cells, inverse = np.unique(bins, axis=0, return_inverse=True)
-        order = np.argsort(inverse, kind='stable')
-        offsets = np.r_[0, np.cumsum(np.bincount(inverse))]
-        rows = []
-        for index, cell in enumerate(cells):
-            ids = order[offsets[index]:offsets[index+1]]
-            rows.append((*map(int, cell), np.ascontiguousarray(points[ids], '<f8').tobytes(),
-                         np.ascontiguousarray(codes[ids], np.uint8).tobytes()))
-        self.db.executemany('INSERT INTO fragments VALUES(?,?,?,?,?)', rows)
-
-    def nearest_codes(self, points, radius):
-        result, best = np.zeros(len(points), np.uint8), np.full(len(points), np.inf)
-        bins = np.floor((points-self.origin)/self.block).astype(np.int64)
-        cells, inverse = np.unique(bins, axis=0, return_inverse=True)
-        reach = int(np.ceil(radius/self.block))
-        for number, cell in enumerate(cells):
-            ids = np.flatnonzero(inverse == number)
-            for delta in product(range(-reach, reach+1), repeat=3):
-                key = tuple(map(int, cell+delta))
-                for rowid, xyz, codes in self.db.execute('SELECT rowid,points,codes FROM fragments WHERE x=? AND y=? AND z=?', key):
-                    if rowid not in self.cache:
-                        self.cache[rowid] = (cKDTree(np.frombuffer(xyz, '<f8').reshape(-1, 3)), np.frombuffer(codes, np.uint8))
-                        if len(self.cache) > 24:
-                            self.cache.popitem(last=False)
-                    tree, labels = self.cache[rowid]
-                    self.cache.move_to_end(rowid)
-                    distances, local = tree.query(points[ids], distance_upper_bound=radius)
-                    take = distances < best[ids]
-                    if np.any(take):
-                        selected = ids[take]
-                        best[selected] = distances[take]
-                        result[selected] = labels[local[take]]
-        return result
-
-    def close(self):
-        self.cache.clear()
-        self.db.close()
+# Backwards-compatible public import; both writers use the shared implementation.
+ClassPointIndex = SharedClassPointIndex
 
 
 def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_codes,
                 skipped=(), checkpoint=lambda: None, progress=lambda *args: None,
                 mirror=None, no_reflection=False, primary_without_reflections=False,
-                class_transfer_radius=0.):
+                class_transfer_radius=0., output_density="reduced", geometry_planes=None,
+                geometry_fill_tolerance=.02):
     header = make_header(stores, crs_wkt)
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -113,54 +63,29 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
     warnings = []
     sample_indices, sample_xyz, sample_scan = [], [], []
     rng = np.random.default_rng(42)
-    total = sum(s.meta["valid_count"] for s in stores)
+    total = sum(selected_count(store, output_density) for store in stores)
     wanted = np.sort(rng.choice(total, size=min(total, 100_000), replace=False)) if total else np.array([], int)
-    extra_writer = laspy.open(extra_temp, mode="w", header=header, do_compress=path.suffix==".laz") if no_reflection else None
-    temporary_directory = tempfile.TemporaryDirectory(prefix='e57cls_class_neighbours_') if class_transfer_radius else None
-    neighbours = ClassPointIndex(Path(temporary_directory.name)/'classes.sqlite', origin) if temporary_directory else None
-
-    def classify(store, start, stop, xyz, valid):
-        world = Pose.from_dict(store.meta["metadata"]["pose"]).to_world(xyz[valid])
-        codes, confidence = votes.lookup(voxel_keys(world, origin, voxel_size))
-        if store.meta['scan_index'] in skipped:
-            codes[:] = 1
-            confidence[:] = 0
-        states = np.zeros(len(world), np.uint8)
-        if mirror:
-            codes, states = mirror(store, start, stop, valid, world, codes)
-        return world, codes, confidence, states
+    laz_backend = (getattr(laspy.LazBackend, "LazrsParallel", laspy.LazBackend.Lazrs)
+                   if path.suffix.lower() == ".laz" else None)
+    writer_options = {"do_compress": path.suffix.lower()==".laz"}
+    if laz_backend is not None:
+        writer_options["laz_backend"] = laz_backend
+    extra_writer = laspy.open(extra_temp, mode="w", header=header, **writer_options) if no_reflection else None
     try:
-        # Index only direct predictions.  Filled points never become a source,
-        # so a 1 cm bridge cannot spread across an unclassified gap.
-        if neighbours:
-            for store in stores:
-                for start, xyz, valid in store.chunks():
-                    checkpoint()
-                    world, codes, _, _ = classify(store, start, start+len(xyz), xyz, valid)
-                    direct = (codes != 1) & (codes != 68)
-                    neighbours.add(world[direct], codes[direct])
-            neighbours.db.commit()
-        with laspy.open(temporary, mode="w", header=header, do_compress=path.suffix==".laz") as writer:
+        with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
+                              geometry_planes, geometry_fill_tolerance) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]
                 pose = Pose.from_dict(meta["pose"])
-                for start, xyz, valid in store.chunks():
+                for start, xyz, valid in output_chunks(store, output_density):
                     checkpoint()
                     stop = start+len(xyz)
                     world = pose.to_world(xyz[valid])
                     n = len(world)
                     if not n:
                         continue
-                    world, codes, confidence, states = classify(store, start, stop, xyz, valid)
-                    if neighbours:
-                        unknown = codes == 1
-                        inherited = neighbours.nearest_codes(world[unknown], class_transfer_radius)
-                        assigned = inherited != 0
-                        ids = np.flatnonzero(unknown)[assigned]
-                        codes[ids] = inherited[assigned]
-                        confidence[ids] = np.maximum(confidence[ids], 128)
-                        inherited_count += len(ids)
+                    world, codes, confidence, states = classified.block(store, start, xyz, valid, output_density, world)
                     if not np.isin(codes, allowed_codes).all() or (codes == 0).any():
                         raise ValueError("Output class missing from legend or forbidden code 0")
                     points = laspy.ScaleAwarePointRecord.zeros(n, header=header)
@@ -208,6 +133,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     counts += np.bincount(codes, minlength=256)
                     mirrors += np.bincount(states, minlength=5)
                     progress("output", written/max(1,total), scan)
+        inherited_count = classified.class_transfer_count
         if extra_writer:
             extra_writer.close()
             extra_writer = None
@@ -219,7 +145,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
             # after reflection points are omitted; still verify the whole file's
             # classes and point count.
             sample_indices, sample_xyz, sample_scan = [], [], []
-        verification = verify_readback(temporary, expected_output_count, sample_indices, sample_xyz, sample_scan, allowed_codes)
+        verification = verify_readback(temporary, expected_output_count, sample_indices, sample_xyz, sample_scan, allowed_codes,
+                                       laz_backend=laz_backend)
         temporary.replace(path)
         if no_reflection:
             extra_temp.replace(extra)
@@ -231,25 +158,28 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 "unclassified_share": int(output_counts[1])/max(1,expected_output_count), "mirror_counts": mirrors.tolist(),
                 "extra_output": str(extra) if no_reflection else None, "extra_removed_count": discarded,
                 "class_transfer_count": inherited_count,
+                "geometry_fill_counts": classified.geometry_fill_counts,
                 "readback": verification, "warnings": warnings, "las_scale_m": header.scales.tolist()}
     finally:
         if extra_writer:
             extra_writer.close()
-        if neighbours:
-            neighbours.close()
-        if temporary_directory:
-            temporary_directory.cleanup()
 
 
-def verify_readback(path, expected_count, indices, xyz, scans, allowed_codes):
+def verify_readback(path, expected_count, indices, xyz, scans, allowed_codes, laz_backend=None):
     indices, xyz, scans = np.asarray(indices), np.asarray(xyz), np.asarray(scans)
     max_error = np.zeros(3)
+    allowed = np.zeros(256, bool)
+    allowed_codes = np.asarray(allowed_codes)
+    valid_codes = allowed_codes[(allowed_codes >= 0) & (allowed_codes < 256)]
+    allowed[valid_codes.astype(np.uint8)] = True
     offset = 0
-    with laspy.open(path) as reader:
+    options = {"laz_backend": laz_backend} if laz_backend is not None else {}
+    with laspy.open(path, **options) as reader:
         if reader.header.point_count != expected_count or reader.header.point_format.id not in (6, 7):
             raise RuntimeError("LAS header readback failed")
-        for block in reader.chunk_iterator(100_000):
-            if not np.isin(np.asarray(block.classification), allowed_codes).all() or (np.asarray(block.classification) == 0).any():
+        for block in reader.chunk_iterator(500_000):
+            classification = np.asarray(block.classification)
+            if not allowed[classification].all() or (classification == 0).any():
                 raise RuntimeError("LAS classification readback failed")
             left, right = np.searchsorted(indices, [offset, offset+len(block)])
             local = indices[left:right]-offset

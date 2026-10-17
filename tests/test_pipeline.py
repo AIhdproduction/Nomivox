@@ -98,7 +98,7 @@ def test_reflection_export_and_uncertain_mask_semantics(tmp_path,monkeypatch,sta
     config=resolve_config(dict(source=str(source),cache=str(tmp_path/'cache'),output=str(tmp_path/'output'),
                                preset=str(path),model=str(model),scene_mode='indoor',profile='fast',
                                view_size=128,boundary_margin=0,depth_width=256,mirror_analysis=True,
-                               component_cleanup=False))
+                               component_cleanup=False,point_reduction=0,format='las'))
     class Analysis:
         registry=type('Registry',(),{'planes':[]})()
         report={'images':[],'scans':{}}
@@ -130,7 +130,8 @@ def test_full_pipeline_and_voting_only_rerun(tmp_path):
     config = resolve_config(dict(source=str(source), cache=str(tmp_path/'c'), output=str(tmp_path/'out'),
                                  preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
                                  view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False,
-                                 component_cleanup=False))
+                                 component_cleanup=False, point_reduction=0, format='las',
+                                 cache_cleanup='keep_masks'))
     backend = Backend()
     report = execute(config, lambda: backend, listen=False)
     assert report['output']['record_count'] == 121
@@ -155,6 +156,92 @@ def test_full_pipeline_and_voting_only_rerun(tmp_path):
                 raise Cancelled()
             return super().predict_tile(image,classes)
     assert execute(config,Interrupted,listen=False) == {'cancelled':True}
+    assert (Path(config['cache']) / 'scan_store' / file_hash(source)).is_dir()
+    assert list((Path(config['cache']) / 'seg').glob('*.npz'))
     resumed = execute(config,Backend,listen=False)
     assert resumed['output']['class_counts'] == report['output']['class_counts']
     assert resumed['sam_calls'] < report['sam_calls']
+
+
+def test_default_reduction_writes_laz_density(tmp_path):
+    source = tmp_path/'default.e57'; small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset_path = tmp_path/'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path/'model.pt'; model.write_bytes(b'synthetic backend')
+    config = resolve_config(dict(source=str(source), cache=str(tmp_path/'cache'), output=str(tmp_path/'out'),
+                                 preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False,
+                                 component_cleanup=False))
+    report = execute(config, lambda: Backend(), listen=False)
+    assert report['output']['record_count'] == round(.6*121)
+    assert report['output']['format'] == 'laz'
+
+
+@pytest.mark.parametrize('mode,keep_masks', [('all', False), ('keep_masks', True)])
+def test_successful_cache_cleanup_is_run_scoped(tmp_path, mode, keep_masks):
+    source = tmp_path / 'cleanup.e57'
+    small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset['scene_resolved_pairs'] = []
+    preset_path = tmp_path / 'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path / 'model.pt'; model.write_bytes(b'synthetic backend')
+    cache = tmp_path / 'cache'
+    for name in ('venv', 'pip'):
+        path = cache / name; path.mkdir(parents=True); (path / 'keep.txt').write_text('keep', encoding='utf-8')
+    (cache / 'launcher.json').write_text('{}', encoding='utf-8')
+    foreign = cache / 'scan_store' / 'foreign-input'; foreign.mkdir(parents=True); (foreign / 'keep.txt').write_text('keep', encoding='utf-8')
+    config = resolve_config(dict(source=str(source), cache=str(cache), output=str(tmp_path / 'out'),
+                                 preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False,
+                                 component_cleanup=False, point_reduction=0, format='las', cache_cleanup=mode))
+    report = execute(config, lambda: Backend(), listen=False)
+    identity = json.loads((tmp_path / 'out' / 'run_config.json').read_text(encoding='utf-8'))['identity']
+    assert (tmp_path / 'out' / 'report.json').is_file()
+    assert list((tmp_path / 'out').glob('*.las'))
+    assert report['cache_cleanup']['mode'] == mode
+    assert report['cache_cleanup']['freed_bytes'] > 0
+    assert not (cache / 'scan_store' / report['input_sha256']).exists()
+    assert not (cache / 'votes' / identity).exists()
+    assert not (cache / 'geometry' / report['input_sha256']).exists()
+    assert bool(list((cache / 'seg').glob('*.npz'))) is keep_masks
+    assert foreign.is_dir()
+    assert all((cache / name).exists() for name in ('venv', 'pip', 'launcher.json'))
+
+
+def test_abort_and_error_keep_cache_for_resume(tmp_path, monkeypatch):
+    source = tmp_path / 'abort.e57'; small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset_path = tmp_path / 'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path / 'model.pt'; model.write_bytes(b'synthetic backend')
+    cache = tmp_path / 'cache'
+    config = resolve_config(dict(source=str(source), cache=str(cache), output=str(tmp_path / 'out'),
+                                 preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=False,
+                                 component_cleanup=False, point_reduction=0, format='las', cache_cleanup='all'))
+    monkeypatch.setattr('e57cls.pipeline.run.write_cloud', lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('output failure')))
+    with pytest.raises(RuntimeError, match='output failure'):
+        execute(config, lambda: Backend(), listen=False)
+    assert (cache / 'scan_store' / file_hash(source)).is_dir()
+    assert list((cache / 'votes').glob('*'))
+    assert list((cache / 'seg').glob('*.npz'))
+
+
+def test_committed_votes_discard_large_scan_intermediates(tmp_path):
+    source = tmp_path / 'intermediates.e57'; small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset_path = tmp_path / 'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path / 'model.pt'; model.write_bytes(b'synthetic backend')
+    cache = tmp_path / 'cache'
+    config = resolve_config(dict(source=str(source), cache=str(cache), output=str(tmp_path / 'out'),
+                                 preset=str(preset_path), model=str(model), profile='fast', scene_mode='indoor',
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=True,
+                                 component_cleanup=False, point_reduction=0, format='las', cache_cleanup='keep_all'))
+    execute(config, lambda: Backend(), listen=False)
+    identity = json.loads((tmp_path / 'out' / 'run_config.json').read_text(encoding='utf-8'))['identity']
+    work = cache / 'votes' / identity / 'scan_0001'
+    assert not (work / 'weights.npy').exists()
+    assert not (work / 'mirror_rep.npy').exists()

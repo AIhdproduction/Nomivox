@@ -396,7 +396,6 @@
       "enabled": true,
       "prompts": [
         "door",
-        "doorway",
         "door frame",
         "door panel",
         "interior door"
@@ -429,7 +428,7 @@
       "name_en": "Stairs",
       "code": 105,
       "color": "#FF8A65",
-      "scene": "indoor",
+      "scene": "both",
       "enabled": true,
       "prompts": [
         "stairs",

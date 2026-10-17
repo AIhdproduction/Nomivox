@@ -13,4 +13,5 @@ dependencies = ["pye57==0.4.19", "numpy==1.26.4", "Pillow==12.3.0", "scipy==1.17
 testpaths = ["tests"]
 addopts = "-ra"
 cache_dir = ".cache/pytest"
+markers = ["slow: long-running synthetic performance test"]
 

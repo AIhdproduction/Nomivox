@@ -1,6 +1,8 @@
 import json
 import sys
 import time
+import numpy as np
+import pye57
 import pytest
 from pathlib import Path
 from PySide6.QtCore import QProcess,QCoreApplication,QEvent
@@ -54,6 +56,7 @@ def test_window_without_source_allows_presets_and_later_selection(tmp_path, qt_a
         assert not window.no_source_hint.isHidden()
         assert window.current_file.text() == tr('no_source_file')
         assert window.bottom.text() == tr('no_source')
+        assert window.summary.text() == tr('summary_no_source')
         monkeypatch.setattr(QInputDialog, 'getText', lambda *args: ('Testvorlage',True))
         window.save_preset()
         assert any(path.name.startswith('preset_') for path,_ in writes)
@@ -63,6 +66,91 @@ def test_window_without_source_allows_presets_and_later_selection(tmp_path, qt_a
         assert window.start_button.isEnabled()
         assert window.current_file.text() == source.name
         assert window.no_source_hint.isHidden()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def write_preview_source(path, count):
+    data = {"cartesianX": np.arange(count, dtype=np.float64),
+            "cartesianY": np.ones(count), "cartesianZ": np.full(count, 2.)}
+    writer = pye57.E57(str(path), mode="w")
+    writer.write_scan_raw(data, name=path.stem, translation=np.array([2700000., 1200000., 400.]))
+    writer.close()
+
+
+def wait_for_gui(app, predicate, timeout=8):
+    deadline = time.monotonic()+timeout
+    while not predicate() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(.01)
+    assert predicate()
+
+
+def test_preview_process_fills_overview_after_selection(tmp_path, qt_application, monkeypatch):
+    source = tmp_path/'fixture.e57'
+    write_preview_source(source, 11)
+    window = MainWindow(None,auto_start=False)
+    window.cache_path.setText(str(tmp_path/'cache'))
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *args: (str(source),'E57 (*.e57)'))
+    started = time.monotonic()
+    try:
+        window.select_source()
+        assert window.summary.text() == tr('summary_loading')
+        wait_for_gui(qt_application,lambda:window.summary.text() == tr('input_summary',scans=1,images=0,points=11))
+        assert time.monotonic()-started < 8
+        assert window.scan_table.rowCount() == 1
+        assert window.scan_table.item(0,1).text() == 'fixture'
+        assert window.metadata.toPlainText()
+        assert window.preview_progress.isHidden()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_preview_uses_cached_report_without_process(tmp_path, qt_application):
+    source = tmp_path/'fixture.e57'
+    write_preview_source(source, 11)
+    window = MainWindow(None,auto_start=False)
+    window.cache_path.setText(str(tmp_path/'cache'))
+    window.source = source
+    key = window.source_preview_key()
+    directory = window.preview_directory(key)
+    directory.mkdir(parents=True)
+    report = dict(scan_count=1,image_count=0,record_count=11,images=[],metadata={'guid':'cached'},
+                  scans=[dict(metadata={'name':'cached'},record_count=11,image_indices=[],
+                              pose_status='valid',classification_eligible_metadata=False)])
+    (directory/'inspect_report.json').write_text(json.dumps(report),encoding='utf-8')
+    try:
+        window.update_source_ui()
+        window.start_preview()
+        assert window.preview_process.state() == QProcess.ProcessState.NotRunning
+        assert window.summary.text() == tr('input_summary',scans=1,images=0,points=11)
+        assert window.scan_table.item(0,1).text() == 'cached'
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_new_source_cancels_running_preview_and_uses_new_result(tmp_path, qt_application, monkeypatch):
+    first = tmp_path/'first.e57'
+    second = tmp_path/'second.e57'
+    write_preview_source(first, 11)
+    write_preview_source(second, 22)
+    selections = iter((str(first),str(second)))
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *args: (next(selections),'E57 (*.e57)'))
+    window = MainWindow(None,auto_start=False)
+    window.cache_path.setText(str(tmp_path/'cache'))
+    try:
+        window.select_source()
+        first_key = window.preview_key
+        window.select_source()
+        assert window.preview_key != first_key
+        wait_for_gui(qt_application,lambda:window.summary.text() == tr('input_summary',scans=1,images=0,points=22))
+        assert window.scan_table.item(0,1).text() == 'second'
     finally:
         window.close()
         window.deleteLater()

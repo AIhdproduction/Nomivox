@@ -11,13 +11,15 @@ from PIL import Image
 from e57cls.files import atomic_json, file_hash
 from e57cls.seg.backend import BACKEND_VERSION, SAM_REVISION
 
+SCORE_FLOOR = .2
+
 
 def identity_hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 def class_identity(image_hash, view, model_hash, cls, scale, tile_size, overlap):
-    return {"schema": 1, "image_sha256": image_hash, "view": view,
+    return {"schema": 2, "score_floor": SCORE_FLOOR, "image_sha256": image_hash, "view": view,
             "model_sha256": model_hash, "sam_revision": SAM_REVISION, "backend": BACKEND_VERSION,
             "prompts": list(cls.prompts), "instance_threshold": cls.instance_threshold,
             "scale": scale, "tile_size": tile_size, "overlap": overlap}
@@ -38,6 +40,7 @@ def tile_boxes(width, height, size, overlap):
 class MaskCache:
     def __init__(self, root: Path):
         self.root = root
+        self.used_paths = set()
         root.mkdir(parents=True, exist_ok=True)
 
     def load(self, identity):
@@ -53,6 +56,7 @@ class MaskCache:
                 score = archive["confidence"]
             if score.dtype != np.float16 or score.ndim != 2 or not np.isfinite(score).all() or np.any((score < 0)|(score > 1)):
                 return None
+            self.used_paths.update((self.root/f"{key}.json", path))
             return score
         except (OSError, KeyError, ValueError):
             return None
@@ -61,10 +65,13 @@ class MaskCache:
         key = identity_hash(identity)
         name = f"{key}_{uuid4().hex}.npz"
         path = self.root/name
+        stored = np.where(scores < SCORE_FLOOR, 0, scores).astype(np.float16)
         with path.open("wb") as stream:
-            np.savez_compressed(stream, confidence=scores.astype(np.float16))
-        atomic_json(self.root/f"{key}.json", {"identity": identity, "file": name,
+            np.savez_compressed(stream, confidence=stored)
+        manifest = self.root/f"{key}.json"
+        atomic_json(manifest, {"identity": identity, "file": name,
                                             "sha256": file_hash(path), "effective_tile_size": effective_tile})
+        self.used_paths.update((manifest, path))
 
 
 def segment_view(image, valid, classes, backend_factory, cache: MaskCache, image_hash,
@@ -112,6 +119,6 @@ def segment_view(image, valid, classes, backend_factory, cache: MaskCache, image
         for offset, index in enumerate(missing):
             merged[offset, ~valid_scaled] = 0
             cache.save(identities[index], merged[offset], effective)
-            scores[index] = merged[offset].astype(np.float16)
+            scores[index] = np.where(merged[offset] < SCORE_FLOOR, 0, merged[offset]).astype(np.float16)
         scaled.close()
     return scores, {"hits": len(classes)-len(missing), "misses": len(missing)}

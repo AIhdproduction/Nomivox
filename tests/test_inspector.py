@@ -85,6 +85,7 @@ def test_pose_validation():
                         "translation": dict(x=2700000, y=1200000, z=400)}) == "valid"
 
 
-def test_invalid_sample_bound(source):
-    with pytest.raises(ValueError):
-        inspect_file(source, 0)
+def test_metadata_only_inspection_skips_point_sampling(source):
+    report = inspect_file(source, 0)
+    assert report["sample_limit_per_scan"] == 0
+    assert report["scans"][0]["sample"] == {"records_read": 0}

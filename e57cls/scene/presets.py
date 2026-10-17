@@ -2,6 +2,8 @@
 import re
 from collections import defaultdict
 
+from e57cls.seg.cache import SCORE_FLOOR
+
 STANDARD = set(range(1, 23)) - {8, 12}
 
 
@@ -48,7 +50,7 @@ def validate_preset(preset, require_active_classes=True):
                     prompts[text.strip().casefold()].append(ident)
             for field in ('min_mask_conf', 'min_instance_conf'):
                 value = item.get(field)
-                if value is not None and (not isinstance(value, (float, int)) or not 0 <= value <= 1):
+                if value is not None and (not isinstance(value, (float, int)) or not SCORE_FLOOR <= value <= 1):
                     errors.append(f'invalid_threshold:{ident}')
     for text, owners in prompts.items():
         if len(set(owners)) > 1 and frozenset(owners) not in pairs:

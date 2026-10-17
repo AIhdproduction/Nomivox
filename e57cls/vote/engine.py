@@ -5,16 +5,26 @@ from pathlib import Path
 import sqlite3
 
 import numpy as np
+import psutil
 from scipy.ndimage import binary_propagation, generate_binary_structure
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 from e57cls.files import atomic_json, file_hash
 from e57cls.geometry.cameras import Pose
+from e57cls.geometry.planes import fit_plane
 
 
 def connect(path):
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA cache_size=-32768")
+    # Keep the working sets in SQLite's page cache without changing the schema
+    # or transaction boundaries used by resumable vote stores.
+    cache_mib = min(1024, max(512, int(psutil.virtual_memory().available // (1024**2) // 8)))
+    connection.execute(f"PRAGMA cache_size={-cache_mib*1024}")
     connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA mmap_size=268435456")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
     return connection
 
 
@@ -76,6 +86,7 @@ def representatives(store, directory: Path, origin, size, checkpoint=lambda: Non
 
 class VoteStore:
     def __init__(self, path):
+        self.path = Path(path)
         self.db = connect(path)
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS votes(key BLOB, class INTEGER, weight REAL, peak REAL, PRIMARY KEY(key,class)) WITHOUT ROWID;
@@ -86,8 +97,49 @@ class VoteStore:
         if 'peak' not in {row[1] for row in self.db.execute('PRAGMA table_info(votes)')}:
             raise ValueError('Old vote schema requires a new pipeline cache identity')
         self.priority_overrides = 0
+        self._lookup_keys = self._lookup_values = None
+        self._lookup_paths = ()
+
+    def _invalidate_lookup(self):
+        for mapping in (self._lookup_keys, self._lookup_values):
+            if isinstance(mapping, np.memmap):
+                mapping.flush()
+                mapping._mmap.close()
+        for path in self._lookup_paths:
+            path.unlink(missing_ok=True)
+        self._lookup_keys = self._lookup_values = None
+        self._lookup_paths = ()
+
+    def _lookup_snapshot(self):
+        if self._lookup_keys is None:
+            count = int(self.db.execute('SELECT COUNT(*) FROM decisions').fetchone()[0])
+            required = count*(np.dtype('V24').itemsize+2)
+            limit = min(2*1024**3, psutil.virtual_memory().available//4)
+            if required > limit:
+                paths = (Path(str(self.path)+'.lookup_keys.npy'), Path(str(self.path)+'.lookup_values.npy'))
+                for path in paths:
+                    path.unlink(missing_ok=True)
+                self._lookup_keys = np.lib.format.open_memmap(paths[0], mode='w+', dtype='V24', shape=(count,))
+                self._lookup_values = np.lib.format.open_memmap(paths[1], mode='w+', dtype=np.uint8, shape=(count, 2))
+                self._lookup_paths = paths
+            else:
+                self._lookup_keys = np.empty(count, 'V24')
+                self._lookup_values = np.empty((count, 2), np.uint8)
+            cursor = self.db.execute('SELECT key,code,confidence FROM decisions ORDER BY key')
+            start = 0
+            while rows := cursor.fetchmany(1_000_000):
+                stop = start+len(rows)
+                self._lookup_keys[start:stop] = np.frombuffer(b''.join(row[0] for row in rows), dtype='V24')
+                self._lookup_values[start:stop] = np.fromiter((value for row in rows for value in row[1:]),
+                                                               dtype=np.uint8, count=2*len(rows)).reshape(-1, 2)
+                start = stop
+            if isinstance(self._lookup_keys, np.memmap):
+                self._lookup_keys.flush()
+                self._lookup_values.flush()
+        return self._lookup_keys, self._lookup_values
 
     def close(self):
+        self._invalidate_lookup()
         self.db.close()
 
     def completed(self, scan, identity):
@@ -103,46 +155,275 @@ class VoteStore:
                 has_evidence = np.any(weights > 0, axis=1)
                 self.db.executemany("INSERT INTO observations VALUES (?,1) ON CONFLICT(key) DO UPDATE SET count=count+1",
                                     ((bytes(k),) for k in keys[has_evidence]))
-                for column, code in enumerate(class_codes):
-                    valid = weights[:, column] > 0
-                    self.db.executemany("INSERT INTO votes VALUES (?,?,?,?) ON CONFLICT(key,class) DO UPDATE SET weight=weight+excluded.weight, peak=MAX(peak,excluded.peak)",
-                                        ((bytes(k), int(code), float(w), float(w)) for k,w in zip(keys[valid], weights[valid, column])))
+                rows, columns = np.nonzero(weights > 0)
+                codes = np.asarray(class_codes, np.int64)[columns]
+                values = weights[rows, columns]
+                self.db.executemany("INSERT INTO votes VALUES (?,?,?,?) ON CONFLICT(key,class) DO UPDATE SET weight=weight+excluded.weight, peak=MAX(peak,excluded.peak)",
+                                    ((bytes(key), int(code), float(weight), float(weight))
+                                     for key, code, weight in zip(keys[rows], codes, values)))
             self.db.execute("INSERT INTO scans VALUES (?,?)", (scan, identity))
+        self._invalidate_lookup()
 
     def decide(self, min_observations=1, min_share=.4, class_order=(), checkpoint=lambda: None, priority=None):
         order = {int(code): i for i, code in enumerate(class_order)}
         self.db.execute("DELETE FROM decisions")
+        self._invalidate_lookup()
         self.priority_overrides = 0
         cursor = self.db.execute("SELECT v.key,v.class,v.weight,o.count,v.peak FROM votes v JOIN observations o ON o.key=v.key ORDER BY v.key,v.class")
         pending = []
-        last, evidence, observations = None, [], 0
-        def finish(key, rows, count):
-            total = sum(w for _, w, _ in rows)
-            code, maximum, _ = min(rows, key=lambda item: (-item[1], order.get(item[0], 1000+item[0])))
-            override = False
-            if priority and code in priority['over'] and count >= min_observations:
-                evidence = next((r for r in rows if r[0] == priority['code'] and r[2] >= priority['confidence']), None)
-                if evidence:
-                    code,maximum,_ = evidence
-                    override = True
-                    self.priority_overrides += 1
-            share = maximum/total if total else 0
-            decided = code if count >= min_observations and (share >= min_share or override) else 1
-            return key, decided, round(share*255) if decided != 1 else 0
-        for key, code, weight, count, peak in cursor:
-            if key != last and last is not None:
-                pending.append(finish(last, evidence, observations))
-                evidence = []
-                if len(pending) >= 50_000:
-                    checkpoint()
-                    self.db.executemany("INSERT INTO decisions VALUES (?,?,?)", pending)
-                    pending.clear()
-            last, observations = key, count
-            evidence.append((code, weight, peak))
-        if last is not None:
-            pending.append(finish(last, evidence, observations))
-        self.db.executemany("INSERT INTO decisions VALUES (?,?,?)", pending)
+        carry = []
+
+        def flush():
+            if pending:
+                checkpoint()
+                self.db.executemany("INSERT INTO decisions VALUES (?,?,?)", pending)
+                pending.clear()
+
+        def finish(rows):
+            keys = np.frombuffer(b''.join(row[0] for row in rows), dtype='V24')
+            codes = np.fromiter((row[1] for row in rows), dtype=np.int64, count=len(rows))
+            weights = np.fromiter((row[2] for row in rows), dtype=np.float64, count=len(rows))
+            observations = np.fromiter((row[3] for row in rows), dtype=np.int64, count=len(rows))
+            peaks = np.fromiter((row[4] for row in rows), dtype=np.float64, count=len(rows))
+            starts = np.r_[0, np.flatnonzero(keys[1:] != keys[:-1])+1]
+            groups = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(rows)]))
+            positions = np.arange(len(rows))-starts[groups]
+            lengths = np.bincount(groups)
+            total = np.zeros(len(starts), np.float64)
+            maximum = np.full(len(starts), -np.inf)
+            winner = np.zeros(len(starts), np.int64)
+            winner_order = np.full(len(starts), np.iinfo(np.int64).max)
+            for position in range(int(lengths.max())):
+                ids = np.flatnonzero(positions == position)
+                grouped = groups[ids]
+                values = weights[ids]
+                total[grouped] += values
+                candidate_order = np.fromiter((order.get(int(code), 1000+int(code)) for code in codes[ids]),
+                                                dtype=np.int64, count=len(ids))
+                take = (values > maximum[grouped]) | ((values == maximum[grouped]) & (candidate_order < winner_order[grouped]))
+                if np.any(take):
+                    selected = grouped[take]
+                    maximum[selected] = values[take]
+                    winner[selected] = codes[ids[take]]
+                    winner_order[selected] = candidate_order[take]
+            override = np.zeros(len(starts), bool)
+            if priority:
+                candidate = ((codes == priority['code']) & (peaks >= priority['confidence']))
+                eligible = np.zeros(len(starts), bool)
+                eligible[groups[candidate]] = True
+                override = np.isin(winner, priority['over']) & eligible & (observations[starts] >= min_observations)
+                if np.any(override):
+                    priority_rows = np.flatnonzero(candidate)
+                    priority_groups = groups[priority_rows]
+                    # Every key/class pair is unique, hence at most one row per group.
+                    priority_weight = np.zeros(len(starts), np.float64)
+                    priority_weight[priority_groups] = weights[priority_rows]
+                    winner[override] = priority['code']
+                    maximum[override] = priority_weight[override]
+                    self.priority_overrides += int(override.sum())
+            share = maximum/total
+            decided = (observations[starts] >= min_observations) & ((share >= min_share) | override)
+            confidence = np.fromiter((round(float(value)*255) for value in share), dtype=np.int64, count=len(share))
+            confidence[~decided] = 0
+            winner[~decided] = 1
+            pending.extend((bytes(key), int(code), int(value)) for key, code, value in zip(keys[starts], winner, confidence))
+            if len(pending) >= 50_000:
+                flush()
+
+        while rows := cursor.fetchmany(1_000_000):
+            rows = carry+rows
+            last = rows[-1][0]
+            split = len(rows)
+            while split and rows[split-1][0] == last:
+                split -= 1
+            if split:
+                finish(rows[:split])
+            carry = rows[split:]
+        if carry:
+            finish(carry)
+        flush()
         self.db.commit()
+
+    def resolve_surface_ties(self, by_id, origin, voxel_size, tie_share=.55, normal_radius=.06,
+                             min_observations=1, scanner_heights=(), checkpoint=lambda: None):
+        """Use local evidence geometry for uncertain wall/ceiling/floor votes.
+
+        Normals use only the bounded neighbourhood of the candidate voxel.
+        Evidence is read through the primary-key index in SQLite; no complete
+        cloud-sized coordinate array or KD-tree is retained in RAM.
+        """
+        surface = {by_id[name]: name for name in ('wall', 'ceiling', 'floor') if name in by_id}
+        result = {'wall': 0, 'ceiling': 0, 'floor': 0, 'candidates': 0, 'unchanged': 0}
+        if len(surface) < 2:
+            return result
+        origin = np.asarray(origin, np.float64)
+        radius = max(1, int(np.ceil(normal_radius/voxel_size)))
+        offsets = np.array([(x, y, z) for x in range(-radius, radius+1) for y in range(-radius, radius+1)
+                            for z in range(-radius, radius+1) if x*x+y*y+z*z <= radius*radius], np.int64)
+        cursor = self.db.execute('SELECT v.key,v.class,v.weight,o.count FROM votes v JOIN observations o ON o.key=v.key ORDER BY v.key,v.class')
+        updates, carry, processed = [], [], 0
+        scanner_height = float(np.median(scanner_heights)) if len(scanner_heights) else float(origin[2])
+
+        def normal_at(key):
+            index = np.frombuffer(key, dtype='<i8', count=3)
+            keys = np.ascontiguousarray(index+offsets, dtype='<i8').view('V24').reshape(-1)
+            nearby = []
+            for start in range(0, len(keys), 500):
+                part = [bytes(item) for item in keys[start:start+500]]
+                statement = 'SELECT key FROM observations WHERE key IN ('+','.join('?' for _ in part)+')'
+                nearby.extend(row[0] for row in self.db.execute(statement, part))
+            if len(nearby) < 6:
+                return None
+            points = origin+(np.frombuffer(b''.join(nearby), dtype='<i8').reshape(-1, 3)+.5)*voxel_size
+            centered = points-points.mean(axis=0)
+            return np.linalg.svd(centered, full_matrices=False)[2][-1]
+
+        def process(group):
+            total = sum(float(row[2]) for row in group)
+            ordered = sorted(group, key=lambda row: (-float(row[2]), int(row[1])))
+            if total and len(ordered) >= 2:
+                first, second = ordered[:2]
+                share = float(first[2])/total
+                if (min_observations <= int(first[3]) and .5 <= share < tie_share
+                        and int(first[1]) in surface and int(second[1]) in surface):
+                    weights = {int(row[1]): float(row[2])/total for row in group}
+                    result['candidates'] += 1
+                    normal = normal_at(bytes(first[0]))
+                    if normal is None:
+                        result['unchanged'] += 1
+                        return
+                    slope = np.degrees(np.arccos(np.clip(abs(normal[2]), 0, 1)))
+                    first_code, second_code = int(first[1]), int(second[1])
+                    names = {surface[first_code], surface[second_code]}
+                    selected = first_code
+                    if slope > 60 and 'wall' in names:
+                        selected = by_id['wall']
+                    elif slope < 30:
+                        horizontal = [name for name in ('floor', 'ceiling') if name in names]
+                        if len(horizontal) == 1:
+                            selected = by_id[horizontal[0]]
+                        elif len(horizontal) == 2:
+                            center_z = origin[2]+(np.frombuffer(first[0], dtype='<i8', count=3)[2]+.5)*voxel_size
+                            selected = by_id['ceiling'] if center_z >= scanner_height else by_id['floor']
+                    elif 'ceiling' in names:
+                        selected = by_id['ceiling']
+                    if selected != first_code:
+                        updates.append((selected, int(round(weights[selected]*255)), bytes(first[0])))
+                        result[surface[selected]] += 1
+
+        while rows := cursor.fetchmany(50_000):
+            rows = carry+rows
+            last, split = rows[-1][0], len(rows)
+            while split and rows[split-1][0] == last:
+                split -= 1
+            start = 0
+            while start < split:
+                stop = start+1
+                while stop < split and rows[stop][0] == rows[start][0]:
+                    stop += 1
+                process(rows[start:stop])
+                processed += 1
+                if processed % 250 == 0:
+                    checkpoint()
+                if len(updates) >= 20_000:
+                    self.db.executemany('UPDATE decisions SET code=?,confidence=? WHERE key=?', updates)
+                    updates.clear()
+                start = stop
+            carry = rows[split:]
+        if carry:
+            process(carry)
+        if updates:
+            self.db.executemany('UPDATE decisions SET code=?,confidence=? WHERE key=?', updates)
+        self.db.commit()
+        self._invalidate_lookup()
+        return result
+
+    @staticmethod
+    def _sparse_components(coordinates):
+        """Return 26-neighbour labels without allocating a dense voxel grid."""
+        key_dtype = np.dtype([('x', '<i8'), ('y', '<i8'), ('z', '<i8')])
+        values = np.ascontiguousarray(coordinates).view(key_dtype).reshape(-1)
+        order = np.argsort(values, kind='stable')
+        sorted_values = values[order]
+        edge_rows, edge_columns = [], []
+        # The 13 forward offsets enumerate every undirected 26-neighbour edge
+        # exactly once. Sparse components then match the old DFS.
+        for dx in (0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    if ((dx, dy, dz) == (0, 0, 0) or (dx == 0 and dy < 0)
+                            or (dx == 0 and dy == 0 and dz < 0)):
+                        continue
+                    target = coordinates+np.array((dx, dy, dz), np.int64)
+                    target_values = np.ascontiguousarray(target).view(key_dtype).reshape(-1)
+                    found = np.searchsorted(sorted_values, target_values)
+                    present = found < len(sorted_values)
+                    present[present] &= sorted_values[found[present]] == target_values[present]
+                    ids = np.flatnonzero(present)
+                    if len(ids):
+                        edge_rows.append(ids)
+                        edge_columns.append(order[found[ids]])
+        if edge_rows:
+            source, target = np.concatenate(edge_rows), np.concatenate(edge_columns)
+            graph = coo_matrix((np.ones(len(source), np.uint8), (source, target)),
+                               shape=(len(coordinates), len(coordinates)))
+        else:
+            graph = coo_matrix((len(coordinates), len(coordinates)), dtype=np.uint8)
+        return connected_components(graph, directed=False, return_labels=True)
+
+    def reject_planar_stairs(self, stairs_code, origin, voxel_size, plane_tolerance, planar_fraction,
+                             minimum_rise, seed, class_order=(), checkpoint=lambda: None):
+        """Restore stair components which geometrically form one plane or are flat."""
+        result = {'checked_components': 0, 'rejected_components': 0, 'reclassified_voxels': {}}
+        rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (int(stairs_code),)))
+        if not rows:
+            self._invalidate_lookup()
+            return result
+        keys = [bytes(row[0]) for row in rows]
+        coordinates = np.frombuffer(b''.join(keys), dtype='<i8').reshape(-1, 3)
+        count, labels = self._sparse_components(coordinates)
+        order = {int(code): index for index, code in enumerate(class_order)}
+        origin = np.asarray(origin, np.float64)
+        component_order = np.argsort(labels, kind='stable')
+        component_offsets = np.r_[0, np.cumsum(np.bincount(labels, minlength=count))]
+
+        for component in range(count):
+            indices = component_order[component_offsets[component]:component_offsets[component+1]]
+            if len(indices) < 50:
+                continue
+            checkpoint()
+            result['checked_components'] += 1
+            points = origin+(coordinates[indices]+.5)*voxel_size
+            plane = fit_plane(points, plane_tolerance, seed, min_fraction=planar_fraction)
+            vertical_span = (coordinates[indices, 2].max()-coordinates[indices, 2].min())*voxel_size
+            if plane is None and vertical_span >= minimum_rise:
+                continue
+            result['rejected_components'] += 1
+            for start in range(0, len(indices), 500):
+                checkpoint()
+                component_keys = [keys[index] for index in indices[start:start+500]]
+                evidence = {key: [] for key in component_keys}
+                statement = 'SELECT key,class,weight FROM votes WHERE key IN ('+','.join('?' for _ in component_keys)+')'
+                for key, code, weight in self.db.execute(statement, component_keys):
+                    evidence[bytes(key)].append((int(code), float(weight)))
+                updates = []
+                for key in component_keys:
+                    votes = evidence[key]
+                    alternatives = [item for item in votes if item[0] != stairs_code]
+                    if not alternatives:
+                        updates.append((1, 0, key))
+                        result['reclassified_voxels']['1'] = result['reclassified_voxels'].get('1', 0)+1
+                        continue
+                    code, weight = min(alternatives, key=lambda item: (-item[1], order.get(item[0], 1000+item[0])))
+                    total = sum(item[1] for item in votes)
+                    confidence = int(round(weight*255/total)) if total else 0
+                    updates.append((code, confidence, key))
+                    target = str(code)
+                    result['reclassified_voxels'][target] = result['reclassified_voxels'].get(target, 0)+1
+                self.db.executemany('UPDATE decisions SET code=?,confidence=? WHERE key=?', updates)
+        self.db.commit()
+        self._invalidate_lookup()
+        return result
 
     def remove_small_components(self, voxel_size, default_minimum, special_rules=(), checkpoint=lambda: None):
         """Turn isolated semantic voxel islands back into class 1.
@@ -159,40 +440,24 @@ class VoteStore:
             rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (code,)))
             if not rows:
                 continue
-            coordinates = [tuple(np.frombuffer(row[0], dtype='<i8', count=3)) for row in rows]
-            positions = {position: index for index, position in enumerate(coordinates)}
-            visited = np.zeros(len(coordinates), bool)
+            keys = [bytes(row[0]) for row in rows]
+            coordinates = np.frombuffer(b''.join(keys), dtype='<i8').reshape(-1, 3)
+            count, labels = self._sparse_components(coordinates)
             minimum, minimum_span = rules.get(code, (default_minimum, 0.))
-            rejected = []
-            for start, point in enumerate(coordinates):
-                if visited[start]:
-                    continue
-                stack, group = [start], []
-                visited[start] = True
-                while stack:
-                    index = stack.pop()
-                    group.append(index)
-                    x, y, z = coordinates[index]
-                    for dx in (-1, 0, 1):
-                        for dy in (-1, 0, 1):
-                            for dz in (-1, 0, 1):
-                                if dx == dy == dz == 0:
-                                    continue
-                                neighbour = positions.get((x+dx, y+dy, z+dz))
-                                if neighbour is not None and not visited[neighbour]:
-                                    visited[neighbour] = True
-                                    stack.append(neighbour)
-                components += 1
-                group_positions = np.asarray([coordinates[index] for index in group], np.int64)
-                span = float(np.ptp(group_positions, axis=0).max()*voxel_size)
-                if len(group) < minimum or span < minimum_span:
-                    rejected.extend(bytes(rows[index][0]) for index in group)
+            sizes = np.bincount(labels, minlength=count)
+            low = np.full((count, 3), np.iinfo(np.int64).max, np.int64)
+            high = np.full((count, 3), np.iinfo(np.int64).min, np.int64)
+            np.minimum.at(low, labels, coordinates)
+            np.maximum.at(high, labels, coordinates)
+            rejected = np.flatnonzero(((sizes < minimum) | ((high-low).max(axis=1)*voxel_size < minimum_span))[labels])
+            components += count
             for start in range(0, len(rejected), 50000):
                 checkpoint()
                 self.db.executemany('UPDATE decisions SET code=1,confidence=0 WHERE key=?',
-                                    ((key,) for key in rejected[start:start+50000]))
+                                    ((keys[index],) for index in rejected[start:start+50000]))
             removed += len(rejected)
         self.db.commit()
+        self._invalidate_lookup()
         return {'components': components, 'removed_voxels': removed}
 
     def vegetation_bases_to_ground(self, vegetation_code, ground_code, voxel_size, cell_size, band_m, checkpoint=lambda: None):
@@ -207,17 +472,19 @@ class VoteStore:
             return {'moved_voxels': 0, 'cells': 0}
         cells = max(1, round(cell_size/voxel_size))
         band = max(0, round(band_m/voxel_size))
-        positions = [(bytes(row[0]), *np.frombuffer(row[0], dtype='<i8', count=3)) for row in rows]
-        floor = {}
-        for _, x, y, z in positions:
-            key = (x//cells, y//cells)
-            floor[key] = min(floor.get(key, z), z)
-        moved = [key for key, x, y, z in positions if z <= floor[(x//cells, y//cells)]+band]
+        keys = [bytes(row[0]) for row in rows]
+        positions = np.frombuffer(b''.join(keys), dtype='<i8').reshape(-1, 3)
+        xy = positions[:, :2] // cells
+        _, inverse = np.unique(xy, axis=0, return_inverse=True)
+        floor = np.full(int(inverse.max())+1, np.iinfo(np.int64).max, np.int64)
+        np.minimum.at(floor, inverse, positions[:, 2])
+        moved = [keys[index] for index in np.flatnonzero(positions[:, 2] <= floor[inverse]+band)]
         for start in range(0, len(moved), 50000):
             checkpoint()
             self.db.executemany('UPDATE decisions SET code=?,confidence=confidence WHERE key=?',
                                 ((ground_code, key) for key in moved[start:start+50000]))
         self.db.commit()
+        self._invalidate_lookup()
         return {'moved_voxels': len(moved), 'cells': len(floor)}
 
     def split_ground_floor_by_building(self, ground_code, floor_code, barrier_codes, voxel_size,
@@ -238,7 +505,7 @@ class VoteStore:
         rows = list(self.db.execute(f'SELECT key FROM decisions WHERE code IN ({clause})', codes))
         if not rows:
             return {'applied': False, 'reason': 'no_building_or_wall_points'}
-        building = np.asarray([np.frombuffer(row[0], dtype='<i8', count=3) for row in rows], np.int64)
+        building = np.frombuffer(b''.join(bytes(row[0]) for row in rows), dtype='<i8').reshape(-1, 3)
         cells = max(1, round(cell_size/voxel_size))
         xy = building[:, :2] // cells
         unique, inverse = np.unique(xy, axis=0, return_inverse=True)
@@ -256,7 +523,7 @@ class VoteStore:
             return {'applied': False, 'reason': 'no_ground_or_floor_points', 'barrier_cells': int(len(barrier))}
         target_keys = [bytes(row[0]) for row in target_rows]
         target_codes = np.asarray([row[1] for row in target_rows], np.uint8)
-        target = np.asarray([np.frombuffer(key, dtype='<i8', count=3) for key in target_keys], np.int64)
+        target = np.frombuffer(b''.join(target_keys), dtype='<i8').reshape(-1, 3)
         target_xy = target[:, :2] // cells
 
         # Work only around the actual building envelope.  Points outside are
@@ -294,17 +561,19 @@ class VoteStore:
             self.db.executemany('UPDATE decisions SET code=?,confidence=confidence WHERE key=?',
                                 ((int(wanted[index]), target_keys[index]) for index in ids))
         self.db.commit()
+        self._invalidate_lookup()
         return {'applied': True, 'barrier_cells': int(len(barrier)), 'grid_cells': int(np.prod(shape, dtype=np.int64)),
                 'inside_voxels': int(inside.sum()), 'ground_voxels': int((~inside).sum()),
                 'changed_voxels': int(changed.sum()), 'cell_size_m': cells*voxel_size}
 
     def lookup(self, keys):
-        unique, inverse = np.unique(keys, return_inverse=True)
-        rows = {}
-        for start in range(0, len(unique), 500):
-            part = [bytes(k) for k in unique[start:start+500]]
-            statement = "SELECT key,code,confidence FROM decisions WHERE key IN ("+",".join("?" for _ in part)+")"
-            rows.update((k, (code, confidence)) for k,code,confidence in self.db.execute(statement, part))
-        values = np.array([rows.get(bytes(k), (1, 0)) for k in unique], np.uint8).reshape(-1, 2)
-        result = values[inverse]
+        keys = np.ascontiguousarray(keys, dtype='V24').reshape(-1)
+        known, values = self._lookup_snapshot()
+        result = np.empty((len(keys), 2), np.uint8)
+        result[:] = (1, 0)
+        if len(known) and len(keys):
+            found = np.searchsorted(known, keys)
+            present = found < len(known)
+            present[present] &= known[found[present]] == keys[present]
+            result[present] = values[found[present]]
         return result[:, 0], result[:, 1]

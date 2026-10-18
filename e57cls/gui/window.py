@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
         self.source = Path(source) if source else None
         self.preset = json.loads((PROJECT/'presets/default.json').read_text(encoding='utf-8'))
         self.config = None
+        self.inspection_report = None
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(PROJECT))
         self.process.readyReadStandardOutput.connect(self.read_stdout)
@@ -183,6 +184,7 @@ class MainWindow(QMainWindow):
             self.bottom.setText(tr('setup_required') if selected else tr('no_source'))
         if hasattr(self,'start_button'):
             self.validate()
+        self.update_slam_ui()
 
     def set_summary_status(self,text,status=None):
         self.summary.setText(text)
@@ -470,7 +472,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll)
         sections = {}
         for key in ('settings_group_profile_output','settings_group_segmentation','settings_group_tuning_geometry',
-                    'settings_group_cleanup','settings_group_scene','settings_group_mirror_glass'):
+                    'settings_group_cleanup','settings_group_scene','settings_group_slam','settings_group_mirror_glass'):
             frame,form = self.card(key)
             forms.addWidget(frame)
             sections[key] = QFormLayout()
@@ -511,12 +513,18 @@ class MainWindow(QMainWindow):
             'mirror_image_scale':(.1,1.,.05),'mirror_view_size':(336,1512,16),
             'mirror_max_range':(1.,100.,1.),'mirror_min_pixels':(10,10000,10),'mirror_mask_width':(512,4096,128),
             'mirror_frame_band':(1,60,1),'mirror_frame_band_max':(1,60,1),'reflection_neighbor_radius':(.01,.5,.01),
-            'mirror_shape_min_iou':(.1,1.,.01),'mirror_shape_max_growth':(1.,3.,.01),'mirror_edge_search':(0.,.5,.01)}
+            'mirror_shape_min_iou':(.1,1.,.01),'mirror_shape_max_growth':(1.,3.,.01),'mirror_edge_search':(0.,.5,.01),
+            'slam_max_range_indoor':(1.,100.,1.),'slam_max_range_outdoor':(1.,100.,1.),'slam_max_range':(0.,100.,1.),
+            'slam_depth_resolution':(64,8192,64),'slam_splat_max_px':(1,64,1),'slam_depth_tol_abs':(.001,.5,.001),
+            'slam_depth_tol_rel':(0.,.1,.001),'slam_station_spacing':(.1,20.,.1),
+            'slam_time_window':(.1,600.,.1),'slam_weight_distance_scale':(.1,100.,.1),
+            'slam_weight_incidence_power':(0.,8.,.1),'slam_weight_radial_power':(0.,8.,.1)}
         groups = {
             'settings_group_segmentation': {'image_scale','tile_overlap','tile_size','view_size','view_fov','instance_confidence','mask_confidence','boundary_margin','gpu_memory_fraction'},
             'settings_group_tuning_geometry': {'min_observations','voxel_size','min_winning_share','surface_tie_share','door_depth_limit','door_max_width','door_max_height','visibility_abs','visibility_rel','depth_width','class_transfer_radius'},
             'settings_group_cleanup': {'component_min_voxels','cable_component_min_voxels','cable_component_min_span','electrical_component_min_voxels','electrical_component_min_span','vegetation_ground_cell_size','vegetation_ground_band','building_boundary_cell_size','building_boundary_min_height','geometry_fill_min_area','geometry_fill_max_gap','geometry_fill_tolerance','geometry_fill_max_planes','stairs_min_confidence','stairs_plane_tolerance','stairs_planar_fraction','stairs_min_rise'},
             'settings_group_scene': {'scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor','scene_sky_indoor_max','scene_overhead_range','scene_plane_tolerance','scene_plane_fraction','scene_ceiling_supported','scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max','scene_sky_confidence','scene_ceiling_confidence'},
+            'settings_group_slam': {'slam_max_range_indoor','slam_max_range_outdoor','slam_max_range','slam_depth_resolution','slam_splat_max_px','slam_depth_tol_abs','slam_depth_tol_rel','slam_station_spacing','slam_time_window','slam_weight_distance_scale','slam_weight_incidence_power','slam_weight_radial_power'},
             'settings_group_mirror_glass': {'mirror_mask_confidence','mirror_fit_tolerance','mirror_plane_tolerance','reflection_prompt_agreement','mirror_merge_angle','mirror_merge_distance','mirror_image_scale','mirror_view_size','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max','reflection_neighbor_radius','mirror_shape_min_iou','mirror_shape_max_growth','mirror_edge_search'},
         }
         for key,(low,high,step) in specifications.items():
@@ -525,7 +533,7 @@ class MainWindow(QMainWindow):
                 widget.setDecimals(3)
             widget.setRange(low,high)
             widget.setSingleStep(step)
-            widget.setValue(DEFAULTS[key])
+            widget.setValue(0 if key == 'slam_max_range' and DEFAULTS[key] is None else DEFAULTS[key])
             self.controls[key] = widget
             group = next(name for name, keys in groups.items() if key in keys)
             self.settings_row(sections[group],tr('setting_'+key),widget)
@@ -595,7 +603,15 @@ class MainWindow(QMainWindow):
         self.mirror_shape_regularize = QCheckBox(tr('mirror_shape_regularize'))
         self.mirror_shape_regularize.setChecked(DEFAULTS['mirror_shape_regularize'])
         sections['settings_group_mirror_glass'].addRow(self.mirror_shape_regularize)
+        self.slam_time_filter = QCheckBox(tr('slam_time_filter'))
+        self.slam_time_filter.setChecked(DEFAULTS['slam_time_filter'])
+        sections['settings_group_slam'].addRow(self.slam_time_filter)
+        self.slam_diagnostics = QCheckBox(tr('slam_diagnostics'))
+        self.slam_diagnostics.setChecked(DEFAULTS['slam_diagnostics'])
+        sections['settings_group_slam'].addRow(self.slam_diagnostics)
         forms.addStretch()
+        self.input_mode.currentIndexChanged.connect(self.update_slam_ui)
+        self.update_slam_ui()
 
     def run_tab(self):
         _,layout = self.tab('tab_run')
@@ -654,7 +670,8 @@ class MainWindow(QMainWindow):
         self.input_mode.setCurrentIndex(max(0,self.input_mode.findData(self.config.get('input_mode',DEFAULTS['input_mode']))))
         self.load_table()
         for key,widget in self.controls.items():
-            widget.setValue(self.config.get(key,DEFAULTS[key]))
+            value = self.config.get(key,DEFAULTS[key])
+            widget.setValue(0 if key == 'slam_max_range' and value is None else value)
         saved_batch = self.config.get('prompt_batch',DEFAULTS['prompt_batch'])
         self.prompt_batch.setCurrentIndex(max(0,self.prompt_batch.findData(saved_batch)))
         self.mirror.setChecked(self.config.get('mirror_analysis',False))
@@ -667,12 +684,15 @@ class MainWindow(QMainWindow):
         self.vegetation_base_to_ground.setChecked(self.config.get('vegetation_base_to_ground',DEFAULTS['vegetation_base_to_ground']))
         self.building_enclosure.setChecked(self.config.get('building_enclosure',DEFAULTS['building_enclosure']))
         self.mirror_shape_regularize.setChecked(self.config.get('mirror_shape_regularize',DEFAULTS['mirror_shape_regularize']))
+        self.slam_time_filter.setChecked(self.config.get('slam_time_filter', DEFAULTS['slam_time_filter']))
+        self.slam_diagnostics.setChecked(self.config.get('slam_diagnostics', DEFAULTS['slam_diagnostics']))
         self.output_format.setCurrentIndex(max(0, self.output_format.findData(self.config.get('format',DEFAULTS['format']))))
         self.point_reduction.setValue(round(100*self.config.get('point_reduction',DEFAULTS['point_reduction'])))
         self.output_density.setCurrentIndex(max(0, self.output_density.findData(self.config.get('output_density',DEFAULTS['output_density']))))
         self.cache_cleanup.setCurrentIndex(max(0, self.cache_cleanup.findData(self.config.get('cache_cleanup',DEFAULTS['cache_cleanup']))))
         self.scene_mode.setCurrentIndex(self.scene_mode.findData(self.config['scene_mode']))
         self.read_inspection()
+        self.update_slam_ui()
         self.set_running(True)
         self.pause_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
@@ -804,6 +824,18 @@ class MainWindow(QMainWindow):
         if hasattr(self,'start_button'):
             self.validate()
 
+    def update_slam_ui(self):
+        """Disable origin-dependent reflection controls for selected SLAM input."""
+        if not hasattr(self, 'mirror'):
+            return
+        detected = self.inspection_report and self.inspection_report.get('input_mode', {}).get('mode') == 'slam'
+        slam = self.input_mode.currentData() == 'slam' or (self.input_mode.currentData() == 'auto' and detected)
+        settings = [widget for key, widget in getattr(self, 'controls', {}).items()
+                    if key.startswith('mirror_') or key == 'reflection_prompt_agreement']
+        for widget in (self.mirror, self.glass, self.extra, self.mirror_shape_regularize, *settings):
+            widget.setEnabled(not slam and self.processing_mode.currentData() != 'filter_only')
+        self.validation.setText(tr('slam_reflection_hint') if slam else '')
+
     def remove_class(self):
         row = self.class_table.currentRow()
         if row >= 0:
@@ -876,6 +908,7 @@ class MainWindow(QMainWindow):
         try:
             self.stop_preview()
             settings = {key:widget.value() for key,widget in self.controls.items()}
+            settings['slam_max_range'] = settings['slam_max_range'] or None
             settings['prompt_batch'] = self.prompt_batch.currentData()
             settings.update(source=str(self.source),processing_mode=self.processing_mode.currentData(),input_mode=self.input_mode.currentData(),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
                 mirror_analysis=self.mirror.isChecked(),glass_analysis=self.glass.isChecked(),
@@ -884,6 +917,7 @@ class MainWindow(QMainWindow):
                 vegetation_base_to_ground=self.vegetation_base_to_ground.isChecked(),
                 building_enclosure=self.building_enclosure.isChecked(),
                 mirror_shape_regularize=self.mirror_shape_regularize.isChecked(),
+                slam_time_filter=self.slam_time_filter.isChecked(),slam_diagnostics=self.slam_diagnostics.isChecked(),
                 extra_no_reflection=self.extra.isChecked(),format=self.output_format.currentData(),
                 point_reduction=self.point_reduction.value()/100,output_density=self.output_density.currentData(),
                 diagnostics=self.diagnostics.currentData(),cache_cleanup=self.cache_cleanup.currentData(),cache=self.cache_path.text(),gpu_device=self.gpu.text(),strict=self.strict.isChecked(),
@@ -1127,6 +1161,7 @@ class MainWindow(QMainWindow):
             self.metadata.setPlainText(json.dumps(report['metadata'],ensure_ascii=False,indent=2)[:30000])
             self.inspection_report = report
             self.show_input_mode(report.get('input_mode'))
+            self.update_slam_ui()
             self.apply_inspection_counts()
             return True
         except Exception as error:

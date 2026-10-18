@@ -585,6 +585,57 @@ def _slam_batches(values, columns):
         yield keys, weights
 
 
+def _slam_scene(config, preset, cameras, image_by_index, reader, index, stores, visibility_cache,
+                mask_cache, image_cache, model_hash, factory, control):
+    """Choose one dataset-wide SLAM scene without any scanner-return heuristic.
+
+    SLAM cameras form one trajectory, therefore a single dataset scene is less
+    surprising than changing the visibility range between neighbouring stations.
+    Explicit scene_mode continues to take precedence.
+    """
+    requested = config['scene_mode']
+    if requested in ('indoor', 'outdoor'):
+        return requested, {'decision': 'manual', 'scope': 'dataset', 'sky_fraction': None,
+                           'overhead_view_fraction': None, 'range_m': None}
+    overrides = [(str(key), value) for key, value in config.get('scene_overrides', {}).items()
+                 if value in ('indoor', 'outdoor')]
+    if overrides:
+        key, scene = sorted(overrides)[0]
+        return scene, {'decision': 'override', 'scope': 'dataset', 'override_key': key,
+                       'sky_fraction': None, 'overhead_view_fraction': None, 'range_m': None}
+    sky = next((item for item in preset.get('auxiliary', []) if item.get('id') == 'sky'), None)
+    provisional = {**config, 'slam_max_range': config.get('slam_max_range') or
+                   max(config['slam_max_range_indoor'], config['slam_max_range_outdoor'])}
+    sky_pixels = sky_total = overhead_views = evaluated = 0
+    for camera in cameras:
+        control.checkpoint()
+        view = camera.views(config['profile'], config['view_size'], config['view_fov'])[-1]
+        item = image_by_index[camera.image_index]
+        rendered, valid, image_hash, _, info = _slam_view_image(reader, item, camera.camera, view, image_cache)
+        visibility, _ = visibility_cache.visibility_for_view(index, camera.pose, view, provisional,
+            intrinsics=camera.camera.params, view=info, checkpoint=control.checkpoint)
+        evaluated += 1
+        if sky is not None:
+            scores, _ = segment_view(rendered, valid, [PromptClass('sky', tuple(sky['prompts']))], factory,
+                mask_cache, image_hash, {**info, 'slam_scene': True}, model_hash, config['image_scale'],
+                config['tile_size'], config['tile_overlap'], control.checkpoint)
+            sky_pixels += int(((scores[0] >= config['scene_sky_confidence']) & valid).sum())
+            sky_total += int(valid.sum())
+        # Only z-buffer-visible points contribute to the overhead decision.
+        if len(visibility.point_indices):
+            world, _ = _slam_point_values(stores, visibility.point_indices)
+            overhead_views += int(np.any((world[:, 2]-camera.pose.translation[2]) > .5))
+    sky_fraction = sky_pixels/max(1, sky_total)
+    overhead_fraction = overhead_views/max(1, evaluated)
+    indoor = overhead_fraction >= .20
+    # Positive sky evidence is required for outdoor classes.  If neither signal
+    # is decisive, retain the project's conservative indoor default.
+    scene = 'indoor' if indoor else ('outdoor' if sky_fraction >= config['scene_sky_outdoor'] else 'indoor')
+    return scene, {'decision': 'automatic', 'scope': 'dataset', 'sky_fraction': float(sky_fraction),
+                   'overhead_view_fraction': float(overhead_fraction), 'views_evaluated': evaluated,
+                   'method': 'sky masks plus visible points above cameras; no upper-hemisphere return rule'}
+
+
 def execute_slam(config, source, output, cache, inspection, store_report, stores, factory, control, started):
     """Run the mobile path without changing the static TLS processing path."""
     preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
@@ -601,6 +652,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     if not cameras:
         raise InputNotClassifiable('No decodable SLAM camera with a valid pose and camera model')
     stations, membership, ordering = cluster_stations(cameras, config['slam_station_spacing'])
+    reflection_masks_requested = bool(config['mirror_analysis'] or config['glass_analysis'])
     config = {**config, 'voxel_origin': [stores[0].meta['metadata']['pose']['translation'][key] for key in 'xyz'],
               '_slam': True, '_shared_sam': False, 'mirror_analysis': False}
     model_hash, input_hash = file_hash(Path(config['model'])), store_report['source_sha256']
@@ -636,19 +688,36 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     warnings = [*input_warnings,
                 *({'code': 'preset_warning', 'detail': item} for item in preset_warnings)]
     warnings.append({'code': 'slam_reflection_disabled', 'detail': 'Reflection class 68 is disabled for mobile SLAM input.'})
+    LOG.info('SLAM class 68 skipped because mobile inputs have no reliable scan origin')
+    if reflection_masks_requested:
+        warnings.append({'code': 'slam_reflection_masks_exclude_labels',
+                         'detail': 'Mirror and glass masks exclude ordinary semantic labels; class 68 remains disabled.'})
     if config['slam_time_filter'] and not time_possible:
         warnings.append({'code': 'slam_time_filter_unavailable', 'detail': 'Point and image timestamps are both required.'})
     image_by_index = {item['index']: item for item in inspection['images']}
-    selected = select_classes(preset, config['scene_mode'], config['building_enclosure'])
-    selected_ids = {item['id'] for item in selected}
-    active_columns = {index for index, item in enumerate(all_classes) if item['id'] in selected_ids}
-    if not active_columns:
-        raise ValueError('No enabled classes for this SLAM scene mode')
     timings, station_results = {}, []
+    view_results, observed = [], {}
+    for store in stores:
+        observed[store.meta['scan_index']] = np.lib.format.open_memmap(
+            cache/'slam_visibility'/input_hash/f'observed_{store.meta["scan_index"]}.npy', mode='w+',
+            dtype=bool, shape=(store.meta['record_count'],))
     control.event('phase_started', phase='slam_index')
     control.event('phase_finished', phase='slam_index')
     control.event('phase_started', phase='slam_segmentation')
     with E57Reader(source) as reader:
+        scene, scene_info = _slam_scene(config, preset, cameras, image_by_index, reader, index, stores,
+            visibility_cache, mask_cache, image_cache, model_hash, factory, control)
+        effective_range = config['slam_max_range'] or config[f'slam_max_range_{scene}']
+        config = {**config, 'slam_max_range': effective_range}
+        scene_info['range_m'] = effective_range
+        selected = select_classes(preset, scene, config['building_enclosure'])
+        selected_ids = {item['id'] for item in selected}
+        active_columns = {index for index, item in enumerate(all_classes) if item['id'] in selected_ids}
+        if not active_columns:
+            raise ValueError('No enabled classes for this SLAM scene mode')
+        reflection_prompts = []
+        if reflection_masks_requested:
+            _, reflection_prompts, _ = reflection_prompt_classes({**config, 'glass_analysis': config['glass_analysis']}, preset)
         for station in stations:
             control.checkpoint()
             if votes.completed(station.id, identity):
@@ -664,16 +733,21 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                     rendered, valid_image, image_hash, mask_hash, view_info = _slam_view_image(reader, item, camera.camera, view, image_cache)
                     prompts = prompt_classes([item for item in all_classes if item['id'] in selected_ids], config)
                     selected_indices = [index for index, item in enumerate(all_classes) if item['id'] in selected_ids]
-                    scores, cache_stats = segment_view(rendered, valid_image, prompts, factory, mask_cache, image_hash,
+                    scores, cache_stats = segment_view(rendered, valid_image, prompts+reflection_prompts, factory, mask_cache, image_hash,
                         view_info, model_hash, config['image_scale'], config['tile_size'], config['tile_overlap'], control.checkpoint)
                     label_config = {**config, 'boundary_margin': config['boundary_margin']+config['slam_boundary_margin_extra']}
-                    labels, confidence = evidence_map(scores, [item for item in all_classes if item['id'] in selected_ids], label_config)
+                    labels, confidence = evidence_map(scores[:len(prompts)], [item for item in all_classes if item['id'] in selected_ids], label_config)
                     visibility, visibility_hit = visibility_cache.visibility_for_view(index, camera.pose, view, config,
                         intrinsics=camera.camera.params, view=view_info, checkpoint=control.checkpoint,
                         progress=lambda phase, hit: control.event('progress', phase=phase, station=station.id, image=camera.image_index, cache=hit),
                         image=rendered, diagnostics_directory=output/'slam_diagnostics')
                     if not len(visibility.point_indices):
+                        view_results.append({'image': camera.image_index, 'station': station.id, 'used': False,
+                                             'reason': 'no_visible_points'})
                         continue
+                    for point in visibility.point_indices:
+                        scan, row = unpack_point_id(point)
+                        observed[scan][row] = True
                     # Point IDs retain original block/record provenance; load only the visible source rows.
                     world, point_times = _slam_point_values(stores, visibility.point_indices,
                                                             time_field_by_scan if time_possible else None)
@@ -683,6 +757,9 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                     local_confidence = np.zeros(len(pixels), np.float32)
                     local_labels[inside] = labels[pixels[inside, 1], pixels[inside, 0]]
                     local_confidence[inside] = confidence[pixels[inside, 1], pixels[inside, 0]]
+                    if reflection_prompts:
+                        reflection = np.maximum.reduce(scores[len(prompts):]) >= config['mirror_mask_confidence']
+                        inside &= ~reflection[pixels[:, 1].clip(0, reflection.shape[0]-1), pixels[:, 0].clip(0, reflection.shape[1]-1)]
                     if time_possible:
                         inside &= np.isfinite(point_times) & (np.abs(point_times-camera.timestamp) <= config['slam_time_window'])
                     weights = local_confidence*slam_observation_weight(visibility.distance, visibility.incidence_angle,
@@ -694,6 +771,9 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                             marker = (bytes(key), global_class)
                             station_values[marker] = max(station_values.get(marker, 0.), float(weight))
                     usable_views += 1
+                    view_results.append({'image': camera.image_index, 'station': station.id, 'used': True,
+                                         'visible_points': int(len(visibility.point_indices)),
+                                         'visibility_cache': bool(visibility_hit)})
                     control.event('progress', phase='slam_label_transfer', station=station.id, image=camera.image_index,
                                   view=view_number, cache=cache_stats, visible_points=len(visibility.point_indices))
             votes.add_scan(station.id, identity, _slam_batches(station_values, len(all_classes)), codes, station_id=station.id)
@@ -728,8 +808,8 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
         vegetation = votes.vegetation_bases_to_ground(by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
             config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
-    # Origin-based geometric fills and direct label transfer can manufacture a
-    # label for a point never visible from any SLAM camera, so they are disabled.
+    # Origin-based fills and direct-neighbour transfer are disabled.  The writer
+    # additionally restores class 1 for every point never marked visible.
     votes.finalize_station_ids()
     control.event('phase_finished', phase='voting')
     control.event('phase_started', phase='output')
@@ -738,25 +818,40 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         raise FileExistsError('Completed output exists; choose a new run directory')
     writer = write_e57 if config['format'] == 'e57' else write_cloud
     progress = lambda phase, fraction, scan: control.event('progress', phase=phase, fraction=fraction, scan=scan)
+    never_visible = 0
+    for store in stores:
+        values = observed[store.meta['scan_index']]
+        values.flush()
+        for start, xyz, valid in store.chunks():
+            never_visible += int((~values[start:start+len(xyz)] & valid).sum())
+    total_valid = sum(store.meta['valid_count'] for store in stores)
+    force_unclassified = lambda store, start, valid: ~np.asarray(observed[store.meta['scan_index']][start:start+len(valid)])[valid]
     if writer is write_e57:
         result = writer(path, source, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'], [row['code'] for row in rows], (),
                         control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=0.,
-                        geometry_planes=None, station_ids=True, station_count=len(stations))
+                        geometry_planes=None, station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
                         output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None,
-                        station_ids=True, station_count=len(stations))
+                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
     control.event('phase_finished', phase='output')
     result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
                   computed_points=sum(selected_count(store, 'reduced') for store in stores), output_points=result['record_count'], format=config['format'])
     report = {'schema_version': 1, 'input': inspection['source'], 'input_sha256': input_hash, 'input_mode': inspection['input_mode'],
-              'output': result, 'scans': [{'scan': item['station'], 'scene': config['scene_mode']} for item in station_results],
+              'output': result, 'scans': [{'scan': item['station'], 'scene': scene} for item in station_results],
               'stations': station_results, 'virtual_stations': len(stations), 'station_ordering': ordering,
-              'views_used': sum(item['views'] for item in station_results), 'warnings': warnings,
+              'views_used': sum(item['used'] for item in view_results),
+              'views_skipped': [item for item in view_results if not item['used']],
+              'views': view_results, 'never_visible_share': never_visible/max(1, total_valid),
+              'class_1_share': result['class_counts'].get('1', 0)/max(1, result['record_count']), 'warnings': warnings,
               'slam': {'station_spacing_m': config['slam_station_spacing'], 'visibility_cache_hits': visibility_cache.hits,
                        'visibility_recomputations': visibility_cache.recomputations, 'time_filter_requested': config['slam_time_filter'],
                        'time_filter_possible': time_possible, 'time_window_s': config['slam_time_window'],
+                       'scene': scene_info, 'visibility_parameters': {key: config[key] for key in
+                           ('slam_max_range', 'slam_max_range_indoor', 'slam_max_range_outdoor', 'slam_depth_resolution',
+                            'slam_splat_max_px', 'slam_depth_tol_abs', 'slam_depth_tol_rel')},
+                       'median_visible_points_per_view': float(np.median([item['visible_points'] for item in view_results if item['used']])) if any(item['used'] for item in view_results) else 0.,
                        'weighting': {'distance_scale_m': config['slam_weight_distance_scale'],
                                      'incidence_power': config['slam_weight_incidence_power'], 'radial_power': config['slam_weight_radial_power'],
                                      'description': 'SAM confidence multiplied by distance, incidence and image-centre factors.'},
@@ -768,6 +863,11 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
               'total_seconds': time.monotonic()-started}
     write_report(output, report, rows)
     votes.close()
+    for values in observed.values():
+        values.flush()
+        values._mmap.close()
+    observed.clear()
+    del values
     cleanup = cleanup_run_cache(cache, input_hash, identity, mask_cache, config['cache_cleanup'])
     report['cache_cleanup'] = {key: value for key, value in cleanup.items() if key != 'incomplete'}
     write_report(output, report, rows)

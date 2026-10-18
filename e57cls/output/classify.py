@@ -418,7 +418,7 @@ class ClassPointIndex:
 class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
-                 geometry_planes=None, geometry_fill_tolerance=.02, progress=lambda *args: None):
+                 geometry_planes=None, geometry_fill_tolerance=.02, progress=lambda *args: None, force_unclassified=None):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
@@ -426,6 +426,7 @@ class ClassifiedSource:
         self.geometry_fill_tolerance = geometry_fill_tolerance
         self.geometry_fill_counts = {}
         self.progress = progress
+        self.force_unclassified = force_unclassified
         self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0.}
 
     def __enter__(self):
@@ -481,6 +482,9 @@ class ClassifiedSource:
             for code, number in zip(*np.unique(filled[assigned], return_counts=True)):
                 self.geometry_fill_counts[str(int(code))] = self.geometry_fill_counts.get(str(int(code)), 0)+int(number)
             self.timing_seconds['plane_fill'] += time.perf_counter()-started
+        if self.force_unclassified is not None:
+            unseen = self.force_unclassified(store, start, valid)
+            codes[unseen], confidence[unseen], states[unseen] = 1, 0, 0
         return world, codes, confidence, states
 
     def close(self):

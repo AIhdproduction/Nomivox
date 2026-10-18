@@ -1,5 +1,21 @@
 # Decisions
 
+- 2026-10-18: SLAM bewertet Sichtbarkeit pro Kameraperspektive mit einem
+  z-gepufferten Tiefenbild. Dadurch erhalten verdeckte Punkte keine Bildlabels.
+  Kameras werden entlang der Trajektorie zu virtuellen Stationen gruppiert; diese
+  Stationen, nicht Datenblöcke, sind die unabhängigen Stimmen. Klasse 68 bleibt
+  deaktiviert, weil ein SLAM-Datenblock keinen belastbaren Scanursprung besitzt.
+  Spiegel-/Glasmasken dürfen vorhandene Bildpixel dennoch von normalen Labels
+  ausschliessen. Die Gewichtung multipliziert SAM-Konfidenz mit Faktoren für
+  Distanz, Einfallswinkel und Bildmitte.
+- 2026-10-18: SLAM entscheidet die Szene einheitlich für die gesamte Trajektorie.
+  Es verwendet Himmelsmasken und z-buffer-sichtbare Punkte über Kameras, niemals
+  die TLS-Regel der oberen Laser-Halbkugel. Das stabilisiert die Reichweite über
+  benachbarte Stationen (20 m innen, 40 m aussen, manuell überschreibbar).
+- 2026-10-18: Gemeinsamer SAM-Durchgang, Parallelisierung, Kachel-Transfer,
+  kompakte Stores, Score-Floor und gezieltes Cache-Cleanup begrenzen Laufzeit,
+  GPU-Speicher und Wiederholungsaufwand.
+
 - 2026-10-13, latest owner changes: replace the old mirror-only/E1/E2 policy with scan-local mask plus depth. Enable mirrors and window glass by default; label points behind the surface inside their own mask 68, including real exterior points behind glass. Never transfer class 68 through global voxel votes. Keep all points in the main LAS.
 - Surface estimation uses only the outer mask edge and neighbouring wall. Try a 10-pixel outside band, then 30 pixels if no supported plane is found. Exclude mask interiors and enclosed holes. Unknown masks no longer erase ordinary semantic evidence. No plane guessed from virtual interior geometry.
 - Require two distinct mirror/glass prompts for each accepted mask pixel. Remove the phrase mentioning a bathroom sink after it caused a real false positive. SAM can still make mistakes; diagnostics retain all masks and plane failures.

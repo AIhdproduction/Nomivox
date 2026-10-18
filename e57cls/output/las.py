@@ -60,7 +60,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 skipped=(), checkpoint=lambda: None, progress=lambda *args: None,
                 mirror=None, no_reflection=False, primary_without_reflections=False,
                 class_transfer_radius=0., output_density="reduced", geometry_planes=None,
-                geometry_fill_tolerance=.02, station_ids=False, station_count=0):
+                geometry_fill_tolerance=.02, station_ids=False, station_count=0, force_unclassified=None):
     header = make_header(stores, crs_wkt, station_ids=station_ids, station_count=station_count)
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -81,7 +81,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
     extra_writer = laspy.open(extra_temp, mode="w", header=header, **writer_options) if no_reflection else None
     try:
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
-                              geometry_planes, geometry_fill_tolerance, progress) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
+                              geometry_planes, geometry_fill_tolerance, progress, force_unclassified) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]
@@ -103,7 +103,10 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     points.mirror_state = states
                     points.point_source_id[:] = scan
                     if station_ids:
-                        points.station_id = votes.lookup_station_ids(voxel_keys(world, origin, voxel_size))
+                        station = votes.lookup_station_ids(voxel_keys(world, origin, voxel_size))
+                        if force_unclassified is not None:
+                            station[force_unclassified(store, start, valid)] = 0
+                        points.station_id = station
                     # Unknown return structure is represented by zero, documented in the report.
                     if "intensity" in store.meta["arrays"]:
                         try:

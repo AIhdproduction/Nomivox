@@ -338,6 +338,20 @@ E57. `scene_mode: "both"` enables automatic scene detection. Use `indoor` or
 `outdoor` for a manual mode. To resume a run, use its saved configuration;
 changed settings require a new output folder. Completed outputs are not overwritten.
 
+## Mobile Mapping / SLAM
+
+Neben statischen TLS-E57-Dateien erkennt Nomivox mobile SLAM-Exporte automatisch;
+`input_mode` kann mit `auto`, `static` oder `slam` festgelegt werden. Im SLAM-Modus
+werden nur z-buffer-sichtbare Punkte einer Kameraperspektive gelabelt und Kameras zu
+virtuellen Stationen zusammengefasst. Klasse 68 ist dort deaktiviert. Die maximale
+Reichweite beträgt standardmässig 20 m innen und 40 m aussen; `slam_max_range`
+überschreibt beide Werte. SLAM ist bisher nur synthetisch verifiziert, nicht mit
+realen NavVis- oder XGRIDS-Exporten.
+
+Die Verarbeitung nutzt einen gemeinsamen SAM-Durchgang, Parallelisierung,
+kachelweisen Transfer, kompakte Datenspeicher, einen Score-Floor und bereinigt
+den Cache nach erfolgreichem Lauf gemäss Einstellung.
+
 ## Validation and limitations
 
 Processing has been checked with a real file containing **10 scans and around

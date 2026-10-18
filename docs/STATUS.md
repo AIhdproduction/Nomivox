@@ -1,5 +1,8 @@
 # Status
 
+SLAM / Mobile Mapping ist nur synthetisch verifiziert, bis echte NavVis- oder
+XGRIDS-Exporte getestet sind.
+
 This is a chronological development log. The first section describes the current
 behaviour and supersedes the milestone sections below where they differ; for
 example, mirror and glass analysis was off by default at M6 and is now on.

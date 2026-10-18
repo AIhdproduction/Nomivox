@@ -1,5 +1,8 @@
 # Verification ledger — 2026-10-13
 
+SLAM / Mobile Mapping ist nur synthetisch verifiziert, bis echte NavVis- oder
+XGRIDS-Exporte getestet sind.
+
 | Item | Status | Evidence |
 |---|---|---|
 | Separate scans and explicit image association | CONFIRMED | Real file has 10 Data3D sections, 10 spherical images and matching GUID associations. The proposed count of eight scans is REFUTED. |

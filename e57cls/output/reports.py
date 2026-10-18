@@ -42,9 +42,21 @@ def write_report(output: Path, report, rows):
     error = max(report['output']['readback']['max_coordinate_error_m'])*1000
     summary += '<p>'+strings['report_preservation'].format(error=error)+'</p>'
     scenes = ''.join(f'<tr><td>{s["scan"]}</td><td>{html.escape(strings.get("scene_"+s["scene"],s["scene"]))}</td></tr>' for s in report['scans'])
+    slam = ''
+    if report.get('slam'):
+        skipped = len(report.get('views_skipped', []))
+        slam = ('<h2>SLAM / Mobile Mapping</h2><ul>'
+                f'<li>Aufnahmeart: {html.escape(report.get("input_mode", {}).get("mode", "slam"))}</li>'
+                f'<li>Ansichten verwendet/übersprungen: {report.get("views_used", 0)} / {skipped}</li>'
+                f'<li>Virtuelle Stationen: {report.get("virtual_stations", 0)}</li>'
+                f'<li>Nie sichtbare Punkte: {report.get("never_visible_share", 0.)*100:.2f}%</li>'
+                f'<li>Klasse 1: {report.get("class_1_share", 0.)*100:.2f}%</li>'
+                f'<li>Median sichtbare Punkte/Ansicht: {report["slam"].get("median_visible_points_per_view", 0.):.0f}</li>'
+                f'<li>Sichtbarkeitsparameter: {html.escape(json.dumps(report["slam"].get("visibility_parameters", {}), ensure_ascii=False))}</li>'
+                '</ul>')
     links = ''.join(f'<li><a href="{html.escape(name,quote=True)}">{strings[key]}</a></li>' for name,key in [(Path(report['output']['path']).name,'report_cloud'),('legend.html','legend_title'),('report.json','report_json'),('log.txt','report_log'),('run_config.json','report_config')])
     if report.get('reflection_analysis'):
         links += f'<li><a href="reflection_report.json">{strings["report_reflections"]}</a></li>'
         overlays = sorted((output/'diagnostics'/'reflections').glob('*_overlay.jpg'))
         links += ''.join(f'<li><a href="{p.relative_to(output).as_posix()}">{html.escape(p.stem)}</a></li>' for p in overlays)
-    atomic_text(output/"report.html", f'<!doctype html><html lang="de"><meta charset="utf-8"><title>{strings["report_title"]}</title><style>body{{font:16px system-ui;max-width:1000px;margin:40px auto;padding:20px}}td,th{{padding:8px;text-align:left;border-bottom:1px solid #ccc}}a{{color:#176a9b}}</style><h1>{strings["report_title"]}</h1><p>{strings["report_total"].format(count=total)}</p>{summary}<h2>{strings["report_links"]}</h2><ul>{links}</ul><table><tr><th>{strings["code"]}</th><th>{strings["class"]}</th><th>{strings["point_count"]}</th><th>{strings["share"]}</th></tr>{body}</table><h2>{strings["report_scans"]}</h2><table>{scenes}</table><h2>{strings["hints"]}</h2><ul>{hints}</ul><p>{strings["report_visual"]}</p><p>{strings["report_details"]}</p></html>')
+    atomic_text(output/"report.html", f'<!doctype html><html lang="de"><meta charset="utf-8"><title>{strings["report_title"]}</title><style>body{{font:16px system-ui;max-width:1000px;margin:40px auto;padding:20px}}td,th{{padding:8px;text-align:left;border-bottom:1px solid #ccc}}a{{color:#176a9b}}</style><h1>{strings["report_title"]}</h1><p>{strings["report_total"].format(count=total)}</p>{summary}{slam}<h2>{strings["report_links"]}</h2><ul>{links}</ul><table><tr><th>{strings["code"]}</th><th>{strings["class"]}</th><th>{strings["point_count"]}</th><th>{strings["share"]}</th></tr>{body}</table><h2>{strings["report_scans"]}</h2><table>{scenes}</table><h2>{strings["hints"]}</h2><ul>{hints}</ul><p>{strings["report_visual"]}</p><p>{strings["report_details"]}</p></html>')

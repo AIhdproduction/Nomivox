@@ -34,6 +34,15 @@ def main(argv=None) -> int:
     segment.add_argument("--prompt", action="append", required=True)
     run = commands.add_parser("run", help="Classify an E57 from a resolved JSON configuration")
     run.add_argument("--config", type=Path, required=True)
+    quality = commands.add_parser("quality", help="Create a post-run quality report from LAS or LAZ output")
+    quality.add_argument("run_directory", type=Path)
+    quality.add_argument("--step", type=int, default=40, help="Use every Nth output point (default: 40)")
+    quality.add_argument("--indoor-scans", type=int, nargs='+', help="Point Source IDs that should be treated as indoor")
+    quality.add_argument("--outdoor-scans", type=int, nargs='+', help="Point Source IDs that should be treated as outdoor")
+    reclassify = commands.add_parser("reclassify", help="Re-run decision and export stages from a retained cache")
+    reclassify.add_argument("--from", dest="source_run", type=Path, required=True)
+    reclassify.add_argument("--out", type=Path, required=True)
+    reclassify.add_argument("--config", type=Path, help="JSON overrides for post-processing parameters")
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
@@ -41,6 +50,17 @@ def main(argv=None) -> int:
             from e57cls.pipeline.run import execute
             result = execute(load_config(args.config))
             return 130 if result.get("cancelled") else 0
+        if args.command == "quality":
+            from e57cls.output.quality import analyze_run
+            result = analyze_run(args.run_directory, args.step, indoor_scans=args.indoor_scans,
+                                 outdoor_scans=args.outdoor_scans)
+            print(f"Quality report: {args.run_directory.resolve() / 'quality' / 'quality.json'}; sampled points: {result['sampled_points']}")
+            return 0
+        if args.command == "reclassify":
+            from e57cls.pipeline.reclassify import reclassify
+            result = reclassify(args.source_run, args.out, args.config)
+            print(f"Reclassified output: {result['output']['path']}")
+            return 0
         if args.command == "segment":
             import numpy as np
             from PIL import Image

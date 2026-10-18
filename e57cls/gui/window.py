@@ -565,6 +565,7 @@ class MainWindow(QMainWindow):
         for key in ('all', 'keep_masks', 'keep_all'):
             self.cache_cleanup.addItem(tr('cache_cleanup_'+key), key)
         self.cache_cleanup.setCurrentIndex(max(0, self.cache_cleanup.findData(DEFAULTS['cache_cleanup'])))
+        self.cache_cleanup.setToolTip(tr('cache_cleanup_reclassify_tooltip'))
         self.settings_row(sections['settings_group_profile_output'],tr('cache_cleanup'),self.cache_cleanup)
         self.point_reduction.valueChanged.connect(self.update_output_density)
         self.update_output_density()

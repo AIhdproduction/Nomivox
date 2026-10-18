@@ -204,6 +204,7 @@
   "cache_cleanup_all": "Nach Lauf alles löschen (nur Ergebnis behalten)",
   "cache_cleanup_keep_masks": "SAM-Masken behalten (schnellere Wiederholung)",
   "cache_cleanup_keep_all": "Alles behalten",
+  "cache_cleanup_reclassify_tooltip": "Für „Nachklassifizieren“ muss „Alles behalten“ gewählt werden.",
   "setting_boundary_margin": "Randabstand (Pixel)",
   "setting_min_winning_share": "Minimaler Stimmenanteil",
   "setting_component_min_voxels": "Streufilter: Mindestgrösse übrige Klassen (Voxel)",

@@ -1,5 +1,10 @@
 # Decisions
 
+- 2026-10-18: Nachklassifizieren verwendet ausschliesslich eine Kopie der
+  gespeicherten Vote-Datenbank aus Läufen mit `cache_cleanup = keep_all`.
+  Segmentierungs-, Sichtbarkeits- und Reduktionsparameter bleiben gesperrt;
+  dadurch sind mehrere sichere Nachbearbeitungsvarianten möglich.
+
 - 2026-10-18: SLAM bewertet Sichtbarkeit pro Kameraperspektive mit einem
   z-gepufferten Tiefenbild. Dadurch erhalten verdeckte Punkte keine Bildlabels.
   Kameras werden entlang der Trajektorie zu virtuellen Stationen gruppiert; diese

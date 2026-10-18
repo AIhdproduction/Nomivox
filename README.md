@@ -333,6 +333,21 @@ For a new CLI run, create a configuration such as `.cache/run_example.json`:
 .cache\venv\Scripts\python.exe -m e57cls run --config .cache\run_example.json
 ```
 
+Für einen abgeschlossenen Lauf erzeugt der folgende Befehl einen Qualitätsbericht
+in `quality/` mit `quality.json`, deutschen Draufsichten und einer HTML-Übersicht:
+
+```powershell
+.cache\venv\Scripts\python.exe -m e57cls quality "D:\Data\Project\klassifiziert\run_..." --step 40
+```
+
+Mit `cache_cleanup: "keep_all"` kann die gespeicherte Abstimmung ohne erneute
+Bildsegmentierung nachklassifiziert werden. Nur Nachbearbeitungs- und Exportwerte
+in der Override-Datei sind zulässig; der ursprüngliche Vote-Cache bleibt erhalten.
+
+```powershell
+.cache\venv\Scripts\python.exe -m e57cls reclassify --from "D:\Data\Project\klassifiziert\run_..." --out "D:\Data\Project\klassifiziert\run_tuned" --config overrides.json
+```
+
 Without an explicit `output` value, the CLI creates a new run folder beside the
 E57. `scene_mode: "both"` enables automatic scene detection. Use `indoor` or
 `outdoor` for a manual mode. To resume a run, use its saved configuration;

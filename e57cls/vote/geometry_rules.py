@@ -108,6 +108,42 @@ def _prepare_tables(votes, voxel_size, cell_size, tile_size, checkpoint):
     db.commit()
 
 
+def _prepare_scan_context(votes, by_id, scan_context, checkpoint):
+    """Materialize bounded per-voxel scene and class-selection evidence."""
+    db = votes.db
+    tracked = ('ground', 'floor', 'tree', 'low_vegetation')
+    codes = {name: int(by_id.get(name, -1)) for name in tracked}
+    db.executescript("""
+        DROP TABLE IF EXISTS temp.geometry_scan_context;
+        DROP TABLE IF EXISTS temp.geometry_scan_allowed;
+        DROP TABLE IF EXISTS temp.geometry_context;
+        CREATE TEMP TABLE geometry_scan_context(scan INTEGER PRIMARY KEY, outdoor INTEGER NOT NULL) WITHOUT ROWID;
+        CREATE TEMP TABLE geometry_scan_allowed(scan INTEGER, code INTEGER, PRIMARY KEY(scan,code)) WITHOUT ROWID;
+        CREATE TEMP TABLE geometry_context(
+            key BLOB PRIMARY KEY, outdoor INTEGER NOT NULL, indoor INTEGER NOT NULL,
+            allow_ground INTEGER NOT NULL, allow_floor INTEGER NOT NULL,
+            allow_tree INTEGER NOT NULL, allow_low_vegetation INTEGER NOT NULL
+        ) WITHOUT ROWID;
+    """)
+    if not scan_context:
+        return False
+    contexts = [(int(scan), int(bool(item.get('outdoor')))) for scan, item in scan_context.items()]
+    db.executemany('INSERT INTO geometry_scan_context VALUES (?,?)', contexts)
+    allowed = [(int(scan), int(code)) for scan, item in scan_context.items()
+               for code in item.get('allowed_codes', ())]
+    db.executemany('INSERT OR IGNORE INTO geometry_scan_allowed VALUES (?,?)', allowed)
+    columns = ','.join(f'MAX(CASE WHEN a.code={codes[name]} THEN 1 ELSE 0 END)' for name in tracked)
+    cursor = db.execute(f'''SELECT o.key,MAX(c.outdoor),MAX(1-c.outdoor),{columns}
+                            FROM scan_observations o JOIN geometry_scan_context c USING(scan)
+                            LEFT JOIN geometry_scan_allowed a USING(scan)
+                            GROUP BY o.key''')
+    while rows := cursor.fetchmany(100_000):
+        checkpoint()
+        db.executemany('INSERT INTO geometry_context VALUES (?,?,?,?,?,?,?)', rows)
+    db.commit()
+    return True
+
+
 def _make_features(votes, origin, voxel_size, config, checkpoint):
     db = votes.db
     cell_size, tile_size, halo = config['geometry_cell_size'], config['geometry_tile_size'], config['geometry_halo']
@@ -135,7 +171,7 @@ def _make_features(votes, origin, voxel_size, config, checkpoint):
     db.commit()
 
 
-def _terrain(votes, origin, config, target, checkpoint):
+def _terrain(votes, origin, config, target, checkpoint, by_id):
     db = votes.db
     size = config['terrain_cell_size']
     rows = db.execute('''SELECT floor((x-?)/?) AS gx,floor((y-?)/?) AS gy,MIN(z)
@@ -163,8 +199,12 @@ def _terrain(votes, origin, config, target, checkpoint):
             return {'artifact': str(target), 'cells': 0, 'covered_cells': 0}
         tree = cKDTree(xy)
         covered = np.zeros(len(xy), bool)
-        feature_rows = db.execute('SELECT cx,cy,cz,x,y,z,planarity,verticality FROM geometry_features')
+        feature_rows = db.execute('''SELECT f.cx,f.cy,f.cz,f.x,f.y,f.z,f.planarity,f.verticality,
+                                    v.code,COALESCE(c.outdoor,0),COALESCE(c.indoor,0)
+                                    FROM geometry_features f JOIN geometry_voxels v USING(cx,cy,cz)
+                                    LEFT JOIN geometry_context c USING(key)''')
         updates = []
+        ceiling, building, wall = (by_id.get(name) for name in ('ceiling', 'building', 'wall'))
         for batch in iter(lambda: feature_rows.fetchmany(100_000), []):
             checkpoint()
             points = np.asarray([row[3:6] for row in batch], np.float64)
@@ -172,21 +212,40 @@ def _terrain(votes, origin, config, target, checkpoint):
             valid = np.isfinite(distance)
             hag = np.full(len(batch), np.nan)
             hag[valid] = points[valid, 2]-heights[nearest[valid]]
-            flat = valid & (np.asarray([row[6] for row in batch]) >= .4) & (np.asarray([row[7] for row in batch]) >= .8)
-            cover = flat & (hag >= config['terrain_cover_min_height']) & (hag <= config['terrain_cover_max_height'])
+            codes = np.asarray([row[8] for row in batch], np.int64)
+            outdoor = np.asarray([row[9] for row in batch], bool)
+            indoor = np.asarray([row[10] for row in batch], bool)
+            in_height = (hag >= config['terrain_cover_min_height']) & (hag <= config['terrain_cover_max_height'])
+            ceiling_cover = codes == ceiling if ceiling is not None else np.zeros(len(batch), bool)
+            slope_cover = np.isin(codes, [item for item in (building, wall) if item is not None]) & (np.asarray([row[6] for row in batch]) >= .35) & (np.asarray([row[7] for row in batch]) >= .5)
+            cover = valid & in_height & (ceiling_cover | slope_cover)
+            # A cell reached exclusively from indoor scans is covered even when
+            # no horizontal ceiling is visible (for example below a roof slope).
+            cover |= indoor & ~outdoor
             covered[nearest[cover]] = True
-            updates.extend((None if not np.isfinite(value) else float(value), int(is_cover), int(row[0]), int(row[1]), int(row[2]))
-                           for row, value, is_cover in zip(batch, hag, cover))
+            updates.extend((None if not np.isfinite(value) else float(value), 0, int(row[0]), int(row[1]), int(row[2]))
+                           for row, value in zip(batch, hag))
             if len(updates) >= 100_000:
                 db.executemany('UPDATE geometry_features SET hag=?,covered=? WHERE cx=? AND cy=? AND cz=?', updates)
                 updates.clear()
         if updates:
             db.executemany('UPDATE geometry_features SET hag=?,covered=? WHERE cx=? AND cy=? AND cz=?', updates)
-        # Coverage is an evidence raster: mark the terrain cell underneath any
-        # planar roof, while scattered crowns never satisfy the predicate.
-        for row in db.execute('SELECT x,y,hag,covered FROM geometry_features WHERE covered=1'):
-            nearest = tree.query(np.asarray(row[:2], np.float64), k=1)[1]
-            covered[nearest] = True
+        # Every feature in a covered terrain cell inherits the XY coverage.
+        feature_rows = db.execute('SELECT cx,cy,cz,x,y FROM geometry_features')
+        updates = []
+        for batch in iter(lambda: feature_rows.fetchmany(100_000), []):
+            checkpoint()
+            points = np.asarray([row[3:5] for row in batch], np.float64)
+            distance, nearest = tree.query(points, k=1, distance_upper_bound=config['terrain_max_gap'], workers=-1)
+            values = np.zeros(len(batch), np.int64)
+            valid = np.isfinite(distance)
+            values[valid] = covered[nearest[valid]]
+            updates.extend((int(value), int(row[0]), int(row[1]), int(row[2])) for row, value in zip(batch, values))
+            if len(updates) >= 100_000:
+                db.executemany('UPDATE geometry_features SET covered=? WHERE cx=? AND cy=? AND cz=?', updates)
+                updates.clear()
+        if updates:
+            db.executemany('UPDATE geometry_features SET covered=? WHERE cx=? AND cy=? AND cz=?', updates)
     target.parent.mkdir(parents=True, exist_ok=True)
     metadata = {'schema_version': 1, 'cell_size': size, 'max_gap': config['terrain_max_gap'],
                 'origin': np.asarray(origin, np.float64).tolist()}
@@ -213,7 +272,8 @@ def _tree_seeds(votes, by_id, config):
     if 'tree_trunk' not in by_id:
         return []
     rows = votes.db.execute('''SELECT v.ix,v.iy,v.iz,f.linearity FROM geometry_voxels v
-        JOIN geometry_features f USING(cx,cy,cz) WHERE v.code=?''', (by_id['tree_trunk'],)).fetchall()
+        JOIN geometry_features f USING(cx,cy,cz) LEFT JOIN geometry_context c USING(key)
+        WHERE v.code=? AND COALESCE(c.outdoor,0)=1''', (by_id['tree_trunk'],)).fetchall()
     if len(rows) < 4:
         return []
     coordinates = np.asarray([row[:3] for row in rows], np.int64)
@@ -233,7 +293,7 @@ def _tree_seeds(votes, by_id, config):
 
 
 def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_target: Path, checkpoint=lambda: None,
-                         active_codes=None):
+                         active_codes=None, scan_context=None):
     """Apply geometric corrections and persist terrain/coverage evidence.
 
     Temporary SQLite tables keep the feature calculation bounded to an 8 m
@@ -246,8 +306,9 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
     origin = np.asarray(origin, np.float64)
     _prepare_tables(votes, voxel_size, config['geometry_cell_size'], config['geometry_tile_size'], checkpoint)
     _make_features(votes, origin, voxel_size, config, checkpoint)
-    result['terrain'] = _terrain(votes, origin, config, Path(terrain_target), checkpoint)
     active_codes = {int(value) for value in (by_id.values() if active_codes is None else active_codes)}
+    context_available = _prepare_scan_context(votes, by_id, scan_context, checkpoint)
+    result['terrain'] = _terrain(votes, origin, config, Path(terrain_target), checkpoint, by_id)
     _alternatives(votes, active_codes)
     db = votes.db
     code = lambda name: by_id.get(name)
@@ -257,9 +318,9 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
     changes = {}
     fallbacks = {}
 
-    def target_or_fallback(name, alternative):
+    def target_or_fallback(name, alternative, allowed=True):
         target = code(name)
-        if target in active_codes:
+        if allowed and target in active_codes:
             return target
         alternative = int(alternative) if alternative is not None else None
         if alternative in active_codes:
@@ -275,28 +336,31 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
         return alternative if alternative in active_codes else 1
 
     cursor = db.execute('''SELECT v.key,v.code,v.confidence,v.ix,v.iy,v.iz,f.x,f.y,f.z,f.scatter,f.planarity,
-                           f.linearity,f.verticality,f.hag,f.covered,a.code,a.confidence
+                           f.linearity,f.verticality,f.hag,f.covered,a.code,a.confidence,
+                           COALESCE(c.outdoor,0),COALESCE(c.indoor,1),COALESCE(c.allow_ground,0),
+                           COALESCE(c.allow_floor,0),COALESCE(c.allow_tree,0),COALESCE(c.allow_low_vegetation,0)
                            FROM geometry_voxels v JOIN geometry_features f USING(cx,cy,cz)
-                           LEFT JOIN geometry_alternatives a USING(key)''')
+                           LEFT JOIN geometry_alternatives a USING(key) LEFT JOIN geometry_context c USING(key)''')
     while rows := cursor.fetchmany(100_000):
         checkpoint()
         for row in rows:
-            key, current, _, _, _, _, x, y, z, scatter, planarity, _, _, hag, covered, alternative, alt_conf = row
+            key, current, _, _, _, _, x, y, z, scatter, planarity, _, _, hag, covered, alternative, alt_conf, outdoor, _, allow_ground, allow_floor, allow_tree, allow_low_vegetation = row
             wanted = None
             confidence = 0
-            if current in building_wall and scatter > .25 and planarity < .4:
+            if config['geometry_rules_outdoor_vegetation'] and outdoor and current in building_wall and scatter > .25 and planarity < .4:
                 wanted = (alternative_or_unclassified(alternative) if covered else
-                          target_or_fallback('tree' if hag is not None and hag >= 1.5 else 'low_vegetation', alternative))
-            elif current == code('ceiling') and scatter > .25 and not covered:
-                wanted = target_or_fallback('tree', alternative)
-            elif current in ground_like and hag is not None and hag > .4:
+                          target_or_fallback('tree' if hag is not None and hag >= 1.5 else 'low_vegetation', alternative,
+                                             allow_tree if hag is not None and hag >= 1.5 else allow_low_vegetation))
+            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current == code('ceiling') and scatter > .25 and not covered:
+                wanted = target_or_fallback('tree', alternative, allow_tree)
+            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current in ground_like and hag is not None and hag > .4:
                 wanted, confidence = alternative_or_unclassified(alternative), int(alt_conf or 0)
-            elif current == code('low_vegetation') and hag is not None and hag > 2.5 and scatter > .25:
-                wanted = target_or_fallback('tree', alternative)
-            elif current == code('ground') and covered:
-                wanted = target_or_fallback('floor', alternative)
-            elif current == code('floor') and not covered and hag is not None and abs(hag) <= .4:
-                wanted = target_or_fallback('ground', alternative)
+            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current == code('low_vegetation') and hag is not None and hag > 2.5 and scatter > .25:
+                wanted = target_or_fallback('tree', alternative, allow_tree)
+            elif config['geometry_rules_ground_floor'] and current == code('ground') and covered:
+                wanted = target_or_fallback('floor', alternative, allow_floor)
+            elif config['geometry_rules_ground_floor'] and outdoor and current == code('floor') and not covered and hag is not None and abs(hag) <= .4:
+                wanted = target_or_fallback('ground', alternative, allow_ground)
             if wanted is not None and wanted != current:
                 changes[bytes(key)] = (int(wanted), confidence)
     seeds = _tree_seeds(votes, by_id, config)
@@ -305,20 +369,21 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
         seed_xy = np.asarray([item[:2] for item in seeds], np.float64)*voxel_size
         seed_top = np.asarray([item[2] for item in seeds], np.float64)*voxel_size
         tree = cKDTree(seed_xy)
-        cursor = db.execute('''SELECT v.key,v.code,v.ix,v.iy,v.iz,f.scatter,f.hag FROM geometry_voxels v
-                             JOIN geometry_features f USING(cx,cy,cz)''')
+        cursor = db.execute('''SELECT v.key,v.code,v.ix,v.iy,v.iz,f.scatter,f.hag,
+                             COALESCE(c.outdoor,0),COALESCE(c.allow_tree,0) FROM geometry_voxels v
+                             JOIN geometry_features f USING(cx,cy,cz) LEFT JOIN geometry_context c USING(key)''')
         for rows in iter(lambda: cursor.fetchmany(100_000), []):
             checkpoint()
             points = np.asarray([(row[2]*voxel_size, row[3]*voxel_size) for row in rows], np.float64)
             distance, nearest = tree.query(points, distance_upper_bound=config['tree_crown_grow_radius'])
             for row, d, seed in zip(rows, distance, nearest):
-                if not np.isfinite(d) or row[5] <= .25:
+                if not np.isfinite(d) or row[5] <= .25 or not row[7]:
                     continue
                 relative_z = row[4]*voxel_size-seed_top[seed]
                 in_cylinder = d <= config['tree_crown_radius'] and -1. <= relative_z <= config['tree_crown_max_height']
                 growing = row[1] == 1 and row[6] is not None and row[6] > 2. and d <= config['tree_crown_grow_radius']
-                if (in_cylinder and row[1] in crown_sources) or growing:
-                    changes[bytes(row[0])] = (target_or_fallback('tree', None), 0)
+                if ((in_cylinder and row[1] in crown_sources) or growing) and config['geometry_rules_outdoor_vegetation'] and row[6]:
+                    changes[bytes(row[0])] = (target_or_fallback('tree', None, row[7]), 0)
     updates = [(new_code, new_conf, key) for key, (new_code, new_conf) in changes.items()]
     for start in range(0, len(updates), 50_000):
         checkpoint()
@@ -329,4 +394,5 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
         values = np.asarray([value[0] for value in changes.values()], np.int64)
         result['changed'] = {str(int(item)): int(number) for item, number in zip(*np.unique(values, return_counts=True))}
     result['fallbacks'] = fallbacks
+    result['scan_context'] = {'available': context_available}
     return result

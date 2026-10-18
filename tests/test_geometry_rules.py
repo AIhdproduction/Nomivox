@@ -61,6 +61,11 @@ def test_terrain_fill_assigns_ground_with_its_own_confidence(tmp_path):
         _, codes, confidence, _ = source.block(store, 0, np.array([[.1, .1, .04]]), np.array([True]), 'original')
     assert codes.tolist() == [2]
     assert confidence.tolist() == [64]
+    with ClassifiedSource(tmp_path, [], Votes(), np.zeros(3), .02, terrain=terrain, terrain_fill=True,
+                          terrain_outdoor_scans=set()) as source:
+        _, codes, confidence, _ = source.block(store, 0, np.array([[.1, .1, .04]]), np.array([True]), 'original')
+    assert codes.tolist() == [1]
+    assert confidence.tolist() == [0]
 
 
 def test_facade_and_crown_features_are_distinguishable():
@@ -94,7 +99,7 @@ def test_geometry_tile_loops_checkpoint_for_bounded_work(tmp_path):
     assert len(calls) > 4
 
 
-def test_geometry_rules_fall_back_when_an_outdoor_target_is_inactive(tmp_path):
+def test_geometry_rules_gate_outdoor_targets_for_indoor_scan(tmp_path):
     votes = VoteStore(tmp_path/'indoor.sqlite')
     try:
         grid = np.meshgrid(np.arange(7)*.1, np.arange(7)*.1, np.arange(7)*.1, indexing='ij')
@@ -104,9 +109,74 @@ def test_geometry_rules_fall_back_when_an_outdoor_target_is_inactive(tmp_path):
         votes.add_scan(1, 'indoor', [(keys, weights)], [101, 100])
         votes.decide(1, .5, [101, 100])
         report = apply_geometry_rules(votes, {'ceiling': 101, 'wall': 100}, np.zeros(3), .02,
-                                      {**DEFAULTS}, tmp_path/'terrain.npz')
+                                      {**DEFAULTS}, tmp_path/'terrain.npz',
+                                      scan_context={1: {'outdoor': False, 'allowed_codes': {101, 100}}})
         codes, _ = votes.lookup(keys)
     finally:
         votes.close()
     assert set(codes.tolist()) <= {1, 100, 101}
+    assert not report['fallbacks']
+
+
+def test_geometry_rules_fall_back_when_an_outdoor_target_is_inactive(tmp_path):
+    votes = VoteStore(tmp_path/'outdoor.sqlite')
+    try:
+        grid = np.meshgrid(np.arange(7)*.1, np.arange(7)*.1, np.arange(7)*.1, indexing='ij')
+        points = np.column_stack([axis.ravel() for axis in grid])
+        keys = voxel_keys(points, np.zeros(3), .02)
+        weights = np.tile(np.array([[.8, .2]], np.float32), (len(keys), 1))
+        votes.add_scan(1, 'outdoor', [(keys, weights)], [101, 100])
+        votes.decide(1, .5, [101, 100])
+        report = apply_geometry_rules(votes, {'ceiling': 101, 'wall': 100}, np.zeros(3), .02,
+                                      {**DEFAULTS}, tmp_path/'terrain.npz',
+                                      scan_context={1: {'outdoor': True, 'allowed_codes': {101, 100}}})
+    finally:
+        votes.close()
     assert report['fallbacks'].get('tree:alternative', 0) > 0
+
+
+def test_indoor_slope_is_covered_and_keeps_floor(tmp_path):
+    votes = VoteStore(tmp_path/'slope.sqlite')
+    try:
+        xx, yy = np.meshgrid(np.arange(9)*.1, np.arange(9)*.1, indexing='ij')
+        floor = np.column_stack((xx.ravel(), yy.ravel(), np.zeros(xx.size)))
+        ceiling = np.column_stack((xx.ravel(), yy.ravel(), 2.+.8*xx.ravel()))
+        points = np.vstack((floor, ceiling))
+        keys = voxel_keys(points, np.zeros(3), .02)
+        weights = np.zeros((len(keys), 2), np.float32)
+        weights[:len(floor), 0] = .9
+        weights[len(floor):, 1] = .9
+        votes.add_scan(1, 'indoor', [(keys, weights)], [102, 101])
+        votes.decide(1, .5, [102, 101])
+        terrain = tmp_path/'terrain.npz'
+        apply_geometry_rules(votes, {'floor': 102, 'ceiling': 101}, np.zeros(3), .02, {**DEFAULTS}, terrain,
+                             scan_context={1: {'outdoor': False, 'allowed_codes': {102, 101}}})
+        codes, _ = votes.lookup(keys[:len(floor)])
+        with np.load(terrain, allow_pickle=False) as artifact:
+            assert artifact['covered'].any()
+    finally:
+        votes.close()
+    assert set(codes.tolist()) == {102}
+
+
+def test_mixed_scan_context_applies_tree_rule_only_outdoors(tmp_path):
+    votes = VoteStore(tmp_path/'mixed.sqlite')
+    try:
+        grid = np.meshgrid(np.arange(7)*.1, np.arange(7)*.1, np.arange(7)*.1, indexing='ij')
+        outside = np.column_stack([axis.ravel() for axis in grid])
+        inside = outside+np.array((3., 0., 0.))
+        outside_keys = voxel_keys(outside, np.zeros(3), .02)
+        inside_keys = voxel_keys(inside, np.zeros(3), .02)
+        weights = np.ones((len(outside_keys), 1), np.float32)
+        votes.add_scan(1, 'outdoor', [(outside_keys, weights)], [101])
+        votes.add_scan(2, 'indoor', [(inside_keys, weights)], [101])
+        votes.decide(1, .5, [101, 5])
+        apply_geometry_rules(votes, {'ceiling': 101, 'tree': 5}, np.zeros(3), .02, {**DEFAULTS}, tmp_path/'terrain.npz',
+                             scan_context={1: {'outdoor': True, 'allowed_codes': {101, 5}},
+                                           2: {'outdoor': False, 'allowed_codes': {101}}})
+        outside_codes, _ = votes.lookup(outside_keys)
+        inside_codes, _ = votes.lookup(inside_keys)
+    finally:
+        votes.close()
+    assert (outside_codes == 5).any()
+    assert set(inside_codes.tolist()) == {101}

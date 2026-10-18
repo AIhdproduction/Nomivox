@@ -420,7 +420,7 @@ class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
                  geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
-                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None):
+                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
@@ -429,6 +429,7 @@ class ClassifiedSource:
         self.geometry_fill_tolerance = geometry_fill_tolerance
         self.terrain_ground_tolerance = terrain_ground_tolerance
         self.terrain_fill = terrain_fill
+        self.terrain_outdoor_scans = None if terrain_outdoor_scans is None else set(terrain_outdoor_scans)
         self.geometry_fill_counts = {}
         self.progress = progress
         self.force_unclassified = force_unclassified
@@ -487,7 +488,8 @@ class ClassifiedSource:
             for code, number in zip(*np.unique(filled[assigned], return_counts=True)):
                 self.geometry_fill_counts[str(int(code))] = self.geometry_fill_counts.get(str(int(code)), 0)+int(number)
             self.timing_seconds['plane_fill'] += time.perf_counter()-started
-        if self.terrain is not None and self.terrain_fill:
+        if self.terrain is not None and self.terrain_fill and (self.terrain_outdoor_scans is None
+                                                               or store.meta['scan_index'] in self.terrain_outdoor_scans):
             started = time.perf_counter()
             unknown = codes == 1
             filled = self.terrain.ground_mask(world[unknown], self.terrain_ground_tolerance)

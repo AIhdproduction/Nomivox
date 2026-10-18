@@ -18,6 +18,7 @@ from e57cls.output.e57 import write_e57
 from e57cls.output.las import write_cloud
 from e57cls.output.reports import legend_rows, write_legends, write_report
 from e57cls.pipeline.config import DEFAULTS, resolve_config
+from e57cls.pipeline.run import geometry_scan_context
 from e57cls.vote.engine import VoteStore
 
 
@@ -35,7 +36,8 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
     'building_boundary_min_height', 'building_boundary_max_cells', 'geometry_fill',
     'geometry_fill_classes', 'geometry_fill_min_area', 'geometry_fill_max_gap',
     'geometry_fill_tolerance', 'geometry_fill_max_planes', 'geometry_rules', 'geometry_cell_size',
-    'geometry_tile_size', 'geometry_halo', 'geometry_knn', 'geometry_knn_radius', 'terrain_cell_size',
+    'geometry_tile_size', 'geometry_halo', 'geometry_knn', 'geometry_knn_radius',
+    'geometry_rules_outdoor_vegetation', 'geometry_rules_ground_floor', 'terrain_cell_size',
     'terrain_max_gap', 'terrain_max_slope', 'terrain_ground_tolerance', 'terrain_fill',
     'terrain_cover_min_height', 'terrain_cover_max_height', 'tree_crown_radius', 'tree_crown_max_height',
     'tree_crown_grow_radius', 'class_transfer_radius', 'output_density', 'format', 'extra_no_reflection',
@@ -140,7 +142,7 @@ def _copy_sqlite(source: Path, target: Path) -> None:
         old.backup(new)
 
 
-def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes):
+def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes, scan_context):
     """Apply precisely the decision/output stages from the regular pipeline."""
     codes = list(by_id.values())
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
@@ -161,7 +163,7 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     if config['geometry_rules']:
         terrain = work/'terrain.npz'
         result['geometry_rules'] = apply_geometry_rules(votes, by_id, origin, config['voxel_size'], config, terrain,
-                                                         active_codes=active_codes)
+                                                         active_codes=active_codes, scan_context=scan_context)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         result['stairs_geometry'] = votes.reject_planar_stairs(by_id['stairs'], origin, config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'], config['seed'], codes)
@@ -219,15 +221,26 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         mapping = preset.get('code_map', {})
         by_id = {item['id']: int(mapping.get(str(item['code']), item['code'])) for item in all_classes}
         config = {**config, 'voxel_origin': manifest['voxel_origin']}
+        source_report = _load_json_object(source_run/'report.json', 'report.json')
+        scan_scenes = {int(item['scan']): item.get('scene') for item in source_report.get('scans', [])
+                       if isinstance(item, dict) and isinstance(item.get('scan'), int)}
+        if input_mode['mode'] == 'static':
+            representatives_by_scan = {store.meta['scan_index']: vote_directory/f"scan_{store.meta['scan_index']:04d}"/'representatives.npy'
+                                       for store in stores}
+            existing = {scan: path for scan, path in representatives_by_scan.items() if path.is_file()}
+            votes.rebuild_scan_observations(existing)
+        scan_context = geometry_scan_context(preset, config, scan_scenes)
         stages, planes, terrain = _postprocess(votes, config, by_id,
             [store.meta['metadata']['pose']['translation']['z'] for store in stores], copied_votes.parent,
-            {row['code'] for row in rows})
+            {row['code'] for row in rows}, scan_context)
         if station_tracking:
             votes.finalize_station_ids()
         inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
-        source_report = _load_json_object(source_run/'report.json', 'report.json')
         writer = write_e57 if config['format'] == 'e57' else write_cloud
         mirror = _StoredMirrorStates(vote_directory/'mirrors') if manifest.get('mirror_analysis') else None
+        terrain_outdoor_scans = ({store.meta['scan_index'] for store in stores}
+                                 if input_mode['mode'] == 'slam' and any(context['outdoor'] for context in scan_context.values())
+                                 else {scan for scan, context in scan_context.items() if context['outdoor']})
         name = f"{Path(config['source']).stem}_classified.{config['format']}"
         path = target/name
         args = (path, Path(config['source']), output_stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
@@ -240,7 +253,8 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
-                        station_ids=station_tracking)
+                        station_ids=station_tracking,
+                        terrain_outdoor_scans=terrain_outdoor_scans)
         result.update(point_reduction=config['point_reduction'], output_density=config['output_density'], format=config['format'])
         write_legends(target, rows)
         shutil.copy2(source_run/'scan_index.json', target/'scan_index.json')

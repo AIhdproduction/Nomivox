@@ -61,7 +61,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 mirror=None, no_reflection=False, primary_without_reflections=False,
                 class_transfer_radius=0., output_density="reduced", geometry_planes=None,
                 geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15, terrain_fill=False,
-                station_ids=False, station_count=0, force_unclassified=None):
+                station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None):
     header = make_header(stores, crs_wkt, station_ids=station_ids, station_count=station_count)
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -83,7 +83,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
     try:
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
                               geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
-                              progress, force_unclassified) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
+                              progress, force_unclassified, terrain_outdoor_scans) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]

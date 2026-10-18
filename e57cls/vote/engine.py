@@ -92,6 +92,8 @@ class VoteStore:
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS votes(key BLOB, class INTEGER, weight REAL, peak REAL, PRIMARY KEY(key,class)) WITHOUT ROWID;
           CREATE TABLE IF NOT EXISTS observations(key BLOB PRIMARY KEY, count INTEGER) WITHOUT ROWID;
+          CREATE TABLE IF NOT EXISTS scan_observations(key BLOB, scan INTEGER,
+              PRIMARY KEY(key,scan)) WITHOUT ROWID;
           CREATE TABLE IF NOT EXISTS scans(scan INTEGER PRIMARY KEY, identity TEXT);
           CREATE TABLE IF NOT EXISTS decisions(key BLOB PRIMARY KEY, code INTEGER, confidence INTEGER) WITHOUT ROWID;
         """)
@@ -165,6 +167,8 @@ class VoteStore:
                 has_evidence = np.any(weights > 0, axis=1)
                 self.db.executemany("INSERT INTO observations VALUES (?,1) ON CONFLICT(key) DO UPDATE SET count=count+1",
                                     ((bytes(k),) for k in keys[has_evidence]))
+                self.db.executemany("INSERT OR IGNORE INTO scan_observations VALUES (?,?)",
+                                    ((bytes(k), int(scan)) for k in keys[has_evidence]))
                 rows, columns = np.nonzero(weights > 0)
                 codes = np.asarray(class_codes, np.int64)[columns]
                 values = weights[rows, columns]
@@ -180,6 +184,32 @@ class VoteStore:
                          for key, code, weight in zip(keys[rows], codes, values)))
             self.db.execute("INSERT INTO scans VALUES (?,?)", (scan, identity))
         self._invalidate_lookup()
+
+    def rebuild_scan_observations(self, representatives_by_scan, checkpoint=lambda: None):
+        """Restore per-scan voxel evidence from retained representative arrays.
+
+        Older ``keep_all`` caches predate ``scan_observations`` but retain one
+        representative array per static scan.  Rebuilding into a reclassify
+        copy preserves the source cache and makes scene-aware postprocessing
+        available to those runs as well.
+        """
+        if self.db.execute('SELECT 1 FROM scan_observations LIMIT 1').fetchone() is not None:
+            return False
+        inserted = 0
+        with self.db:
+            for scan, path in sorted(representatives_by_scan.items()):
+                checkpoint()
+                values = np.load(path, mmap_mode='r', allow_pickle=False)
+                try:
+                    keys = values['key'] if values.dtype.names and 'key' in values.dtype.names else values
+                    for start in range(0, len(keys), 100_000):
+                        batch = keys[start:start+100_000]
+                        self.db.executemany('INSERT OR IGNORE INTO scan_observations VALUES (?,?)',
+                                            ((bytes(key), int(scan)) for key in batch))
+                        inserted += len(batch)
+                finally:
+                    values._mmap.close()
+        return bool(inserted)
 
     def decide(self, min_observations=1, min_share=.4, class_order=(), checkpoint=lambda: None, priority=None,
                vote_families=()):

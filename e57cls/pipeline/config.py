@@ -37,6 +37,7 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "geometry_fill_min_area": .5, "geometry_fill_max_gap": .30, "geometry_fill_tolerance": .02,
             "geometry_fill_max_planes": 400,
             "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
+            "geometry_rules_outdoor_vegetation": True, "geometry_rules_ground_floor": True,
             "geometry_halo": 1.5, "geometry_knn": 24, "geometry_knn_radius": 1.,
             "terrain_cell_size": .5, "terrain_max_gap": 5., "terrain_max_slope": .75,
             "terrain_ground_tolerance": .15, "terrain_fill": True,
@@ -196,7 +197,8 @@ def resolve_config(config: dict, base: Path = PROJECT):
     if (not isinstance(value['component_cleanup'], bool) or not isinstance(value['surface_tie_break'], bool)
             or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
             or not isinstance(value['mirror_shape_regularize'], bool) or not isinstance(value['geometry_rules'], bool)
-            or not isinstance(value['terrain_fill'], bool)):
+            or not isinstance(value['geometry_rules_outdoor_vegetation'], bool)
+            or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels','cable_component_min_voxels','electrical_component_min_voxels','geometry_fill_max_planes'):
         if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:

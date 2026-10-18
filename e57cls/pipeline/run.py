@@ -125,6 +125,19 @@ def select_classes(preset, mode, building_enclosure=False):
     return selected
 
 
+def geometry_scan_context(preset, config, scan_scenes):
+    """Return conservative scene and selected-class evidence for geometry rules."""
+    mapping = preset.get('code_map', {})
+    result = {}
+    for scan, scene in scan_scenes.items():
+        # Only an explicit outdoor decision enables exterior plausibility rules.
+        mode = scene if scene in ('indoor', 'outdoor') else 'indoor'
+        selected = select_classes(preset, mode, config['building_enclosure'])
+        result[int(scan)] = {'outdoor': mode == 'outdoor',
+                             'allowed_codes': {int(mapping.get(str(item['code']), item['code'])) for item in selected}}
+    return result
+
+
 def prompt_classes(classes, config):
     return [PromptClass(c['id'], tuple(c['prompts']),
                         c.get('min_instance_conf') if c.get('min_instance_conf') is not None
@@ -799,9 +812,10 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             config['building_boundary_max_cells'], control.checkpoint)
     if config['geometry_rules']:
         terrain = work/'terrain.npz'
+        rule_context = geometry_scan_context(preset, config, {station.id: scene for station in stations})
         geometry_rules = apply_geometry_rules(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
                                               config, terrain, control.checkpoint,
-                                              active_codes={row['code'] for row in rows})
+                                              active_codes={row['code'] for row in rows}, scan_context=rule_context)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         stairs = votes.reject_planar_stairs(by_id['stairs'], np.asarray(config['voxel_origin']), config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
@@ -839,14 +853,16 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                         control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=0.,
                         geometry_planes=None, terrain=terrain, terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
-                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
+                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
+                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set())
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
                         output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None, terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
-                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
+                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
+                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set())
     control.event('phase_finished', phase='output')
     result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
                   computed_points=sum(selected_count(store, 'reduced') for store in stores), output_points=result['record_count'], format=config['format'])
@@ -1248,9 +1264,11 @@ def execute(config, backend_factory=None, listen=True):
                 if config['geometry_rules']:
                     geometry_started = time.monotonic()
                     terrain = work/'terrain.npz'
+                    rule_context = geometry_scan_context(preset, config,
+                                                         {item['scan']: item.get('scene') for item in scan_results if 'scan' in item})
                     geometry_rules_report = apply_geometry_rules(votes, by_id, np.array(config['voxel_origin']),
                         config['voxel_size'], config, terrain, control.checkpoint,
-                        active_codes={row['code'] for row in rows})
+                        active_codes={row['code'] for row in rows}, scan_context=rule_context)
                     timings['geometry_rules'] = time.monotonic()-geometry_started
                 if config['stairs_geometry_check'] and 'stairs' in by_id:
                     stairs_geometry_report = votes.reject_planar_stairs(
@@ -1304,7 +1322,8 @@ def execute(config, backend_factory=None, listen=True):
                         geometry_planes=geometry_planes if semantic_run and config['geometry_fill'] else None,
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain if semantic_run else None,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
-                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows))
+                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        terrain_outdoor_scans={item['scan'] for item in scan_results if item.get('scene') == 'outdoor'})
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}

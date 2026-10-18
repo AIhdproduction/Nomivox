@@ -12,6 +12,7 @@ import numpy as np
 
 from e57cls.files import atomic_json, new_output
 from e57cls.geometry.fill import extract_planes
+from e57cls.vote.geometry_rules import apply_geometry_rules
 from e57cls.io.store import load_scan, reduced_store
 from e57cls.output.e57 import write_e57
 from e57cls.output.las import write_cloud
@@ -33,11 +34,16 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
     'vegetation_ground_band', 'building_enclosure', 'building_boundary_cell_size',
     'building_boundary_min_height', 'building_boundary_max_cells', 'geometry_fill',
     'geometry_fill_classes', 'geometry_fill_min_area', 'geometry_fill_max_gap',
-    'geometry_fill_tolerance', 'geometry_fill_max_planes', 'class_transfer_radius',
-    'output_density', 'format', 'extra_no_reflection', 'cache_cleanup', 'vote_families', 'tree_crown_radius',
+    'geometry_fill_tolerance', 'geometry_fill_max_planes', 'geometry_rules', 'geometry_cell_size',
+    'geometry_tile_size', 'geometry_halo', 'geometry_knn', 'geometry_knn_radius', 'terrain_cell_size',
+    'terrain_max_gap', 'terrain_max_slope', 'terrain_ground_tolerance', 'terrain_fill',
+    'terrain_cover_min_height', 'terrain_cover_max_height', 'tree_crown_radius', 'tree_crown_max_height',
+    'tree_crown_grow_radius', 'class_transfer_radius', 'output_density', 'format', 'extra_no_reflection',
+    'cache_cleanup', 'vote_families',
 })
 RECLASSIFY_POST_VOTE_PREFIXES = ('stairs_', 'surface_tie_', 'component_', 'cable_', 'electrical_',
-                                 'vegetation_', 'building_', 'geometry_fill', 'class_transfer_')
+                                 'vegetation_', 'building_', 'geometry_fill', 'geometry_', 'terrain_', 'tree_',
+                                 'class_transfer_')
 INPUT_MODES = frozenset({'static', 'slam'})
 REQUESTED_INPUT_MODES = INPUT_MODES | {'auto'}
 
@@ -134,14 +140,15 @@ def _copy_sqlite(source: Path, target: Path) -> None:
         old.backup(new)
 
 
-def _postprocess(votes, config, by_id, scanner_heights, work: Path):
+def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes):
     """Apply precisely the decision/output stages from the regular pipeline."""
     codes = list(by_id.values())
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
                 'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
-    votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority)
+    families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
+    votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority, vote_families=families)
     result = {'surface_ties': None, 'building_enclosure': None, 'stairs_geometry': None,
-              'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_fill': None}
+              'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_rules': None, 'geometry_fill': None}
     origin = np.asarray(config['voxel_origin'])
     if config['surface_tie_break']:
         result['surface_ties'] = votes.resolve_surface_ties(by_id, origin, config['voxel_size'], config['surface_tie_share'],
@@ -150,6 +157,11 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path):
         result['building_enclosure'] = votes.split_ground_floor_by_building(by_id['ground'], by_id['floor'],
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'], config['building_boundary_max_cells'])
+    terrain = None
+    if config['geometry_rules']:
+        terrain = work/'terrain.npz'
+        result['geometry_rules'] = apply_geometry_rules(votes, by_id, origin, config['voxel_size'], config, terrain,
+                                                         active_codes=active_codes)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         result['stairs_geometry'] = votes.reject_planar_stairs(by_id['stairs'], origin, config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'], config['seed'], codes)
@@ -167,7 +179,7 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path):
     if config['geometry_fill']:
         planes = work/'planes.npz'
         result['geometry_fill'] = extract_planes(votes, by_id, origin, config['voxel_size'], config, planes)
-    return result, planes
+    return result, planes, terrain
 
 
 def reclassify(source_run: Path, output: Path, overrides_path: Path | None = None) -> dict:
@@ -207,8 +219,9 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         mapping = preset.get('code_map', {})
         by_id = {item['id']: int(mapping.get(str(item['code']), item['code'])) for item in all_classes}
         config = {**config, 'voxel_origin': manifest['voxel_origin']}
-        stages, planes = _postprocess(votes, config, by_id,
-            [store.meta['metadata']['pose']['translation']['z'] for store in stores], copied_votes.parent)
+        stages, planes, terrain = _postprocess(votes, config, by_id,
+            [store.meta['metadata']['pose']['translation']['z'] for store in stores], copied_votes.parent,
+            {row['code'] for row in rows})
         if station_tracking:
             votes.finalize_station_ids()
         inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
@@ -224,7 +237,10 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         result = writer(*args, mirror=mirror.output if mirror else None, no_reflection=config['extra_no_reflection'],
                         output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
                         geometry_planes=planes if config['geometry_fill'] else None,
-                        geometry_fill_tolerance=config['geometry_fill_tolerance'], station_ids=station_tracking)
+                        geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain,
+                        terrain_ground_tolerance=config['terrain_ground_tolerance'],
+                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        station_ids=station_tracking)
         result.update(point_reduction=config['point_reduction'], output_density=config['output_density'], format=config['format'])
         write_legends(target, rows)
         shutil.copy2(source_run/'scan_index.json', target/'scan_index.json')

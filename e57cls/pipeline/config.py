@@ -11,6 +11,7 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "tile_size": 1008, "tile_overlap": .3, "prompt_batch": "auto", "instance_confidence": .4,
             "mask_confidence": .5, "boundary_margin": 2, "voxel_size": .02, "min_observations": 1,
             "min_winning_share": .50, "surface_tie_break": True, "surface_tie_share": .55,
+            "vote_families": [["ground", "floor"]],
             "surface_normal_radius": .06, "view_size": 1512, "view_fov": 95, "visibility_abs": .03,
             "visibility_rel": .01, "depth_width": 4096, "gpu_device": "cuda:0", "gpu_memory_fraction": .85,
             "mirror_analysis": True, "glass_analysis": True, "reflection_policy": "masked_depth",
@@ -35,6 +36,13 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "floor", "ground", "road", "sidewalk"],
             "geometry_fill_min_area": .5, "geometry_fill_max_gap": .30, "geometry_fill_tolerance": .02,
             "geometry_fill_max_planes": 400,
+            "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
+            "geometry_halo": 1.5, "geometry_knn": 24, "geometry_knn_radius": 1.,
+            "terrain_cell_size": .5, "terrain_max_gap": 5., "terrain_max_slope": .75,
+            "terrain_ground_tolerance": .15, "terrain_fill": True,
+            "terrain_cover_min_height": 1.8, "terrain_cover_max_height": 6.,
+            "tree_crown_radius": 4., "tree_crown_max_height": 25.,
+            "tree_crown_grow_radius": 6.,
             "vegetation_base_to_ground": True, "vegetation_ground_cell_size": .10,
             "vegetation_ground_band": .04,
             "building_enclosure": True, "building_boundary_cell_size": .25,
@@ -182,18 +190,30 @@ def resolve_config(config: dict, base: Path = PROJECT):
         raise ValueError('Invalid stairs planar fraction')
     if not isinstance(value['stairs_priority_over'], list) or not all(isinstance(item, str) for item in value['stairs_priority_over']):
         raise ValueError('Invalid stairs priority classes')
+    if (not isinstance(value['vote_families'], list) or any(not isinstance(family, list)
+            or not family or not all(isinstance(item, str) for item in family) for family in value['vote_families'])):
+        raise ValueError('Invalid vote families')
     if (not isinstance(value['component_cleanup'], bool) or not isinstance(value['surface_tie_break'], bool)
             or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
-            or not isinstance(value['mirror_shape_regularize'], bool)):
+            or not isinstance(value['mirror_shape_regularize'], bool) or not isinstance(value['geometry_rules'], bool)
+            or not isinstance(value['terrain_fill'], bool)):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels','cable_component_min_voxels','electrical_component_min_voxels','geometry_fill_max_planes'):
         if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
             raise ValueError(f'Invalid {key}')
     for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius','reflection_neighbor_radius',
                 'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
-                'geometry_fill_max_gap','geometry_fill_tolerance'):
+                'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_cell_size', 'geometry_tile_size',
+                'geometry_halo', 'geometry_knn_radius', 'terrain_cell_size', 'terrain_max_gap', 'terrain_max_slope',
+                'terrain_ground_tolerance', 'terrain_cover_min_height', 'terrain_cover_max_height',
+                'tree_crown_radius', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['geometry_knn'], int) or isinstance(value['geometry_knn'], bool)
+            or not 3 <= value['geometry_knn'] <= 128):
+        raise ValueError('Invalid geometry neighbour count')
+    if value['terrain_cover_max_height'] <= value['terrain_cover_min_height']:
+        raise ValueError('Invalid terrain cover range')
     if (not isinstance(value['depth_gate_classes'], list) or not all(isinstance(item, str) for item in value['depth_gate_classes'])
             or not isinstance(value['geometry_fill_classes'], list) or not all(isinstance(item, str) for item in value['geometry_fill_classes'])):
         raise ValueError('Invalid geometry class list')

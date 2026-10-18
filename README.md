@@ -348,6 +348,11 @@ in der Override-Datei sind zulässig; der ursprüngliche Vote-Cache bleibt erhal
 .cache\venv\Scripts\python.exe -m e57cls reclassify --from "D:\Data\Project\klassifiziert\run_..." --out "D:\Data\Project\klassifiziert\run_tuned" --config overrides.json
 ```
 
+The retained post-processing controls include `geometry_rules`, `vote_families`,
+and the `terrain_*`/`tree_*` thresholds. Geometry rules create a compact terrain
+artifact for the run. Its optional output-only terrain fill assigns class 2 to an
+otherwise unclassified point only when uncovered DTM evidence supports it.
+
 Without an explicit `output` value, the CLI creates a new run folder beside the
 E57. `scene_mode: "both"` enables automatic scene detection. Use `indoor` or
 `outdoor` for a manual mode. To resume a run, use its saved configuration;

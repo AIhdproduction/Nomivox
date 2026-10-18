@@ -21,6 +21,7 @@ from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_to_camera
 from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
+from e57cls.vote.geometry_rules import apply_geometry_rules
 from e57cls.io.inspector import inspect_file, markdown
 from e57cls.io.input_mode import detect_input_mode, pseudo_setup_points_check
 from e57cls.io.reader import E57Reader
@@ -783,8 +784,10 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     control.event('phase_started', phase='voting')
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
                 'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
-    votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority)
-    surface_ties = building = stairs = components = vegetation = None
+    families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
+    votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority, families)
+    surface_ties = building = stairs = components = vegetation = geometry_rules = None
+    terrain = None
     if config['surface_tie_break']:
         surface_ties = votes.resolve_surface_ties(by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
             config['surface_tie_share'], config['surface_normal_radius'], config['min_observations'],
@@ -794,6 +797,11 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'],
             config['building_boundary_max_cells'], control.checkpoint)
+    if config['geometry_rules']:
+        terrain = work/'terrain.npz'
+        geometry_rules = apply_geometry_rules(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
+                                              config, terrain, control.checkpoint,
+                                              active_codes={row['code'] for row in rows})
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         stairs = votes.reject_planar_stairs(by_id['stairs'], np.asarray(config['voxel_origin']), config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
@@ -829,11 +837,15 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     if writer is write_e57:
         result = writer(path, source, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'], [row['code'] for row in rows], (),
                         control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=0.,
-                        geometry_planes=None, station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
+                        geometry_planes=None, terrain=terrain, terrain_ground_tolerance=config['terrain_ground_tolerance'],
+                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
-                        output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None,
+                        output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None, terrain=terrain,
+                        terrain_ground_tolerance=config['terrain_ground_tolerance'],
+                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified)
     control.event('phase_finished', phase='output')
     result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
@@ -859,7 +871,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
               'sam_calls': 0,
               'stairs_priority_overrides': votes.priority_overrides, 'created_utc': datetime.now(timezone.utc).isoformat(),
               'surface_ties': surface_ties, 'building_enclosure': building, 'stairs_geometry': stairs,
-              'component_cleanup': components, 'vegetation_base_to_ground': vegetation,
+              'component_cleanup': components, 'vegetation_base_to_ground': vegetation, 'geometry_rules': geometry_rules,
               'total_seconds': time.monotonic()-started}
     write_report(output, report, rows)
     votes.close()
@@ -903,6 +915,8 @@ def execute(config, backend_factory=None, listen=True):
     surface_tie_report = None
     geometry_fill_report = None
     geometry_planes = None
+    geometry_rules_report = None
+    terrain = None
     def factory():
         nonlocal backend
         if backend is None:
@@ -1216,7 +1230,8 @@ def execute(config, backend_factory=None, listen=True):
                 by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
                 priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
                             'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
-                votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority)
+                families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
+                votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority, families)
                 if config['surface_tie_break']:
                     tie_started = time.monotonic()
                     surface_tie_report = votes.resolve_surface_ties(
@@ -1230,6 +1245,13 @@ def execute(config, backend_factory=None, listen=True):
                         by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
                         config['building_boundary_max_cells'], control.checkpoint)
+                if config['geometry_rules']:
+                    geometry_started = time.monotonic()
+                    terrain = work/'terrain.npz'
+                    geometry_rules_report = apply_geometry_rules(votes, by_id, np.array(config['voxel_origin']),
+                        config['voxel_size'], config, terrain, control.checkpoint,
+                        active_codes={row['code'] for row in rows})
+                    timings['geometry_rules'] = time.monotonic()-geometry_started
                 if config['stairs_geometry_check'] and 'stairs' in by_id:
                     stairs_geometry_report = votes.reject_planar_stairs(
                         by_id['stairs'], np.array(config['voxel_origin']), config['voxel_size'],
@@ -1280,7 +1302,9 @@ def execute(config, backend_factory=None, listen=True):
                         class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.,
                         output_density=config['output_density'],
                         geometry_planes=geometry_planes if semantic_run and config['geometry_fill'] else None,
-                        geometry_fill_tolerance=config['geometry_fill_tolerance'])
+                        geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain if semantic_run else None,
+                        terrain_ground_tolerance=config['terrain_ground_tolerance'],
+                        terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows))
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}
@@ -1306,6 +1330,7 @@ def execute(config, backend_factory=None, listen=True):
                   "geometry_fill": {**(geometry_fill_report or {'planes': {}}),
                                     'filled_points': result.get('geometry_fill_counts', {}),
                                     'confidence': 96},
+                  "geometry_rules": geometry_rules_report,
                   "mask_cache_behavior": "Mask identities include the prompts of one class. Removing doorway invalidates only door masks; other class masks remain reusable.",
                   "reflection_analysis": mirrors.report if mirrors else None,
                   "time_policy": "GPS time is zero when time base is not verified",

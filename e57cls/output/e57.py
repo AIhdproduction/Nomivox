@@ -148,6 +148,7 @@ def _limits(store, density):
 
 def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
            progress, mirror, density, without_reflections, class_transfer_radius, geometry_planes, geometry_fill_tolerance,
+           terrain, terrain_ground_tolerance, terrain_fill,
            station_ids=False, station_count=0, force_unclassified=None):
     source_file = lib.ImageFile(str(source), "r")
     image = lib.ImageFile(str(path), "w")
@@ -159,7 +160,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
     try:
         root = _write_root(image, source_file)
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
-                              geometry_planes, geometry_fill_tolerance, progress, force_unclassified) as classified:
+                              geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
+                              progress, force_unclassified) as classified:
           for store in stores:
             prototypes = store.meta["metadata"]["points"]["fields"]
             fields = {name: prototypes.get(name, {"type": "Float"}) for name in store.meta["arrays"]
@@ -240,6 +242,7 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
               skipped=(), checkpoint=lambda: None, progress=lambda *args: None, mirror=None,
               no_reflection=False, primary_without_reflections=False, class_transfer_radius=0.,
               output_density="reduced", geometry_planes=None, geometry_fill_tolerance=.02,
+              terrain=None, terrain_ground_tolerance=.15, terrain_fill=False,
               station_ids=False, station_count=0, force_unclassified=None):
     """Write an E57 atomically, retaining images and Nomivox extension fields."""
     temporary = path.with_name(path.stem+".partial"+path.suffix)
@@ -248,7 +251,8 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
     try:
         result = _write(temporary, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
                         progress, mirror, output_density, primary_without_reflections, class_transfer_radius,
-                        geometry_planes, geometry_fill_tolerance, station_ids, station_count, force_unclassified)
+                        geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
+                        station_ids, station_count, force_unclassified)
         started = time.perf_counter()
         result["readback"] = verify_e57(temporary, source, stores, result["record_count"], allowed_codes,
                                           primary_without_reflections, result.pop("_samples"))
@@ -259,7 +263,8 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
         if no_reflection:
             extra_result = _write(extra_temporary, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
                                   progress, mirror, output_density, True, class_transfer_radius,
-                                  geometry_planes, geometry_fill_tolerance, station_ids, station_count, force_unclassified)
+                                  geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
+                                  station_ids, station_count, force_unclassified)
             started = time.perf_counter()
             verify_e57(extra_temporary, source, stores, extra_result["record_count"], allowed_codes, True,
                        extra_result.pop("_samples"))

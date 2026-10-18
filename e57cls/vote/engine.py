@@ -181,7 +181,8 @@ class VoteStore:
             self.db.execute("INSERT INTO scans VALUES (?,?)", (scan, identity))
         self._invalidate_lookup()
 
-    def decide(self, min_observations=1, min_share=.4, class_order=(), checkpoint=lambda: None, priority=None):
+    def decide(self, min_observations=1, min_share=.4, class_order=(), checkpoint=lambda: None, priority=None,
+               vote_families=()):
         order = {int(code): i for i, code in enumerate(class_order)}
         self.db.execute("DELETE FROM decisions")
         self._invalidate_lookup()
@@ -239,6 +240,38 @@ class VoteStore:
                     maximum[override] = priority_weight[override]
                     self.priority_overrides += int(override.sum())
             share = maximum/total
+            family_share = np.zeros(len(starts), np.float64)
+            family_winner = winner.copy()
+            # A family only rescues split evidence. Clear individual winners
+            # remain untouched and ties retain the configured class order.
+            for family in vote_families:
+                members = np.asarray(tuple(family), np.int64)
+                selected_rows = np.isin(codes, members)
+                if not selected_rows.any():
+                    continue
+                sums = np.bincount(groups[selected_rows], weights=weights[selected_rows], minlength=len(starts))
+                candidate_weight = np.full(len(starts), -np.inf)
+                candidate_code = np.zeros(len(starts), np.int64)
+                candidate_order = np.full(len(starts), np.iinfo(np.int64).max)
+                for position in range(int(lengths.max())):
+                    ids = np.flatnonzero((positions == position) & selected_rows)
+                    grouped = groups[ids]
+                    values = weights[ids]
+                    choices = np.fromiter((order.get(int(code), 1000+int(code)) for code in codes[ids]),
+                                            dtype=np.int64, count=len(ids))
+                    take = (values > candidate_weight[grouped]) | ((values == candidate_weight[grouped])
+                            & (choices < candidate_order[grouped]))
+                    if take.any():
+                        picked = grouped[take]
+                        candidate_weight[picked] = values[take]
+                        candidate_code[picked] = codes[ids[take]]
+                        candidate_order[picked] = choices[take]
+                shares = sums/total
+                take = shares > family_share
+                family_share[take], family_winner[take] = shares[take], candidate_code[take]
+            rescued = (share < min_share) & (family_share >= min_share) & ~override
+            winner[rescued] = family_winner[rescued]
+            share[rescued] = family_share[rescued]
             decided = (observations[starts] >= min_observations) & ((share >= min_share) | override)
             confidence = np.fromiter((round(float(value)*255) for value in share), dtype=np.int64, count=len(share))
             confidence[~decided] = 0

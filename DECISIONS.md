@@ -1,5 +1,11 @@
 # Decisions
 
+- 2026-10-18: The previous no-extrapolation rule is lifted only for the
+  class-2 terrain fill. An unclassified output point may become ground when
+  the persisted DTM marks its cell as uncovered terrain and its height is
+  within the configured terrain tolerance. The fill uses confidence 64 and
+  remains independently switchable.
+
 - 2026-10-18: Nachklassifizieren verwendet ausschliesslich eine Kopie der
   gespeicherten Vote-Datenbank aus Läufen mit `cache_cleanup = keep_all`.
   Segmentierungs-, Sichtbarkeits- und Reduktionsparameter bleiben gesperrt;

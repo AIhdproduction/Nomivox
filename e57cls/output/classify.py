@@ -14,6 +14,7 @@ from scipy.spatial import cKDTree
 from e57cls.geometry.cameras import Pose
 from e57cls.geometry.fill import PlaneIndex
 from e57cls.vote.engine import voxel_keys
+from e57cls.vote.geometry_rules import TerrainIndex
 
 
 def classify_points(store, start, stop, xyz, valid, votes, origin, voxel_size,
@@ -418,16 +419,20 @@ class ClassPointIndex:
 class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
-                 geometry_planes=None, geometry_fill_tolerance=.02, progress=lambda *args: None, force_unclassified=None):
+                 geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
+                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
         self.geometry = PlaneIndex(geometry_planes) if geometry_planes else None
+        self.terrain = TerrainIndex(terrain) if terrain else None
         self.geometry_fill_tolerance = geometry_fill_tolerance
+        self.terrain_ground_tolerance = terrain_ground_tolerance
+        self.terrain_fill = terrain_fill
         self.geometry_fill_counts = {}
         self.progress = progress
         self.force_unclassified = force_unclassified
-        self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0.}
+        self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0., 'terrain_fill': 0.}
 
     def __enter__(self):
         if not self.radius: return self
@@ -482,6 +487,15 @@ class ClassifiedSource:
             for code, number in zip(*np.unique(filled[assigned], return_counts=True)):
                 self.geometry_fill_counts[str(int(code))] = self.geometry_fill_counts.get(str(int(code)), 0)+int(number)
             self.timing_seconds['plane_fill'] += time.perf_counter()-started
+        if self.terrain is not None and self.terrain_fill:
+            started = time.perf_counter()
+            unknown = codes == 1
+            filled = self.terrain.ground_mask(world[unknown], self.terrain_ground_tolerance)
+            ids = np.flatnonzero(unknown)[filled]
+            codes[ids], confidence[ids] = 2, 64
+            if len(ids):
+                self.geometry_fill_counts['terrain_fill'] = self.geometry_fill_counts.get('terrain_fill', 0)+len(ids)
+            self.timing_seconds['terrain_fill'] += time.perf_counter()-started
         if self.force_unclassified is not None:
             unseen = self.force_unclassified(store, start, valid)
             codes[unseen], confidence[unseen], states[unseen] = 1, 0, 0
@@ -499,6 +513,12 @@ class ClassifiedSource:
         if geometry is not None:
             try:
                 geometry.close()
+            except Exception:
+                pass
+        terrain, self.terrain = self.terrain, None
+        if terrain is not None:
+            try:
+                terrain.close()
             except Exception:
                 pass
         predictions, self.predictions = self.predictions, {}

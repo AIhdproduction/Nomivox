@@ -359,7 +359,10 @@ def test_output_prepare_events_and_timing_are_reported(tmp_path):
     result = write_cloud(tmp_path/'cloud.las', [_synthetic_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2],
                          class_transfer_radius=.01, progress=lambda *event: events.append(event))
     assert any(event[0] == 'output_prepare' for event in events)
-    assert set(result['timing_seconds']) == {'lookup_mirror', 'transfer', 'plane_fill', 'write', 'readback'}
+    # The terrain fill is a separate output stage, so existing timing keys must
+    # remain stable while the new key is explicitly required.
+    assert {'lookup_mirror', 'transfer', 'plane_fill', 'write', 'readback'} <= set(result['timing_seconds'])
+    assert 'terrain_fill' in result['timing_seconds']
 
 
 @pytest.mark.slow

@@ -1,6 +1,7 @@
 """Compact, deterministic plane completion data used by both output writers."""
 
 import json
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -161,22 +162,36 @@ class PlaneIndex:
         self._archive = np.load(path, allow_pickle=False)
         self.meta = json.loads(str(self._archive['metadata']))
         self.planes = []
+        self.grid_size = 1.
+        self.grid = {}
         for item in self.meta['planes']:
             cells = self._archive[item['cells']]
-            self.planes.append((item, np.asarray(item['center']), np.asarray(item['normal']),
-                                np.asarray(item['basis']), np.sort(_keys(cells)),
-                                np.asarray(item.get('bbox_min', [-np.inf]*3)), np.asarray(item.get('bbox_max', [np.inf]*3))))
+            entry = (item, np.asarray(item['center']), np.asarray(item['normal']),
+                     np.asarray(item['basis']), np.sort(_keys(cells)),
+                     np.asarray(item.get('bbox_min', [-np.inf]*3)), np.asarray(item.get('bbox_max', [np.inf]*3)))
+            index = len(self.planes)
+            self.planes.append(entry)
+            bbox_min, bbox_max = entry[-2:]
+            if np.isfinite(bbox_min).all() and np.isfinite(bbox_max).all():
+                low = np.floor(bbox_min/self.grid_size).astype(np.int64)
+                high = np.floor(bbox_max/self.grid_size).astype(np.int64)
+                for cell in product(*(range(int(a), int(b)+1) for a, b in zip(low, high))):
+                    self.grid.setdefault(cell, []).append(index)
 
-    def fill(self, points, tolerance):
+    def fill(self, points, tolerance, checkpoint=lambda: None):
         codes = np.zeros(len(points), np.uint8)
         best = np.full(len(points), np.inf)
         tied = np.zeros(len(points), bool)
         if not len(points):
             return codes
-        block_low, block_high = points.min(axis=0), points.max(axis=0)
-        for item, center, normal, basis, occupied, bbox_min, bbox_max in self.planes:
-            if np.any(bbox_max < block_low) or np.any(bbox_min > block_high):
-                continue
+        cells = np.floor(points/self.grid_size).astype(np.int64)
+        candidates = set()
+        for cell in np.unique(cells, axis=0):
+            candidates.update(self.grid.get(tuple(map(int, cell)), ()))
+        for position, plane_index in enumerate(sorted(candidates)):
+            if position % 32 == 0:
+                checkpoint()
+            item, center, normal, basis, occupied, bbox_min, bbox_max = self.planes[plane_index]
             in_box = np.all((points >= bbox_min) & (points <= bbox_max), axis=1)
             if not in_box.any():
                 continue

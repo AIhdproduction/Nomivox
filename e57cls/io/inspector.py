@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 import math
+import logging
 import platform
 import time
 
@@ -12,9 +13,11 @@ from PIL import ImageFile
 
 from e57cls.files import atomic_json, atomic_text, new_output
 from e57cls.io.reader import E57Reader, metadata
+from e57cls.io.input_mode import detect_input_mode
 
 REPRESENTATIONS = ("sphericalRepresentation", "pinholeRepresentation",
                    "cylindricalRepresentation", "visualReferenceRepresentation")
+LOG = logging.getLogger(__name__)
 
 
 def pose_status(pose: dict | None) -> str:
@@ -46,6 +49,23 @@ def image_header(blob, limit: int = 1024 * 1024) -> dict:
     raise ValueError(f"Image header unavailable within {limit} bytes")
 
 
+def image_decodable(blob) -> None:
+    """Fully decode an embedded image without retaining its compressed bytes."""
+    parser = ImageFile.Parser()
+    offset = 0
+    while offset < blob.byteCount():
+        count = min(64 * 1024, blob.byteCount()-offset)
+        buffer = np.empty(count, np.uint8)
+        blob.read(buffer, offset, count)
+        parser.feed(buffer.tobytes())
+        offset += count
+    image = parser.close()
+    try:
+        image.load()
+    finally:
+        image.close()
+
+
 def sample_summary(chunk) -> dict:
     xyz = chunk.xyz[chunk.valid]
     result = {"records_read": len(chunk.xyz), "valid_records": int(chunk.valid.sum()),
@@ -70,7 +90,7 @@ def sample_summary(chunk) -> dict:
     return result
 
 
-def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
+def inspect_file(source: Path, sample_points: int = 100_000, config: dict | None = None) -> dict:
     if not 0 <= sample_points <= 1_000_000:
         raise ValueError("Sample size must be between 0 and 1000000")
     source = source.resolve(strict=True)
@@ -112,7 +132,8 @@ def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
             reps = [name for name in REPRESENTATIONS if name in item]
             image = {"index": index + 1, "metadata": item, "representations": reps,
                      "pose_status": pose_status(item.get("pose")), "blob_headers": {},
-                     "association_status": "uncertain", "scan_index": None}
+                     "association_status": "uncertain", "scan_index": None,
+                     "classification_eligible_slam": False}
             for rep in reps:
                 image["blob_headers"][rep] = {}
                 for name in ("jpegImage", "pngImage", "imageMask"):
@@ -146,14 +167,43 @@ def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
                     scan["classification_eligible_metadata"] |= bool(usable) and scan["sample"] is not None
             else:
                 issues.append({"code": "image_association_uncertain", "image": index + 1})
+            required = {"sphericalRepresentation": ("pixelWidth", "pixelHeight"),
+                        "pinholeRepresentation": ("pixelWidth", "pixelHeight", "focalLength", "principalPointX", "principalPointY"),
+                        "cylindricalRepresentation": ("pixelWidth", "pixelHeight", "radius", "principalPointY")}
+            if image["pose_status"] == "valid":
+                for rep in reps:
+                    params, headers = item[rep], image["blob_headers"][rep]
+                    if rep in required and all(key in params for key in required[rep]):
+                        dimensions = all(params.get(key, 0) > 0 for key in ("imageWidth", "imageHeight", "pixelWidth", "pixelHeight"))
+                        image["classification_eligible_slam"] |= dimensions and any(
+                            header["matches_metadata"] for name, header in headers.items() if name != "imageMask")
+            if not image["classification_eligible_slam"]:
+                issues.append({"code": "image_not_classifiable_slam", "image": index + 1})
             images.append(image)
         for scan in scans:
             if not scan["classification_eligible_metadata"]:
                 issues.append({"code": "scan_not_classifiable", "scan": scan["index"]})
+        detected = detect_input_mode({"scans": scans, "images": images}, config or {})
+        if detected["mode"] == "slam":
+            for image in images:
+                if not image["classification_eligible_slam"]:
+                    continue
+                try:
+                    representation = next(rep for rep in image["representations"]
+                                          if rep != "visualReferenceRepresentation"
+                                          and any(name in image["metadata"][rep] for name in ("jpegImage", "pngImage")))
+                    name = "jpegImage" if "jpegImage" in image["metadata"][representation] else "pngImage"
+                    image_decodable(reader.blob(image["index"]-1, representation, name))
+                    image["decode_status"] = "valid"
+                except (RuntimeError, ValueError, OSError, StopIteration) as error:
+                    image["classification_eligible_slam"] = False
+                    image["decode_status"] = "invalid"
+                    issues.append({"code": "image_decode_failed", "image": image["index"], "detail": str(error)})
+                    LOG.warning("Skipping SLAM image %d because it cannot be decoded: %s", image["index"], error)
     after = source.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError("Input changed during inspection")
-    return {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
+    report = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
             "source": {"path": str(source), "bytes": before.st_size, "mtime_ns": before.st_mtime_ns},
             "versions": {"python": platform.python_version(), **{k: version(k) for k in ("pye57", "numpy", "Pillow")}},
             "metadata": file_meta, "scan_count": len(scans), "image_count": len(images),
@@ -162,6 +212,8 @@ def inspect_file(source: Path, sample_points: int = 100_000) -> dict:
             "scans": scans, "images": images, "issues": issues,
             "sample_limit_per_scan": sample_points, "elapsed_seconds": time.monotonic() - started,
             "input_stat_unchanged": True, "projection_alignment_verified": False}
+    report["input_mode"] = detected
+    return report
 
 
 def markdown(report: dict) -> str:
@@ -176,6 +228,10 @@ def markdown(report: dict) -> str:
         for rep in image["representations"]:
             params = image["metadata"][rep]
             lines.append(f"| {image['index']} | {rep} | {params.get('imageWidth')} x {params.get('imageHeight')} | {image['association_status']} | {image.get('camera_scanner_offset_m', 'unknown')} |")
+    input_mode = report.get("input_mode")
+    if input_mode:
+        lines.extend(["", "## Input mode", "", f"Selected: {input_mode['mode']} (requested: {input_mode['requested']})", ""])
+        lines.extend(f"- Rule {rule['id']}: {'hit' if rule['hit'] else 'no hit'}; {rule['detail']}" for rule in input_mode['rules'])
     lines.extend(["", "## Coordinate metadata", "", "```text", report["metadata"].get("coordinateMetadata", "Absent"), "```", "", "## Issues", ""])
     lines.extend(f"- {issue}" for issue in report["issues"])
     if not report["issues"]:

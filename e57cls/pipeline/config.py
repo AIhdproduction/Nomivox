@@ -7,7 +7,7 @@ from pathlib import Path
 from e57cls.seg.cache import SCORE_FLOOR
 
 PROJECT = Path(__file__).resolve().parents[2]
-DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "scene_mode": "both", "profile": "balanced", "image_scale": .90,
+DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "input_mode": "auto", "scene_mode": "both", "profile": "balanced", "image_scale": .90,
             "tile_size": 1008, "tile_overlap": .3, "prompt_batch": "auto", "instance_confidence": .4,
             "mask_confidence": .5, "boundary_margin": 2, "voxel_size": .02, "min_observations": 1,
             "min_winning_share": .50, "surface_tie_break": True, "surface_tie_share": .55,
@@ -15,8 +15,16 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "scen
             "visibility_rel": .01, "depth_width": 4096, "gpu_device": "cuda:0", "gpu_memory_fraction": .85,
             "mirror_analysis": True, "glass_analysis": True, "reflection_policy": "masked_depth",
             "extra_no_reflection": False, "format": "laz", "output_density": "reduced",
-            "point_reduction": .40, "strict": False,
+            "point_reduction": .40, "strict": False, "pipeline_parallel": True,
+            "pipeline_prefetch_scans": 1,
             "cache_cleanup": "all",
+            "slam_max_range_indoor": 20., "slam_max_range_outdoor": 40., "slam_max_range": None,
+            "slam_depth_resolution": 1024, "slam_splat_max_px": 6,
+            "slam_depth_tol_abs": .02, "slam_depth_tol_rel": .01, "slam_diagnostics": False,
+            "slam_station_spacing": 1.0, "slam_boundary_margin_extra": 1,
+            "slam_weight_distance_scale": 5.0, "slam_weight_incidence_power": 1.0,
+            "slam_weight_radial_power": 1.0, "slam_time_filter": False,
+            "slam_time_window": 10.0,
             "seed": 42, "scene_overrides": {}, "diagnostics": "sample",
             "component_cleanup": True, "component_min_voxels": 12,
             "cable_component_min_voxels": 8, "cable_component_min_span": .20,
@@ -79,6 +87,47 @@ def resolve_config(config: dict, base: Path = PROJECT):
         raise ValueError("Invalid point reduction")
     if value["processing_mode"] not in ("classify_and_filter", "filter_only"):
         raise ValueError("Invalid processing mode")
+    if value["input_mode"] not in ("auto", "static", "slam"):
+        raise ValueError("Invalid input mode")
+    if value["slam_max_range"] is not None and (not isinstance(value["slam_max_range"], (int, float))
+                                                 or isinstance(value["slam_max_range"], bool)
+                                                 or not 0 < value["slam_max_range"] < float("inf")):
+        raise ValueError("Invalid SLAM maximum range")
+    for key in ("slam_max_range_indoor", "slam_max_range_outdoor"):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 < value[key] < float("inf")):
+            raise ValueError(f"Invalid {key}")
+    for key in ("slam_depth_tol_abs", "slam_depth_tol_rel"):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 <= value[key] < float("inf")):
+            raise ValueError(f"Invalid {key}")
+    if not 64 <= value["slam_depth_resolution"] <= 8192:
+        raise ValueError("Invalid SLAM depth-map resolution")
+    if not 1 <= value["slam_splat_max_px"] <= 64:
+        raise ValueError("Invalid SLAM splat maximum")
+    if not isinstance(value["slam_diagnostics"], bool):
+        raise ValueError("Invalid SLAM diagnostics setting")
+    if (not isinstance(value["slam_station_spacing"], (int, float)) or isinstance(value["slam_station_spacing"], bool)
+            or not 0 < value["slam_station_spacing"] < float("inf")):
+        raise ValueError("Invalid SLAM station spacing")
+    if (not isinstance(value["slam_boundary_margin_extra"], int) or isinstance(value["slam_boundary_margin_extra"], bool)
+            or not 0 <= value["slam_boundary_margin_extra"] <= 16):
+        raise ValueError("Invalid SLAM boundary margin")
+    for key in ("slam_weight_distance_scale", "slam_time_window"):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 < value[key] < float("inf")):
+            raise ValueError(f"Invalid {key}")
+    for key in ("slam_weight_incidence_power", "slam_weight_radial_power"):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 <= value[key] < float("inf")):
+            raise ValueError(f"Invalid {key}")
+    if not isinstance(value["slam_time_filter"], bool):
+        raise ValueError("Invalid SLAM time filter")
+    if not isinstance(value['pipeline_parallel'], bool):
+        raise ValueError('Invalid pipeline parallel setting')
+    if (not isinstance(value['pipeline_prefetch_scans'], int) or isinstance(value['pipeline_prefetch_scans'], bool)
+            or not 1 <= value['pipeline_prefetch_scans'] <= 3):
+        raise ValueError('Invalid pipeline prefetch scans')
     # A reflection-only run has no useful result without this analysis.  Keep this
     # invariant for command-line configurations as well as the GUI.
     if value["processing_mode"] == "filter_only":

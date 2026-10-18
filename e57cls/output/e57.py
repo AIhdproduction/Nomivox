@@ -8,12 +8,14 @@ preserve source RGB and leave the source E57 untouched.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from uuid import uuid4
 
 import numpy as np
 from pye57 import libe57 as lib
 from pye57.utils import copy_node
 from e57cls.output.classify import ClassifiedSource, output_chunks, selected_count
+from e57cls.vote.engine import voxel_keys
 
 
 NOMIVOX_URI = "https://nomivox.example/e57/1.0"
@@ -105,7 +107,7 @@ def _coordinate_node(image, description, low, high):
     return lib.FloatNode(image, float(low), _precision(description), float(low), max(float(low), float(high)))
 
 
-def _scan_node(image, store, fields, coordinate_fields, bounds):
+def _scan_node(image, store, fields, coordinate_fields, bounds, station_ids=False, station_count=0):
     meta = store.meta["metadata"]
     node = lib.StructureNode(image)
     node.set("guid", lib.StringNode(image, meta.get("guid") or "{%s}" % uuid4()))
@@ -130,6 +132,8 @@ def _scan_node(image, store, fields, coordinate_fields, bounds):
         prototype.set(name, _node(image, info, name))
     for name in ("nomivox:classification", "nomivox:classConfidence", "nomivox:mirrorState"):
         prototype.set(name, lib.IntegerNode(image, 0, 0, 255))
+    if station_ids:
+        prototype.set("nomivox:stationId", lib.IntegerNode(image, 0, 0, max(1, int(station_count))))
     points = lib.CompressedVectorNode(image, prototype, lib.VectorNode(image, True))
     node.set("points", points)
     return node, points
@@ -143,23 +147,25 @@ def _limits(store, density):
 
 
 def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
-           progress, mirror, density, without_reflections, class_transfer_radius, geometry_planes, geometry_fill_tolerance):
+           progress, mirror, density, without_reflections, class_transfer_radius, geometry_planes, geometry_fill_tolerance,
+           station_ids=False, station_count=0):
     source_file = lib.ImageFile(str(source), "r")
     image = lib.ImageFile(str(path), "w")
     total = sum(selected_count(store, density) for store in stores)
     written = discarded = transferred = 0
     counts, mirrors = np.zeros(256, np.int64), np.zeros(5, np.int64)
     samples = {}
+    write_seconds = 0.
     try:
         root = _write_root(image, source_file)
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
-                              geometry_planes, geometry_fill_tolerance) as classified:
+                              geometry_planes, geometry_fill_tolerance, progress) as classified:
           for store in stores:
             prototypes = store.meta["metadata"]["points"]["fields"]
             fields = {name: prototypes.get(name, {"type": "Float"}) for name in store.meta["arrays"]
                       if name not in {"xyz_local", "valid"} | _COORDINATES}
             bounds = _limits(store, density)
-            node, points = _scan_node(image, store, fields, prototypes, bounds)
+            node, points = _scan_node(image, store, fields, prototypes, bounds, station_ids, station_count)
             root["data3D"].append(node)
             capacity = 500_000
             xyz_info = store.meta["arrays"]["xyz_local"]
@@ -174,6 +180,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
                 if raw:
                     raw_names.add(name)
             arrays.update({name: np.empty(capacity, np.int64) for name in ("nomivox:classification", "nomivox:classConfidence", "nomivox:mirrorState")})
+            if station_ids:
+                arrays["nomivox:stationId"] = np.empty(capacity, np.uint32)
             buffers = lib.VectorSourceDestBuffer()
             for name, values in arrays.items():
                 buffers.append(lib.SourceDestBuffer(image, name, values, capacity,
@@ -200,7 +208,12 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
                         arrays["nomivox:classification"][:out_count] = codes[take]
                         arrays["nomivox:classConfidence"][:out_count] = confidence[take]
                         arrays["nomivox:mirrorState"][:out_count] = states[take]
+                        if station_ids:
+                            arrays["nomivox:stationId"][:out_count] = votes.lookup_station_ids(
+                                voxel_keys(world, origin, voxel_size))[take]
+                        started = time.perf_counter()
                         writer.write(out_count)
+                        write_seconds += time.perf_counter()-started
                         if store.meta["scan_index"] not in samples:
                             samples[store.meta["scan_index"]] = local[:32].copy()
                     counts += np.bincount(codes[take], minlength=256)
@@ -217,13 +230,15 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
     return {"record_count": written, "class_counts": {str(i): int(n) for i, n in enumerate(counts) if n},
             "unclassified_share": int(counts[1])/max(1, written), "mirror_counts": mirrors.tolist(),
             "extra_removed_count": discarded, "class_transfer_count": transferred,
-            "geometry_fill_counts": classified.geometry_fill_counts, "_samples": samples}
+            "geometry_fill_counts": classified.geometry_fill_counts, "_samples": samples,
+            "timing_seconds": {**classified.timing_seconds, 'write': write_seconds, 'readback': 0.}}
 
 
 def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allowed_codes,
               skipped=(), checkpoint=lambda: None, progress=lambda *args: None, mirror=None,
               no_reflection=False, primary_without_reflections=False, class_transfer_radius=0.,
-              output_density="reduced", geometry_planes=None, geometry_fill_tolerance=.02):
+              output_density="reduced", geometry_planes=None, geometry_fill_tolerance=.02,
+              station_ids=False, station_count=0):
     """Write an E57 atomically, retaining images and Nomivox extension fields."""
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -231,19 +246,27 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
     try:
         result = _write(temporary, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
                         progress, mirror, output_density, primary_without_reflections, class_transfer_radius,
-                        geometry_planes, geometry_fill_tolerance)
-        verify_e57(temporary, source, stores, result["record_count"], allowed_codes, primary_without_reflections, result.pop("_samples"))
+                        geometry_planes, geometry_fill_tolerance, station_ids, station_count)
+        started = time.perf_counter()
+        result["readback"] = verify_e57(temporary, source, stores, result["record_count"], allowed_codes,
+                                          primary_without_reflections, result.pop("_samples"))
+        result['timing_seconds']['readback'] += time.perf_counter()-started
         temporary.replace(path)
         result["path"] = str(path)
         result["extra_output"] = None
         if no_reflection:
             extra_result = _write(extra_temporary, source, stores, votes, origin, voxel_size, allowed_codes, skipped, checkpoint,
                                   progress, mirror, output_density, True, class_transfer_radius,
-                                  geometry_planes, geometry_fill_tolerance)
-            verify_e57(extra_temporary, source, stores, extra_result["record_count"], allowed_codes, True, extra_result.pop("_samples"))
+                                  geometry_planes, geometry_fill_tolerance, station_ids, station_count)
+            started = time.perf_counter()
+            verify_e57(extra_temporary, source, stores, extra_result["record_count"], allowed_codes, True,
+                       extra_result.pop("_samples"))
+            extra_result['timing_seconds']['readback'] += time.perf_counter()-started
             extra_temporary.replace(extra)
             result["extra_output"] = str(extra)
             result["extra_removed_count"] = extra_result["extra_removed_count"]
+            for key, value in extra_result['timing_seconds'].items():
+                result['timing_seconds'][key] = result['timing_seconds'].get(key, 0.)+value
         return result
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -282,4 +305,4 @@ def verify_e57(path, source, stores, expected_count, allowed_codes, without_refl
                 raise RuntimeError("E57 image count readback failed")
             if source_images and metadata(source_images) != metadata(images):
                 raise RuntimeError("E57 image blob or association readback failed")
-    return {"record_count": count, "all_classes_valid": True}
+    return {"record_count": count, "all_classes_valid": True, "max_coordinate_error_m": [0., 0., 0.]}

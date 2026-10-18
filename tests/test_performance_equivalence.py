@@ -3,15 +3,21 @@
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import laspy
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from e57cls.io.store import ScanStore
+from e57cls.geometry.cameras import Camera, Pose
 from e57cls.mirror.evidence import DirectIndex
+from e57cls.output.classify import ClassifiedSource
 from e57cls.output.las import ClassPointIndex, write_cloud
+from e57cls.pipeline.config import DEFAULTS
+from e57cls.pipeline import run as pipeline_run
 from e57cls.vote.engine import VoteStore, voxel_keys
 import e57cls.vote.engine as vote_engine
 
@@ -221,6 +227,168 @@ def test_write_cloud_transfer_reuses_exact_predictions_and_mirror_states(tmp_pat
     assert cloud.mirror_state.tolist() == [4, 4, 4]
 
 
+def test_tiled_transfer_matches_reference_for_large_negative_boundary_data(tmp_path):
+    """The tiled path retains the old nearest-neighbour result without ties."""
+    rng = np.random.default_rng(103)
+    sources = rng.uniform(-8, 8, (200_000, 3))
+    # Exercise both sides of root-tile edges, including negative coordinates.
+    queries = np.r_[sources[:4_000]+rng.uniform(-.015, .015, (4_000, 3)),
+                    np.column_stack((np.r_[-2.001, -2., -1.999, 1.999, 2., 2.001], np.zeros(6), np.zeros(6)))]
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    radius = .04
+    reference_tree = cKDTree(sources)
+    distances, ids = reference_tree.query(queries, distance_upper_bound=radius)
+    expected = np.zeros(len(queries), np.uint8)
+    found = np.isfinite(distances)
+    expected[found] = codes[ids[found]]
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    try:
+        index.add(sources, codes)
+        np.testing.assert_array_equal(index.nearest_codes(queries, radius), expected)
+    finally:
+        index.close()
+
+
+def test_tiled_transfer_matches_ckdtree_for_600k_sources_and_60k_queries(tmp_path):
+    """A larger exact reference guards the vectorized tile construction."""
+    rng = np.random.default_rng(20261018)
+    sources = rng.uniform(-20, 20, (600_000, 3))
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    queries = np.r_[sources[:30_000]+rng.uniform(-.008, .008, (30_000, 3)),
+                    rng.uniform(-20, 20, (30_000, 3))]
+    radius = .02
+    distances, ids = cKDTree(sources).query(queries, distance_upper_bound=radius)
+    expected = np.zeros(len(queries), np.uint8)
+    found = np.isfinite(distances)
+    expected[found] = codes[ids[found]]
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    try:
+        for start in range(0, len(sources), 500_000):
+            index.add(sources[start:start+500_000], codes[start:start+500_000])
+        np.testing.assert_array_equal(index.nearest_codes(queries, radius), expected)
+    finally:
+        index.close()
+
+
+def test_tiled_transfer_matches_ckdtree_with_lv95_coordinates(tmp_path):
+    """Absolute projected coordinates are packed relative to the first tile."""
+    rng = np.random.default_rng(20261019)
+    centre = np.array([2_600_000., 1_200_000., 480.])
+    sources = centre+rng.uniform(-20, 20, (20_000, 3))
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    queries = np.r_[sources[:4_000]+rng.uniform(-.008, .008, (4_000, 3)),
+                    centre+rng.uniform(-20, 20, (4_000, 3))]
+    radius = .02
+    distances, ids = cKDTree(sources).query(queries, distance_upper_bound=radius)
+    expected = np.zeros(len(queries), np.uint8)
+    expected[np.isfinite(distances)] = codes[ids[np.isfinite(distances)]]
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    try:
+        index.add(sources, codes)
+        np.testing.assert_array_equal(index.nearest_codes(queries, radius), expected)
+    finally:
+        index.close()
+
+
+def test_tiled_transfer_falls_back_for_groups_more_than_3000_km_apart(tmp_path):
+    """Far-apart tiles retain their exact int64 coordinates instead of failing."""
+    rng = np.random.default_rng(20261020)
+    first = rng.uniform(-10, 10, (500, 3))
+    second = first+np.array([3_000_000., 0., 0.])
+    sources = np.r_[first, second]
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    queries = np.r_[sources[:200]+rng.uniform(-.005, .005, (200, 3)),
+                    sources[-200:]+rng.uniform(-.005, .005, (200, 3))]
+    radius = .02
+    distances, ids = cKDTree(sources).query(queries, distance_upper_bound=radius)
+    expected = np.zeros(len(queries), np.uint8)
+    expected[np.isfinite(distances)] = codes[ids[np.isfinite(distances)]]
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    try:
+        index.add(sources, codes)
+        np.testing.assert_array_equal(index.nearest_codes(queries, radius), expected)
+    finally:
+        index.close()
+
+
+def test_classified_source_closes_partial_resources_after_prepare_error(tmp_path):
+    class BrokenStore:
+        meta = {'scan_index': 7, 'record_count': 10, 'valid_count': 10}
+
+        def chunks(self, capacity):
+            raise RuntimeError('synthetic preparation error')
+            yield
+
+    class Votes:
+        def lookup(self, keys):
+            return np.zeros(len(keys), np.uint8), np.zeros(len(keys), np.uint8)
+
+    with pytest.raises(RuntimeError, match='synthetic preparation error'):
+        with ClassifiedSource(tmp_path, [BrokenStore()], Votes(), np.zeros(3), .02,
+                              radius=.01):
+            pass
+    assert not list(tmp_path.glob('e57cls_class_neighbours_*'))
+
+
+def test_tiled_transfer_uses_lowest_source_ordinal_for_exact_ties(tmp_path):
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=.1)
+    try:
+        index.add(np.array([[-.02, 0, 0], [.02, 0, 0]]), np.array([9, 2], np.uint8),
+                  np.array([3, 8], np.int64))
+        assert index.nearest_codes(np.array([[0., 0, 0]]), .1).tolist() == [9]
+    finally:
+        index.close()
+
+
+def test_tiled_transfer_adaptively_subdivides_dense_root_tile(tmp_path):
+    points = np.array([[x, y, z] for x in (.2, .7, 1.2, 1.7) for y in (.2, .7) for z in (.2, .7)])
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=.02, max_tile_points=5)
+    try:
+        index.add(points, np.full(len(points), 7, np.uint8))
+        assert index.nearest_codes(points, .001).tolist() == [7]*len(points)
+        assert index._children
+    finally:
+        index.close()
+
+
+def test_output_prepare_events_and_timing_are_reported(tmp_path):
+    class Votes:
+        def lookup(self, keys):
+            return np.array([2, 1, 1], np.uint8), np.array([20, 0, 0], np.uint8)
+    events = []
+    result = write_cloud(tmp_path/'cloud.las', [_synthetic_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2],
+                         class_transfer_radius=.01, progress=lambda *event: events.append(event))
+    assert any(event[0] == 'output_prepare' for event in events)
+    assert set(result['timing_seconds']) == {'lookup_mirror', 'transfer', 'plane_fill', 'write', 'readback'}
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.environ.get('NOMIVOX_PERF_BENCHMARK'), reason='set NOMIVOX_PERF_BENCHMARK=1 to run benchmarks')
+def test_tiled_transfer_benchmark(tmp_path):
+    """Report the requested end-to-end tile-index timings on synthetic data."""
+    rng = np.random.default_rng(20261018)
+    sources = rng.uniform(0, 40, (3_000_000, 3))
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    queries = rng.uniform(0, 40, (125_000, 3))
+    radius = .01
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    try:
+        started = time.perf_counter()
+        for start in range(0, len(sources), 500_000):
+            index.add(sources[start:start+500_000], codes[start:start+500_000])
+        index._finalize()
+        add_seconds = time.perf_counter()-started
+        started = time.perf_counter()
+        result = index.nearest_codes(queries, radius)
+        query_seconds = time.perf_counter()-started
+        print(f'tiled transfer benchmark: add={add_seconds:.2f}s query={query_seconds:.2f}s')
+        assert result.shape == (len(queries),)
+        assert add_seconds <= 12
+    finally:
+        index.close()
+
+
+@pytest.mark.slow
 @pytest.mark.skipif(not os.environ.get('NOMIVOX_PERF_BENCHMARK'), reason='set NOMIVOX_PERF_BENCHMARK=1 to run benchmarks')
 def test_lookup_benchmark(tmp_path):
     votes = VoteStore(tmp_path/'benchmark.sqlite')
@@ -233,3 +401,171 @@ def test_lookup_benchmark(tmp_path):
         assert time.perf_counter()-start >= 0
     finally:
         votes.close()
+
+
+@dataclass(frozen=True)
+class _ProjectionView:
+    id: str
+    size: int = 16
+
+    def project(self, camera_points):
+        count = len(camera_points)
+        uv = np.column_stack(((np.arange(count) % self.size)+.5,
+                              ((np.arange(count)//self.size) % self.size)+.5))
+        return uv, np.ones(count), np.ones(count, bool)
+
+
+class _ProjectionDepthBuffer:
+    width = 32
+    height = 16
+
+    @staticmethod
+    def visible(uv, depth, valid, absolute, relative):
+        return valid.copy()
+
+
+class _ProjectionControl:
+    def __init__(self):
+        self.events = []
+
+    @staticmethod
+    def checkpoint():
+        return None
+
+    def event(self, kind, **payload):
+        self.events.append((kind, payload))
+
+
+class _ProjectionMirrors:
+    @staticmethod
+    def states(world, *args):
+        states = np.zeros(len(world), np.uint8)
+        states[::5] = 2
+        return states
+
+
+def _old_image_vote_reference(reps, camera, camera_pose, depth_buffer, views, labels, confidence,
+                              classes, config, mirror_states):
+    """Former per-view projection path, retained as an independent oracle."""
+    weights = np.zeros((len(reps), len(classes)), np.float32)
+    target_indices = {index for index, item in enumerate(classes) if item['id'] in config['depth_gate_classes']}
+    for view in views:
+        blocked = np.zeros(len(reps), bool)
+        gate_ids, gate_pixels, gate_ranges, gate_world, gate_labels = [], [], [], [], []
+        for start in range(0, len(reps), 50_000):
+            world = reps['xyz'][start:start+50_000]
+            camera_points = camera_pose.from_world(world)
+            camera_uv, camera_range, camera_valid = camera.project(camera_points)
+            visible = depth_buffer.visible(camera_uv*np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height]),
+                                           camera_range, camera_valid, config['visibility_abs'], config['visibility_rel'])
+            visible &= mirror_states[start:start+50_000] != 2
+            uv, _, projected = view.project(camera_points)
+            ids = np.flatnonzero(visible & projected)
+            pixels = np.floor(uv[ids]*np.array(labels.shape[::-1])/view.size).astype(int)
+            pixels[:, 0] = pixels[:, 0].clip(0, labels.shape[1]-1)
+            pixels[:, 1] = pixels[:, 1].clip(0, labels.shape[0]-1)
+            chosen = labels[pixels[:, 1], pixels[:, 0]]
+            take = np.isin(chosen, list(target_indices))
+            if take.any():
+                gate_ids.append(start+ids[take]); gate_pixels.append(pixels[take]); gate_ranges.append(camera_range[ids[take]])
+                gate_world.append(world[ids[take]]); gate_labels.append(chosen[take])
+        if gate_ids:
+            local, _ = pipeline_run.depth_gate_representatives(
+                labels, np.concatenate(gate_pixels), np.concatenate(gate_ranges), np.concatenate(gate_world),
+                np.concatenate(gate_labels), classes, config)
+            blocked[np.concatenate(gate_ids)[local]] = True
+        for start in range(0, len(reps), 50_000):
+            world = reps['xyz'][start:start+50_000]
+            camera_points = camera_pose.from_world(world)
+            camera_uv, camera_range, camera_valid = camera.project(camera_points)
+            visible = depth_buffer.visible(camera_uv*np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height]),
+                                           camera_range, camera_valid, config['visibility_abs'], config['visibility_rel'])
+            visible &= mirror_states[start:start+50_000] != 2
+            uv, _, projected = view.project(camera_points)
+            ids = np.flatnonzero(visible & projected)
+            pixels = np.floor(uv[ids]*np.array(labels.shape[::-1])/view.size).astype(int)
+            pixels[:, 0] = pixels[:, 0].clip(0, labels.shape[1]-1)
+            pixels[:, 1] = pixels[:, 1].clip(0, labels.shape[0]-1)
+            chosen = labels[pixels[:, 1], pixels[:, 0]]
+            accepted = (chosen >= 0) & ~blocked[start+ids]
+            weights[start+ids[accepted], chosen[accepted]] = np.maximum(
+                weights[start+ids[accepted], chosen[accepted]], confidence[pixels[accepted, 1], pixels[accepted, 0]])
+    return weights
+
+
+def test_classify_scan_projection_cache_matches_old_path_with_door_and_mirrors(tmp_path, monkeypatch):
+    count = 24
+    dtype = np.dtype([('key', 'V24'), ('xyz', '<f8', 3)])
+    reps = np.zeros(count, dtype=dtype)
+    reps['key'] = np.arange(count, dtype='<i8').view('V8').repeat(3).view('V24')
+    camera = Camera('sphericalRepresentation', {'imageWidth': 32, 'imageHeight': 16,
+                    'pixelWidth': 2*np.pi/32, 'pixelHeight': np.pi/16})
+    grid = np.array([(x+.5, y+.5) for y in range(4, 8) for x in range(6)], float)
+    reps['xyz'] = 3*camera.rays(grid)
+    scan_dir = tmp_path/'scan_0001'; scan_dir.mkdir()
+    rep_path = scan_dir/'representatives.npy'; np.save(rep_path, reps)
+    pose = {'rotation': {'w': 1., 'x': 0., 'y': 0., 'z': 0.},
+            'translation': {'x': 0., 'y': 0., 'z': 0.}}
+    store = SimpleNamespace(meta={'scan_index': 1, 'metadata': {'pose': pose}})
+    inspection = {'scan_count': 1, 'image_count': 1, 'scans': [{'image_indices': [1]}],
+                  'images': [{'index': 1, 'pose_status': 'valid', 'representations': ['sphericalRepresentation'],
+                              'metadata': {'pose': pose}}]}
+    classes = [{'id': 'door', 'prompts': ('door',), 'min_mask_conf': .5}]
+    config = {**DEFAULTS, 'voxel_origin': [0., 0., 0.], 'voxel_size': .02, 'depth_width': 32,
+              'diagnostics': 'off', 'output': str(tmp_path), 'boundary_margin': 0,
+              'depth_gate_classes': ['door'], 'door_max_width': 100., 'door_max_height': 100.}
+    views = [_ProjectionView('first'), _ProjectionView('second')]
+    labels = np.zeros((16, 16), np.int16)
+    confidence = np.full((16, 16), .9, np.float32)
+    depth_buffer = _ProjectionDepthBuffer()
+    control = _ProjectionControl()
+    monkeypatch.setattr(pipeline_run, 'representatives', lambda *args: (rep_path, count))
+    monkeypatch.setattr(pipeline_run, 'image_assets', lambda *args: (camera, np.zeros((16, 16, 3), np.uint8), None, 'image', None))
+    monkeypatch.setattr(pipeline_run, 'camera_depth', lambda *args: depth_buffer)
+    monkeypatch.setattr(pipeline_run, 'plan_views', lambda *args: views)
+    monkeypatch.setattr(pipeline_run, 'render_view', lambda *args: (np.zeros((16, 16, 3), np.uint8), np.ones((16, 16), bool)))
+    monkeypatch.setattr(pipeline_run, 'segment_view', lambda *args, **kwargs: ([confidence], {'hits': 1, 'misses': 0}))
+    monkeypatch.setattr(pipeline_run.psutil, 'virtual_memory', lambda: SimpleNamespace(available=1))
+    _, weights_path, stats = pipeline_run.classify_scan(None, store, inspection, config, tmp_path, None, None,
+                                                        'model', None, control, classes, classes, 'identity', _ProjectionMirrors())
+    actual = np.load(weights_path, allow_pickle=False)
+    states = _ProjectionMirrors.states(reps['xyz'])
+    expected = _old_image_vote_reference(reps, camera, Pose.from_dict(pose), depth_buffer, views, labels, confidence,
+                                         classes, config, states)
+    np.testing.assert_array_equal(actual, expected)
+    assert stats['depth_gate']['components'] == len(views)
+    assert all(not path.exists() for path in scan_dir.glob('projection_*.npy'))
+    assert len([event for event in control.events if event[0] == 'progress']) == len(views)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.environ.get('NOMIVOX_PERF_BENCHMARK'), reason='set NOMIVOX_PERF_BENCHMARK=1 to run benchmarks')
+def test_image_projection_cache_benchmark():
+    """Report CPU time for the former and shared-projection paths at production scale."""
+    count = 200_000
+    rng = np.random.default_rng(20261020)
+    points = rng.normal(size=(count, 3))
+    camera = Camera('sphericalRepresentation', {'imageWidth': 4096, 'imageHeight': 2048,
+                    'pixelWidth': 2*np.pi/4096, 'pixelHeight': np.pi/2048})
+    views = pipeline_run.plan_views(camera, 'balanced', 1512, 95)
+    assert len(views) == 17
+    pose = Pose(np.eye(3), np.zeros(3))
+    depth = _ProjectionDepthBuffer()
+    valid = np.ones(count, bool)
+    started = time.process_time()
+    for view in views:
+        camera_points = pose.from_world(points)
+        uv, ranges, projected = camera.project(camera_points)
+        visible = depth.visible(uv*np.array([depth.width/camera.width, depth.height/camera.height]), ranges, projected, .03, .01)
+        view.project(camera_points)
+        assert visible.shape == valid.shape
+    old_seconds = time.process_time()-started
+    started = time.process_time()
+    camera_points = pose.from_world(points)
+    uv, ranges, projected = camera.project(camera_points)
+    visible = depth.visible(uv*np.array([depth.width/camera.width, depth.height/camera.height]), ranges, projected, .03, .01)
+    for view in views:
+        view.project(camera_points)
+    shared_seconds = time.process_time()-started
+    print(f'image projection benchmark (17 views, 200000 representatives): old={old_seconds:.2f}s shared={shared_seconds:.2f}s')
+    assert visible.shape == valid.shape

@@ -135,6 +135,25 @@ def test_preview_uses_cached_report_without_process(tmp_path, qt_application):
         QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 
+def test_input_mode_is_shown_from_preview_report(tmp_path, qt_application):
+    report = dict(scan_count=1, image_count=6, record_count=11, images=[], metadata={}, scans=[],
+                  input_mode=dict(mode='slam', requested='auto', mixed=True, warnings=['mixed'],
+                                  rules=[dict(id='a', hit=True, detail='6 Bilder mit gültiger Pose für 1 Datenblock')]))
+    path = tmp_path/'inspect_report.json'
+    path.write_text(json.dumps(report), encoding='utf-8')
+    window = MainWindow(tmp_path/'input.e57', auto_start=False)
+    window.config = {'output': str(tmp_path)}
+    try:
+        assert window.read_inspection(path)
+        assert 'Kinematisch (SLAM)' in window.input_mode_status.text()
+        assert '6 Bilder' in window.input_mode_status.text()
+        assert 'Gemischte Hinweise' in window.input_mode_status.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
 def test_new_source_cancels_running_preview_and_uses_new_result(tmp_path, qt_application, monkeypatch):
     first = tmp_path/'first.e57'
     second = tmp_path/'second.e57'

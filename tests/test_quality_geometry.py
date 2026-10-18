@@ -157,6 +157,29 @@ def test_geometry_fill_keeps_gap_between_coplanar_pieces(tmp_path):
         votes.close()
 
 
+def test_plane_grid_matches_brute_force_plane_selection(tmp_path):
+    ceiling = _grid((0, 0, 2), 0, 1)
+    wall = _grid((3, 0, 0), 1, 2)
+    votes = _multi_class_votes(tmp_path/'grid.sqlite', [(101, ceiling), (100, wall)])
+    try:
+        config = {**DEFAULTS, 'geometry_fill_classes': ['ceiling', 'wall'], 'geometry_fill_min_area': .1,
+                  'geometry_fill_max_gap': .1, 'geometry_fill_tolerance': .03, 'geometry_fill_max_planes': 10}
+        target = tmp_path/'grid.npz'
+        extract_planes(votes, {'wall': 100, 'ceiling': 101}, np.zeros(3), .02, config, target)
+        planes = PlaneIndex(target)
+        try:
+            points = np.array([[.2, .2, 2.], [.7, .4, 2.], [3., .3, .3], [6., 6., 6.]])
+            fast = planes.fill(points, .03)
+            cells = np.unique(np.floor(points/planes.grid_size).astype(np.int64), axis=0)
+            planes.grid = {tuple(map(int, cell)): list(range(len(planes.planes))) for cell in cells}
+            brute_force = planes.fill(points, .03)
+            np.testing.assert_array_equal(fast, brute_force)
+        finally:
+            planes.close()
+    finally:
+        votes.close()
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not os.environ.get('NOMIVOX_RUN_SLOW'), reason='set NOMIVOX_RUN_SLOW=1 to run the million-voxel benchmark')
 def test_geometry_fill_million_voxel_runtime(tmp_path):

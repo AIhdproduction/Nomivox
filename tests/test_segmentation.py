@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from e57cls.seg.backend import PromptClass
-from e57cls.seg.cache import MaskCache, SCORE_FLOOR, segment_view
+from e57cls.seg.cache import MaskCache, MissingMaskCache, SCORE_FLOOR, segment_view
 from e57cls.mirror.pipeline import agreed_probability
 from e57cls.pipeline.config import resolve_config
 from e57cls.pipeline.run import evidence_map
@@ -36,6 +36,16 @@ def test_cache_prompt_granularity_raw_confidence_and_vote_independence(tmp_path)
     classes[1] = PromptClass("floor", ("wood floor",))
     _, stats = segment_view(*args, scale=1., tile_size=16)
     assert stats == {"hits": 1, "misses": 1}
+
+
+def test_cache_only_segmentation_never_recomputes_missing_masks(tmp_path):
+    image = np.zeros((10, 10, 3), np.uint8)
+    valid = np.ones((10, 10), bool)
+    cache = MaskCache(tmp_path)
+    with pytest.raises(MissingMaskCache):
+        segment_view(image, valid, [PromptClass('wall', ('wall',))],
+                     lambda: pytest.fail('cache-only access must not create a backend'), cache,
+                     'imagehash', {'yaw': 0}, 'modelhash', scale=1., tile_size=16, cache_only=True)
 
 
 def test_score_floor_is_neutral_for_decisions_and_validation(tmp_path):

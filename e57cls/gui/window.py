@@ -193,6 +193,8 @@ class MainWindow(QMainWindow):
     def clear_inspection(self):
         self.scan_table.setRowCount(0)
         self.metadata.clear()
+        if hasattr(self, 'input_mode_status'):
+            self.input_mode_status.clear()
 
     def preview_cache(self):
         return Path(self.cache_path.text()).expanduser().resolve()/'preview'
@@ -333,6 +335,12 @@ class MainWindow(QMainWindow):
         self.processing_mode.addItem(tr('mode_classify_and_filter'),'classify_and_filter')
         self.processing_mode.addItem(tr('mode_filter_only'),'filter_only')
         mode_form.addRow(tr('processing_mode'),self.processing_mode)
+        self.input_mode = QComboBox()
+        self.input_mode.addItem(tr('input_mode_auto'), 'auto')
+        self.input_mode.addItem(tr('input_mode_static'), 'static')
+        self.input_mode.addItem(tr('input_mode_slam'), 'slam')
+        self.input_mode.setCurrentIndex(self.input_mode.findData(DEFAULTS['input_mode']))
+        mode_form.addRow(tr('input_mode'), self.input_mode)
         self.mode_hint = QLabel(tr('mode_classify_and_filter_hint'))
         self.mode_hint.setWordWrap(True)
         self.mode_hint.setProperty('class','hint')
@@ -363,6 +371,10 @@ class MainWindow(QMainWindow):
         frame,card = self.card('card_overview')
         self.summary = QLabel(tr('summary_no_source'))
         card.addWidget(self.summary)
+        self.input_mode_status = QLabel()
+        self.input_mode_status.setWordWrap(True)
+        self.input_mode_status.setProperty('class','hint')
+        card.addWidget(self.input_mode_status)
         self.preview_progress = QProgressBar()
         self.preview_progress.setTextVisible(False)
         self.preview_progress.hide()
@@ -639,6 +651,7 @@ class MainWindow(QMainWindow):
         self.preset = json.loads(Path(self.config['preset']).read_text(encoding='utf-8'))
         processing_mode = self.config.get('processing_mode','classify_and_filter')
         self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))
+        self.input_mode.setCurrentIndex(max(0,self.input_mode.findData(self.config.get('input_mode',DEFAULTS['input_mode']))))
         self.load_table()
         for key,widget in self.controls.items():
             widget.setValue(self.config.get(key,DEFAULTS[key]))
@@ -864,7 +877,7 @@ class MainWindow(QMainWindow):
             self.stop_preview()
             settings = {key:widget.value() for key,widget in self.controls.items()}
             settings['prompt_batch'] = self.prompt_batch.currentData()
-            settings.update(source=str(self.source),processing_mode=self.processing_mode.currentData(),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
+            settings.update(source=str(self.source),processing_mode=self.processing_mode.currentData(),input_mode=self.input_mode.currentData(),scene_mode=self.scene_mode.currentData(),profile=self.profile.currentData(),
                 mirror_analysis=self.mirror.isChecked(),glass_analysis=self.glass.isChecked(),
                 stairs_priority=self.stairs_priority.isChecked(),stairs_geometry_check=self.stairs_geometry_check.isChecked(),component_cleanup=self.component_cleanup.isChecked(),
                 surface_tie_break=self.surface_tie_break.isChecked(),geometry_fill=self.geometry_fill.isChecked(),
@@ -916,12 +929,20 @@ class MainWindow(QMainWindow):
     def reset_estimator(self):
         cache = Path(self.config['cache'])
         self.timing_profile_path = cache/'timing_profile.json'
+        parallel_shared = (self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter'
+                           and bool(self.config.get('mirror_analysis',False))
+                           and bool(self.config.get('pipeline_parallel',DEFAULTS['pipeline_parallel'])))
         applies = {
-            'mirror_masks': bool(self.config.get('mirror_analysis',False)),
+            # In the parallel pipeline SAM and local mirror fitting overlap the
+            # scan-paced CPU work.  Counting them separately would double-count
+            # the ETA, so segmentation measures the combined cadence instead.
+            'sam': (not parallel_shared and self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter'
+                    and bool(self.config.get('mirror_analysis',False))),
+            'mirror_masks': bool(self.config.get('mirror_analysis',False)) and not parallel_shared,
             'mirror_evidence': bool(self.config.get('mirror_analysis',False)),
             'segmentation': self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
         }
-        self.estimator = RunEstimator(applies=applies,profile=load_profile(self.timing_profile_path))
+        self.estimator = RunEstimator(applies=applies,profile=load_profile(self.timing_profile_path),parallel=parallel_shared)
         self.apply_inspection_counts()
 
     def command(self,command):
@@ -957,6 +978,7 @@ class MainWindow(QMainWindow):
                 self.preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
                 processing_mode = config.get('processing_mode','classify_and_filter')
                 self.processing_mode.setCurrentIndex(max(0,self.processing_mode.findData(processing_mode)))
+                self.input_mode.setCurrentIndex(max(0,self.input_mode.findData(config.get('input_mode',DEFAULTS['input_mode']))))
                 self.load_table()
                 self.launch_worker()
             except Exception as error:
@@ -997,7 +1019,7 @@ class MainWindow(QMainWindow):
             self.estimator.phase_started(started_phase,timestamp)
             # Only pipeline root phases have a meaningful duration.  Scene
             # detection is performed once per scan inside segmentation.
-            if started_phase in ('inspection','mirror','segmentation','voting','output'):
+            if started_phase in ('inspection','sam','mirror','segmentation','voting','output'):
                 self.estimate_phase = started_phase
                 self.estimate_fraction = 0.
                 self.phase_fraction = 0.
@@ -1011,12 +1033,24 @@ class MainWindow(QMainWindow):
             self.phase_fraction = fraction
             self.phase_progress.setValue(round(fraction*1000))
             phase = event.get('phase')
-            estimate_phase = 'mirror' if phase in ('mirror_masks','mirror_evidence') else phase
-            if estimate_phase in ('inspection','mirror','segmentation','voting','output'):
+            estimate_phase = 'mirror' if phase in ('mirror_masks','mirror_evidence') else ('output' if phase == 'output_prepare' else phase)
+            if estimate_phase in ('inspection','sam','mirror','segmentation','voting','output'):
                 self.estimate_phase = estimate_phase
-                self.estimate_fraction = fraction
-            overall = (.3+.6*fraction if phase == 'segmentation' else .9+.1*fraction if phase == 'output'
-                       else .03+.27*fraction if phase in ('mirror_masks','mirror_evidence') else .03*fraction)
+                self.estimate_fraction = (.1*fraction if phase == 'output_prepare' else (.1+.9*fraction if phase == 'output' else fraction))
+            output_fraction = .1*fraction if phase == 'output_prepare' else .1+.9*fraction if phase == 'output' else 0.
+            current_config = self.config or {}
+            shared_sam = (current_config.get('processing_mode','classify_and_filter') == 'classify_and_filter'
+                           and bool(current_config.get('mirror_analysis',False)))
+            parallel_shared = shared_sam and bool(current_config.get('pipeline_parallel',DEFAULTS['pipeline_parallel']))
+            if parallel_shared and phase in ('sam','mirror_masks','segmentation'):
+                self.phase_key = 'parallel'
+                self.phase.setText(STRINGS.get('phase_parallel',tr('state_running')))
+            overall = (.1+.7*fraction if phase == 'segmentation' and parallel_shared
+                       else .1+.35*fraction if phase in ('sam','mirror_masks') and parallel_shared
+                       else .3*fraction if phase == 'sam' else .5+.4*fraction if phase == 'segmentation' and shared_sam
+                        else .3+.2*fraction if phase in ('mirror_masks','mirror_evidence') and shared_sam
+                        else .3+.6*fraction if phase == 'segmentation' else .9+.1*output_fraction if phase in ('output_prepare','output')
+                        else .03+.27*fraction if phase in ('mirror_masks','mirror_evidence') else .03*fraction)
             self.current_fraction = max(self.current_fraction,overall)
             self.overall.setValue(round(self.current_fraction*1000))
             self.details.setText(tr('progress_detail',scan=event.get('scan','–'),scans=event.get('scan_count','–'),
@@ -1034,6 +1068,11 @@ class MainWindow(QMainWindow):
             self.phase.setText(STRINGS.get('state_'+event['state'],tr('state_running')))
             self.resume_button.setEnabled(event['state'] == 'paused')
             self.pause_button.setEnabled(event['state'] == 'running')
+        elif kind == 'input_mode':
+            report = getattr(self, 'inspection_report', None)
+            if report is not None:
+                report['input_mode'] = {key: event[key] for key in ('mode', 'requested', 'rules', 'mixed', 'warnings') if key in event}
+            self.show_input_mode(event)
         elif kind == 'warning':
             self.log.appendPlainText(STRINGS.get(event.get('code'),tr('technical_warning')))
         elif kind == 'cache_cleanup':
@@ -1087,11 +1126,28 @@ class MainWindow(QMainWindow):
             self.scan_table.resizeColumnsToContents()
             self.metadata.setPlainText(json.dumps(report['metadata'],ensure_ascii=False,indent=2)[:30000])
             self.inspection_report = report
+            self.show_input_mode(report.get('input_mode'))
             self.apply_inspection_counts()
             return True
         except Exception as error:
             self.log.appendPlainText(str(error))
             return False
+
+    def show_input_mode(self, value):
+        if not value or not hasattr(self, 'input_mode_status'):
+            return
+        mode = value.get('mode', 'static')
+        title = tr('input_mode_slam_detected') if mode == 'slam' else tr('input_mode_static_detected')
+        reasons = [rule.get('detail', '') for rule in value.get('rules', []) if rule.get('hit')]
+        if not reasons:
+            reasons = [tr('input_mode_no_slam_evidence')]
+        text = title+'\n'+tr('input_mode_reasons', reasons='; '.join(reasons))
+        if value.get('mixed'):
+            text += '\n'+tr('input_mode_mixed')
+        self.input_mode_status.setText(text)
+        self.input_mode_status.setProperty('status', 'warning' if mode == 'slam' or value.get('mixed') else 'success')
+        self.input_mode_status.style().unpolish(self.input_mode_status)
+        self.input_mode_status.style().polish(self.input_mode_status)
 
     def apply_inspection_counts(self):
         report = getattr(self,'inspection_report',None)
@@ -1099,8 +1155,10 @@ class MainWindow(QMainWindow):
             return
         self.estimator.set_unit_count('mirror_masks',sum(bool(scan['image_indices']) for scan in report['scans']))
         self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
+        self.estimator.set_unit_count('sam',report['scan_count'])
         self.estimator.set_unit_count('segmentation',sum(bool(scan['classification_eligible_metadata']) for scan in report['scans']))
         self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
+        self.estimator.set_unit_indices('sam',range(1,report['scan_count']+1))
         self.estimator.set_unit_indices('segmentation',[index for index,scan in enumerate(report['scans'],1)
                                                         if scan['classification_eligible_metadata']])
 

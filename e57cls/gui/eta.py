@@ -13,8 +13,9 @@ from pathlib import Path
 from e57cls.files import atomic_json
 
 
-STAGES = ("mirror_masks", "mirror_evidence", "segmentation")
+STAGES = ("sam", "mirror_masks", "mirror_evidence", "segmentation")
 DEFAULT_PROFILE = {
+    "sam": {"avg_seconds": 275.0, "max_seconds": 472.0},
     "mirror_masks": {"avg_seconds": 40.0, "max_seconds": 70.0},
     "mirror_evidence": {"avg_seconds": 103.0, "max_seconds": 511.0},
     "segmentation": {"avg_seconds": 275.0, "max_seconds": 472.0},
@@ -54,10 +55,11 @@ class RunEstimator:
     Paused intervals are removed when matching ``state`` events are supplied.
     Without those events, elapsed time is necessarily treated as active time.
     """
-    def __init__(self, applies=None, unit_counts=None, profile=None):
+    def __init__(self, applies=None, unit_counts=None, profile=None, parallel=False):
         applies = applies or {}
         unit_counts = unit_counts or {}
         self.applies = {stage: bool(applies.get(stage, False)) for stage in STAGES}
+        self.parallel = bool(parallel)
         self.unit_counts = {stage: unit_counts.get(stage) for stage in STAGES}
         self.unit_indices = {stage: None for stage in STAGES}
         self.prior_profile = deepcopy(DEFAULT_PROFILE)
@@ -80,7 +82,9 @@ class RunEstimator:
 
     @property
     def counts_known(self):
-        return all(not self.applies[stage] or isinstance(self.unit_counts[stage], int)
+        # ``sam`` is introduced only by the shared pipeline.  Older callers
+        # can keep their persisted timing profile without supplying its count.
+        return all(not self.applies[stage] or stage == 'sam' or isinstance(self.unit_counts[stage], int)
                    and self.unit_counts[stage] >= 0 for stage in STAGES)
 
     def set_unit_count(self, stage, count):
@@ -118,7 +122,9 @@ class RunEstimator:
     def phase_started(self, phase, timestamp):
         now = self._active_time(timestamp)
         self.phase_started_at[phase] = now
-        if phase == "mirror":
+        if phase == "sam":
+            self._start_stage("sam", now)
+        elif phase == "mirror":
             self._start_stage("mirror_masks", now)
         elif phase == "segmentation":
             self._start_stage("segmentation", now)
@@ -129,7 +135,9 @@ class RunEstimator:
 
     def phase_finished(self, phase, timestamp):
         now = self._active_time(timestamp)
-        if phase == "mirror":
+        if phase == "sam":
+            self._finish_stage("sam", now)
+        elif phase == "mirror":
             self._finish_stage("mirror_masks", now)
             self._finish_stage("mirror_evidence", now)
         elif phase == "segmentation":
@@ -137,11 +145,18 @@ class RunEstimator:
 
     def progress(self, phase, timestamp, **event):
         now = self._active_time(timestamp)
+        if phase == 'output_prepare':
+            phase = 'output'
+            event = {**event, 'fraction': .1*float(event.get('fraction', 0.0))}
         if phase in ("voting", "output"):
             self.phase_fraction[phase] = max(0.0, min(1.0, float(event.get("fraction", 0.0))))
             return
         if phase not in STAGES:
             return
+        if phase == "sam" and isinstance(event.get("scan_count"), int):
+            self.set_unit_count(phase, event["scan_count"])
+            if self.unit_indices[phase] is None:
+                self.set_unit_indices(phase, range(1, event["scan_count"]+1))
         if phase == "mirror_masks" and isinstance(event.get("image_count"), int):
             self.set_unit_count(phase, event["image_count"])
         if phase == "mirror_evidence" and isinstance(event.get("scan_count"), int):
@@ -248,7 +263,7 @@ class RunEstimator:
         stage_estimate = stage_maximum = 0.0
         total_estimate = total_maximum = 0.0
         for stage in STAGES:
-            if not self.applies[stage]:
+            if not self.applies[stage] or self.unit_counts[stage] is None:
                 continue
             average, maximum = self.per_unit(stage)
             estimate = self._stage_remaining(stage, now, average)

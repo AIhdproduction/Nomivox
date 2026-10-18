@@ -1,16 +1,19 @@
 """E57 -> panorama views -> SAM -> independent scan votes -> original LAS."""
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 import json
 import logging
 import os
 from pathlib import Path
+import queue
 import shutil
+import threading
 import time
 
 import numpy as np
+import psutil
 from scipy.ndimage import label, maximum_filter, minimum_filter
 
 from e57cls.files import atomic_json, atomic_text, file_hash
@@ -19,6 +22,7 @@ from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
 from e57cls.io.inspector import inspect_file, markdown
+from e57cls.io.input_mode import detect_input_mode, pseudo_setup_points_check
 from e57cls.io.reader import E57Reader
 from e57cls.io.store import build_store, load_scan, reduced_store
 from e57cls.output.las import write_cloud
@@ -29,12 +33,26 @@ from e57cls.output.diagnostics import save_overlay
 from e57cls.pipeline.control import Cancelled, Control
 from e57cls.seg.backend import PromptClass, SAM3Backend
 from e57cls.seg.cache import MaskCache, identity_hash, segment_view
-from e57cls.vote.engine import VoteStore, representatives
+from e57cls.vote.engine import VoteStore, representatives, voxel_keys
+from e57cls.slam.cameras import build_camera_list, iter_camera_views
+from e57cls.slam.cache import VisibilityCache
+from e57cls.slam.index import build_spatial_index, unpack_point_id
+from e57cls.slam.stations import cluster_stations
 from e57cls.scene.presets import validate_preset
 from e57cls.scene.detect import detect
-from e57cls.mirror.pipeline import build as build_mirrors
+from e57cls.mirror.pipeline import (MirrorAnalysis, build as build_mirrors, finalize_states,
+                                    fit_scan_surfaces, reflection_prompt_classes)
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SamProducerMessage:
+    """One complete message from the shared-SAM producer to its consumer."""
+
+    kind: str
+    scan: int | None = None
+    payload: object = None
 
 
 def cleanup_run_cache(cache: Path, source_hash: str, identity: str, mask_cache: MaskCache, mode: str) -> dict:
@@ -43,9 +61,10 @@ def cleanup_run_cache(cache: Path, source_hash: str, identity: str, mask_cache: 
     if mode == "keep_all":
         return result
     cache = cache.resolve()
-    targets = [cache/"scan_store"/source_hash, cache/"votes"/identity, cache/"geometry"/source_hash]
+    targets = [cache/"scan_store"/source_hash, cache/"votes"/identity, cache/"geometry"/source_hash,
+               cache/"slam_visibility"/source_hash, cache/"slam_index"/source_hash]
     if mode == "all":
-        targets.extend(mask_cache.used_paths)
+        targets.extend(mask_cache.used_paths_snapshot())
     failures = []
     for target in targets:
         try:
@@ -103,6 +122,99 @@ def select_classes(preset, mode, building_enclosure=False):
         selected.extend(c for c in preset['classes'] if c.get('enabled', True)
                         and c['id'] in {'ground', 'floor', 'building', 'wall'} and c['id'] not in selected_ids)
     return selected
+
+
+def prompt_classes(classes, config):
+    return [PromptClass(c['id'], tuple(c['prompts']),
+                        c.get('min_instance_conf') if c.get('min_instance_conf') is not None
+                        else config['instance_confidence'])
+            for c in classes]
+
+
+def prepare_shared_sam(reader, stores, inspection, config, work, image_cache, mask_cache,
+                       model_hash, factory, control, preset, assets, depth_builder,
+                       progress_stores=None, image_numbers=None, total_images=None):
+    """Populate one shared SAM cache pass for semantic and reflection prompts.
+
+    The small JSON files make scene selection durable at the same boundary as
+    the masks.  A resumed run deliberately visits all views again: cache hits
+    are cheap while a missing entry from an interrupted pass is regenerated.
+    """
+    records = {}
+    _, _, mirror_phrases = reflection_prompt_classes(config, preset)
+    images = [(store, item) for store in stores
+              for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
+              for item in [inspection['images'][index-1]]
+              if item['pose_status'] == 'valid'
+              and any(r != 'visualReferenceRepresentation' for r in item['representations'])]
+    image_count = total_images if total_images is not None else len(images)
+    image_numbers = image_numbers or {item['index']: number for number, (_, item) in enumerate(images, 1)}
+    progress_stores = progress_stores or stores
+    for store in stores:
+        control.checkpoint()
+        scan = store.meta['scan_index']
+        path = work/f'scene_{scan:04d}.json'
+        mode = config['scene_overrides'].get(str(scan), config['scene_mode'])
+        record = {'scan': scan, 'mode': mode, 'status': 'failed', 'failed_images': {}}
+        try:
+            scene = {'scene': mode, 'manual': True}
+            if mode == 'both':
+                control.event('phase_started', phase='scene', scan=scan)
+                try:
+                    scene = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
+                                   factory, control, preset, assets, depth_builder)
+                finally:
+                    control.event('phase_finished', phase='scene', scan=scan)
+                mode = scene['scene']
+                control.event('scene', scan=scan, **scene)
+            classes = select_classes(preset, mode, config['building_enclosure'])
+            if not classes:
+                raise ValueError('No enabled classes for this scene')
+            record.update(mode=mode, scene=scene, class_ids=[item['id'] for item in classes])
+            prompts = prompt_classes(classes, config)+mirror_phrases
+            scan_images = [item for candidate, item in images if candidate is store]
+            for item in scan_images:
+                image = mask = None
+                try:
+                    camera, image, mask, image_hash, mask_hash = assets(reader, item, image_cache)
+                    views = plan_views(camera, config['profile'], config['view_size'], config['view_fov']) or [None]
+                    for view_index, view in enumerate(views):
+                        control.checkpoint()
+                        rendered, valid = (render_view(image, mask, camera, view) if view else
+                                           (image, mask > 0 if mask is not None else np.ones(image.shape[:2], bool)))
+                        view_info = asdict(view) if view else {'kind': camera.kind, 'params': camera.params}
+                        view_info.update(mask_sha256=mask_hash, torch_version=version('torch'))
+                        cached_scores, cached = segment_view(
+                            rendered, valid, prompts, factory, mask_cache, image_hash, view_info, model_hash,
+                            config['image_scale'], config['tile_size'], config['tile_overlap'], control.checkpoint)
+                        del cached_scores
+                        number = image_numbers[item['index']]
+                        control.event('progress', phase='sam', scan=scan, scan_count=len(progress_stores),
+                                      image=item['index'], image_number=number, image_count=image_count,
+                                      view=view_index+1, view_count=len(views),
+                                      fraction=(number-1+(view_index+1)/len(views))/max(1, image_count), cache=cached)
+                except Cancelled:
+                    raise
+                except Exception as error:
+                    if config['strict']:
+                        raise
+                    record['failed_images'][str(item['index'])] = str(error)
+                    break
+                finally:
+                    del image, mask
+            if record['failed_images']:
+                record['error'] = next(iter(record['failed_images'].values()))
+            else:
+                record['status'] = 'complete'
+        except Cancelled:
+            raise
+        except Exception as error:
+            if config['strict']:
+                raise
+            record['error'] = str(error)
+        atomic_json(path, record)
+        records[scan] = record
+    return records
 
 
 def image_assets(reader, item, cache):
@@ -200,6 +312,67 @@ def depth_gate_representatives(labels, pixels, camera_range, world, chosen, clas
     return blocked, report
 
 
+class ImageProjectionCache:
+    """Camera-space data shared by every planned view of one source image."""
+
+    _names = ("camera_points", "camera_uv", "camera_range", "camera_valid", "visible")
+
+    def __init__(self, directory, image_index, count):
+        # The five arrays use 50 bytes per representative. Keep a generous
+        # margin for segmentation, depth buffers and the representative mmap.
+        required = count*(3*np.dtype(np.float64).itemsize + 2*np.dtype(np.float64).itemsize
+                          + np.dtype(np.float64).itemsize + 2*np.dtype(np.bool_).itemsize)
+        self.paths = []
+        self.memmap = count > 2_000_000 or required > psutil.virtual_memory().available//4
+        specifications = {
+            "camera_points": (np.float64, (count, 3)),
+            "camera_uv": (np.float64, (count, 2)),
+            "camera_range": (np.float64, (count,)),
+            "camera_valid": (np.bool_, (count,)),
+            "visible": (np.bool_, (count,)),
+        }
+        self.arrays = {}
+        for name, (dtype, shape) in specifications.items():
+            if self.memmap:
+                path = directory/f"projection_{image_index}_{name}.npy"
+                path.unlink(missing_ok=True)
+                self.paths.append(path)
+                self.arrays[name] = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+            else:
+                self.arrays[name] = np.empty(shape, dtype=dtype)
+
+    def populate(self, reps, camera_pose, camera, depth_buffer, config, control, rep_states):
+        scale = np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height])
+        for start in range(0, len(reps), 50_000):
+            control.checkpoint()
+            stop = start+50_000
+            world = reps["xyz"][start:stop]
+            camera_points = camera_pose.from_world(world)
+            camera_uv, camera_range, camera_valid = camera.project(camera_points)
+            visible = depth_buffer.visible(camera_uv*scale, camera_range, camera_valid,
+                                           config["visibility_abs"], config["visibility_rel"])
+            if rep_states is not None:
+                visible &= rep_states[start:stop] != 2
+            self.arrays["camera_points"][start:stop] = camera_points
+            self.arrays["camera_uv"][start:stop] = camera_uv
+            self.arrays["camera_range"][start:stop] = camera_range
+            self.arrays["camera_valid"][start:stop] = camera_valid
+            self.arrays["visible"][start:stop] = visible
+        for array in self.arrays.values():
+            if isinstance(array, np.memmap):
+                array.flush()
+
+    def close(self):
+        for array in self.arrays.values():
+            if isinstance(array, np.memmap):
+                array.flush()
+                array._mmap.close()
+        self.arrays.clear()
+        for path in self.paths:
+            path.unlink(missing_ok=True)
+        self.paths.clear()
+
+
 def classify_scan(reader, store, inspection, config, work, image_cache, mask_cache,
                   model_hash, factory, control, classes, all_classes, identity, mirrors=None):
     scan = store.meta["scan_index"]
@@ -212,7 +385,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
     weights[:] = 0
     by_id = {c["id"]: i for i,c in enumerate(all_classes)}
     global_columns = np.array([by_id[c["id"]] for c in classes])
-    prompt_classes = [PromptClass(c["id"], tuple(c["prompts"]), c.get("min_instance_conf") if c.get("min_instance_conf") is not None else config["instance_confidence"]) for c in classes]
+    prompts = prompt_classes(classes, config)
     scan_pose = Pose.from_dict(store.meta["metadata"]["pose"])
     stats = {"hits": 0, "misses": 0, "views": 0, "representatives": count,
              "depth_gate": {'components': 0, 'rejected_representatives': 0, 'seconds': 0.}}
@@ -231,92 +404,97 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
             camera, image, mask, image_hash, mask_hash = image_assets(reader, item, image_cache)
             camera_pose = Pose.from_dict(item["metadata"]["pose"])
             depth_buffer = camera_depth(store, scan_pose, camera_pose, camera, config["depth_width"], control)
-            views = plan_views(camera, config["profile"], config["view_size"], config["view_fov"])
-            planned = views if views else [None]
-            for view_index, view in enumerate(planned):
-                control.checkpoint()
-                if view:
-                    rendered, valid = render_view(image, mask, camera, view)
-                    view_info = asdict(view)
-                else:
-                    rendered, valid = image, (mask > 0) if mask is not None else np.ones(image.shape[:2], bool)
-                    view_info = {"kind": camera.kind, "params": camera.params}
-                view_info.update(mask_sha256=mask_hash, torch_version=version("torch"))
-                scores, cached = segment_view(rendered, valid, prompt_classes, factory, mask_cache, image_hash,
-                                               view_info, model_hash, config["image_scale"], config["tile_size"],
-                                               config["tile_overlap"], control.checkpoint)
-                stats["hits"] += cached["hits"]
-                stats["misses"] += cached["misses"]
-                stats["views"] += 1
-                labels, confidence = evidence_map(scores, classes, config)
-                if config['diagnostics'] == 'all' or (config['diagnostics'] == 'sample' and view_index == 0):
-                    save_overlay(config['output'],scan,item['index'],view_index,rendered,labels,classes)
-                h, w = labels.shape
-                # Build a small per-view gate map before accumulating votes.
-                # The geometry is evaluated only for labels which can be gated
-                # (normally ``door``), keeping other semantic classes fast.
-                blocked = np.zeros(count, bool)
-                target_indices = {index for index, item in enumerate(classes) if item['id'] in config['depth_gate_classes']}
-                if target_indices:
-                    gate_started = time.monotonic()
-                    gate_ids, gate_pixels, gate_ranges, gate_world, gate_labels = [], [], [], [], []
+            projection = ImageProjectionCache(work/f"scan_{scan:04d}", item["index"], count)
+            camera_points = camera_uv = camera_range = camera_valid = visible = uv = projected = None
+            try:
+                projection.populate(reps, camera_pose, camera, depth_buffer, config, control, rep_states)
+                views = plan_views(camera, config["profile"], config["view_size"], config["view_fov"])
+                planned = views if views else [None]
+                for view_index, view in enumerate(planned):
+                    control.checkpoint()
+                    if view:
+                        rendered, valid = render_view(image, mask, camera, view)
+                        view_info = asdict(view)
+                    else:
+                        rendered, valid = image, (mask > 0) if mask is not None else np.ones(image.shape[:2], bool)
+                        view_info = {"kind": camera.kind, "params": camera.params}
+                    view_info.update(mask_sha256=mask_hash, torch_version=version("torch"))
+                    scores, cached = segment_view(rendered, valid, prompts, factory, mask_cache, image_hash,
+                                                   view_info, model_hash, config["image_scale"], config["tile_size"],
+                                                   config["tile_overlap"], control.checkpoint,
+                                                   cache_only=config.get('_shared_sam', False))
+                    stats["hits"] += cached["hits"]
+                    stats["misses"] += cached["misses"]
+                    stats["views"] += 1
+                    labels, confidence = evidence_map(scores, classes, config)
+                    if config['diagnostics'] == 'all' or (config['diagnostics'] == 'sample' and view_index == 0):
+                        save_overlay(config['output'],scan,item['index'],view_index,rendered,labels,classes)
+                    h, w = labels.shape
+                    # Build a small per-view gate map before accumulating votes.
+                    # The geometry is evaluated only for labels which can be gated
+                    # (normally ``door``), keeping other semantic classes fast.
+                    blocked = np.zeros(count, bool)
+                    target_indices = {index for index, item in enumerate(classes) if item['id'] in config['depth_gate_classes']}
+                    if target_indices:
+                        gate_started = time.monotonic()
+                        gate_ids, gate_pixels, gate_ranges, gate_world, gate_labels = [], [], [], [], []
+                        for start in range(0, count, 50_000):
+                            control.checkpoint()
+                            stop = start+50_000
+                            world = reps['xyz'][start:stop]
+                            camera_points = projection.arrays['camera_points'][start:stop]
+                            camera_uv = projection.arrays['camera_uv'][start:stop]
+                            camera_range = projection.arrays['camera_range'][start:stop]
+                            camera_valid = projection.arrays['camera_valid'][start:stop]
+                            visible = projection.arrays['visible'][start:stop]
+                            uv, _, projected = view.project(camera_points) if view else (camera_uv, camera_range, camera_valid)
+                            size = np.array([view.size, view.size] if view else [camera.width, camera.height])
+                            ids = np.flatnonzero(visible & projected)
+                            if not len(ids):
+                                continue
+                            pixels = np.floor(uv[ids]*np.array([w, h])/size).astype(int)
+                            pixels[:, 0] = pixels[:, 0].clip(0, w-1)
+                            pixels[:, 1] = pixels[:, 1].clip(0, h-1)
+                            chosen = labels[pixels[:, 1], pixels[:, 0]]
+                            take = np.isin(chosen, list(target_indices))
+                            if take.any():
+                                gate_ids.append(start+ids[take]); gate_pixels.append(pixels[take]); gate_ranges.append(camera_range[ids[take]])
+                                gate_world.append(world[ids[take]]); gate_labels.append(chosen[take])
+                        if gate_ids:
+                            local, gate_report = depth_gate_representatives(labels, np.concatenate(gate_pixels), np.concatenate(gate_ranges),
+                                                                             np.concatenate(gate_world), np.concatenate(gate_labels), classes, config)
+                            blocked[np.concatenate(gate_ids)[local]] = True
+                            for key, value in gate_report.items():
+                                stats['depth_gate'][key] += value
+                        stats['depth_gate']['seconds'] += time.monotonic()-gate_started
                     for start in range(0, count, 50_000):
                         control.checkpoint()
-                        world = reps['xyz'][start:start+50_000]
-                        camera_points = camera_pose.from_world(world)
-                        camera_uv, camera_range, camera_valid = camera.project(camera_points)
-                        visible = depth_buffer.visible(camera_uv*np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height]),
-                                                       camera_range, camera_valid, config['visibility_abs'], config['visibility_rel'])
-                        if mirrors:
-                            visible &= rep_states[start:start+50_000] != 2
+                        stop = start+50_000
+                        camera_points = projection.arrays['camera_points'][start:stop]
+                        camera_uv = projection.arrays['camera_uv'][start:stop]
+                        camera_range = projection.arrays['camera_range'][start:stop]
+                        camera_valid = projection.arrays['camera_valid'][start:stop]
+                        visible = projection.arrays['visible'][start:stop]
                         uv, _, projected = view.project(camera_points) if view else (camera_uv, camera_range, camera_valid)
                         size = np.array([view.size, view.size] if view else [camera.width, camera.height])
                         ids = np.flatnonzero(visible & projected)
-                        if not len(ids):
-                            continue
-                        pixels = np.floor(uv[ids]*np.array([w, h])/size).astype(int)
+                        pixels = np.floor(uv[ids]*np.array([w,h])/size).astype(int)
                         pixels[:, 0] = pixels[:, 0].clip(0, w-1)
                         pixels[:, 1] = pixels[:, 1].clip(0, h-1)
                         chosen = labels[pixels[:, 1], pixels[:, 0]]
-                        take = np.isin(chosen, list(target_indices))
-                        if take.any():
-                            gate_ids.append(start+ids[take]); gate_pixels.append(pixels[take]); gate_ranges.append(camera_range[ids[take]])
-                            gate_world.append(world[ids[take]]); gate_labels.append(chosen[take])
-                    if gate_ids:
-                        local, gate_report = depth_gate_representatives(labels, np.concatenate(gate_pixels), np.concatenate(gate_ranges),
-                                                                         np.concatenate(gate_world), np.concatenate(gate_labels), classes, config)
-                        blocked[np.concatenate(gate_ids)[local]] = True
-                        for key, value in gate_report.items():
-                            stats['depth_gate'][key] += value
-                    stats['depth_gate']['seconds'] += time.monotonic()-gate_started
-                for start in range(0, count, 50_000):
-                    control.checkpoint()
-                    world = reps["xyz"][start:start+50_000]
-                    camera_points = camera_pose.from_world(world)
-                    camera_uv, camera_range, camera_valid = camera.project(camera_points)
-                    visible = depth_buffer.visible(camera_uv*np.array([depth_buffer.width/camera.width, depth_buffer.height/camera.height]),
-                                                   camera_range, camera_valid, config["visibility_abs"], config["visibility_rel"])
-                    if mirrors:
-                        states = rep_states[start:start+50_000]
-                        # An uncertain SAM mask must not suppress ordinary semantic evidence.
-                        visible &= states != 2
-                    uv, _, projected = view.project(camera_points) if view else (camera_uv, camera_range, camera_valid)
-                    size = np.array([view.size, view.size] if view else [camera.width, camera.height])
-                    ids = np.flatnonzero(visible & projected)
-                    pixels = np.floor(uv[ids]*np.array([w,h])/size).astype(int)
-                    pixels[:, 0] = pixels[:, 0].clip(0, w-1)
-                    pixels[:, 1] = pixels[:, 1].clip(0, h-1)
-                    chosen = labels[pixels[:, 1], pixels[:, 0]]
-                    accepted = (chosen >= 0) & ~blocked[start+ids]
-                    columns = global_columns[chosen[accepted]]
-                    weights[start+ids[accepted], columns] = np.maximum(weights[start+ids[accepted], columns],
-                        confidence[pixels[accepted, 1], pixels[accepted, 0]])
-                weights.flush()
-                control.event("progress", phase="segmentation", scan=scan, scan_count=inspection["scan_count"],
-                              image=item["index"], image_count=inspection["image_count"], view=view_index+1,
-                              view_count=len(planned), fraction=(scan-1+(view_index+1)/len(planned))/inspection["scan_count"], cache=cached)
-                LOG.info("Scan %d image %d view %d/%d complete; cache %s", scan, item["index"], view_index+1, len(planned), cached)
-            del image, mask, depth_buffer
+                        accepted = (chosen >= 0) & ~blocked[start+ids]
+                        columns = global_columns[chosen[accepted]]
+                        weights[start+ids[accepted], columns] = np.maximum(weights[start+ids[accepted], columns],
+                            confidence[pixels[accepted, 1], pixels[accepted, 0]])
+                    weights.flush()
+                    control.event("progress", phase="segmentation", scan=scan, scan_count=inspection["scan_count"],
+                                  image=item["index"], image_count=inspection["image_count"], view=view_index+1,
+                                  view_count=len(planned), fraction=(scan-1+(view_index+1)/len(planned))/inspection["scan_count"], cache=cached)
+                    LOG.info("Scan %d image %d view %d/%d complete; cache %s", scan, item["index"], view_index+1, len(planned), cached)
+            finally:
+                camera_points = camera_uv = camera_range = camera_valid = visible = uv = projected = None
+                projection.close()
+                del image, mask, depth_buffer
         atomic_json(work/f"scan_{scan:04d}"/"evidence.json", {"identity": identity, **stats})
     finally:
         if rep_states is not None:
@@ -324,6 +502,277 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
         weights._mmap.close()
         reps._mmap.close()
     return rep_path, weights_path, stats
+
+
+def _slam_point_values(stores, point_ids, fields=None):
+    """Read world coordinates (and optionally explicit point times) in bounded runs."""
+    point_ids = np.asarray(point_ids, np.int64)
+    world = np.empty((len(point_ids), 3), np.float64)
+    times = np.full(len(point_ids), np.nan, np.float64)
+    by_scan = {store.meta['scan_index']: store for store in stores}
+    scans = point_ids >> 48
+    rows = point_ids & ((1 << 48)-1)
+    for scan in np.unique(scans):
+        ids = np.flatnonzero(scans == scan)
+        store = by_scan.get(int(scan))
+        if store is None:
+            raise ValueError('Visibility index refers to an unknown scan')
+        ordered = ids[np.argsort(rows[ids], kind='stable')]
+        sorted_rows = rows[ordered]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_rows) != 1)+1, len(ordered)]
+        pose = Pose.from_dict(store.meta['metadata']['pose'])
+        for first, last in zip(starts[:-1], starts[1:]):
+            target = ordered[first:last]
+            low, high = int(rows[target[0]]), int(rows[target[-1]])+1
+            local = store.read('xyz_local', low, high)[rows[target]-low]
+            world[target] = pose.to_world(local)
+            field = fields.get(int(scan)) if isinstance(fields, dict) else fields
+            if field and field in store.meta['arrays']:
+                values = store.read(field, low, high)[rows[target]-low]
+                values = np.asarray(values, np.float64)
+                times[target] = np.where(np.isfinite(values), values, np.nan)
+    return world, times
+
+
+def _slam_time_field(stores):
+    names = ('timeStamp', 'timestamp', 'time', 'gpsTime', 'gps_time')
+    matches = []
+    for store in stores:
+        matches.append(next((name for name in names if name in store.meta['arrays']), None))
+    return matches if all(matches) else None
+
+
+def slam_observation_weight(distance, incidence_angle, radial_position, config):
+    """Combine SAM confidence with distance, surface incidence and image-centre quality.
+
+    The configurable factors favour closer points, rays more perpendicular to
+    a surface normal, and pixels near the image centre.  They intentionally
+    remain multiplicative so a weak geometric factor cannot increase SAM
+    evidence.
+    """
+    distance = np.asarray(distance, np.float64)
+    incidence_angle = np.asarray(incidence_angle, np.float64)
+    radial_position = np.asarray(radial_position, np.float64)
+    distance_factor = float(config['slam_weight_distance_scale']) / (distance + float(config['slam_weight_distance_scale']))
+    incidence_factor = np.clip(np.cos(incidence_angle), 0., 1.) ** float(config['slam_weight_incidence_power'])
+    radial_factor = 1. / (1.+np.maximum(radial_position, 0.)) ** float(config['slam_weight_radial_power'])
+    return (distance_factor*incidence_factor*radial_factor).astype(np.float32)
+
+
+def _slam_view_image(reader, item, camera, view, image_cache):
+    camera_model, image, mask, image_hash, mask_hash = image_assets(reader, item, image_cache)
+    if isinstance(view, Camera):
+        return image, (mask > 0 if mask is not None else np.ones(image.shape[:2], bool)), image_hash, mask_hash, {
+            'id': f'image_{item["index"]}_native', 'kind': camera_model.kind, 'params': camera_model.params}
+    rendered, valid = render_view(image, mask, camera_model, view)
+    return rendered, valid, image_hash, mask_hash, {**asdict(view), 'image_index': item['index'], 'mask_sha256': mask_hash}
+
+
+def _slam_batches(values, columns):
+    """Yield dense class vectors after per-station, per-voxel maxima."""
+    if not values:
+        return
+    dtype = np.dtype([('key', 'V24'), ('column', '<i4'), ('weight', '<f4')])
+    rows = np.empty(len(values), dtype=dtype)
+    for index, ((key, column), weight) in enumerate(values.items()):
+        rows[index] = (np.void(key), column, weight)
+    rows.sort(order=('key', 'column'))
+    for start in range(0, len(rows), 50_000):
+        block = rows[start:start+50_000]
+        keys = block['key']
+        weights = np.zeros((len(block), columns), np.float32)
+        weights[np.arange(len(block)), block['column']] = block['weight']
+        yield keys, weights
+
+
+def execute_slam(config, source, output, cache, inspection, store_report, stores, factory, control, started):
+    """Run the mobile path without changing the static TLS processing path."""
+    preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
+    semantic_run = config['processing_mode'] == 'classify_and_filter'
+    errors, preset_warnings = validate_preset(preset, require_active_classes=semantic_run)
+    if errors:
+        raise ValueError('Invalid preset: '+'; '.join(errors))
+    if not semantic_run:
+        raise ValueError('SLAM mode requires semantic classification')
+    all_classes = [item for item in preset['classes'] if item.get('enabled', True)]
+    if not all_classes:
+        raise ValueError('No active classes')
+    cameras = build_camera_list(inspection)
+    if not cameras:
+        raise InputNotClassifiable('No decodable SLAM camera with a valid pose and camera model')
+    stations, membership, ordering = cluster_stations(cameras, config['slam_station_spacing'])
+    config = {**config, 'voxel_origin': [stores[0].meta['metadata']['pose']['translation'][key] for key in 'xyz'],
+              '_slam': True, '_shared_sam': False, 'mirror_analysis': False}
+    model_hash, input_hash = file_hash(Path(config['model'])), store_report['source_sha256']
+    identity = identity_hash({'pipeline_revision': 'slam-v1', 'source': input_hash, 'model': model_hash,
+                              'preset': preset, 'config': {key: value for key, value in config.items() if key not in ('output', 'cache')}})
+    manifest = {**config, 'pipeline_revision': 'slam-v1', 'identity': identity, 'input_sha256': input_hash,
+                'model_sha256': model_hash, 'resolved_preset': preset,
+                'versions': {name: version(name) for name in ('numpy', 'pye57', 'Pillow', 'torch', 'torchvision', 'sam3', 'laspy')}}
+    previous = output/'run_config.json'
+    if previous.exists() and json.loads(previous.read_text(encoding='utf-8')).get('identity') != identity:
+        raise ValueError('This output directory belongs to a different run; choose a new folder')
+    atomic_json(previous, manifest)
+    rows = legend_rows(preset)
+    write_legends(output, rows)
+    atomic_json(output/'scan_index.json', {str(store.meta['scan_index']): {'guid': store.meta['metadata'].get('guid'),
+                'name': store.meta['metadata'].get('name')} for store in stores})
+    work = cache/'votes'/identity
+    work.mkdir(parents=True, exist_ok=True)
+    votes = VoteStore(work/'votes.sqlite', station_tracking=True)
+    mask_cache, image_cache = MaskCache(cache/'seg'), cache/'geometry'/input_hash/'images'
+    index = build_spatial_index(stores, cache/'slam_index'/input_hash, input_hash, checkpoint=control.checkpoint)
+    visibility_cache = VisibilityCache(cache, input_hash)
+    code_map = preset.get('code_map', {})
+    codes = [int(code_map.get(str(item['code']), item['code'])) for item in all_classes]
+    by_id = {item['id']: codes[position] for position, item in enumerate(all_classes)}
+    time_fields = _slam_time_field(stores)
+    time_possible = bool(config['slam_time_filter'] and time_fields and all(camera.timestamp is not None for camera in cameras))
+    time_field_by_scan = {store.meta['scan_index']: field for store, field in zip(stores, time_fields or [None]*len(stores))}
+    LOG.info('SLAM timestamp filtering requested=%s possible=%s', config['slam_time_filter'], time_possible)
+    input_warnings = [item if isinstance(item, dict)
+                      else {'code': 'input_mode_warning', 'detail': str(item)}
+                      for item in inspection['input_mode'].get('warnings', [])]
+    warnings = [*input_warnings,
+                *({'code': 'preset_warning', 'detail': item} for item in preset_warnings)]
+    warnings.append({'code': 'slam_reflection_disabled', 'detail': 'Reflection class 68 is disabled for mobile SLAM input.'})
+    if config['slam_time_filter'] and not time_possible:
+        warnings.append({'code': 'slam_time_filter_unavailable', 'detail': 'Point and image timestamps are both required.'})
+    image_by_index = {item['index']: item for item in inspection['images']}
+    selected = select_classes(preset, config['scene_mode'], config['building_enclosure'])
+    selected_ids = {item['id'] for item in selected}
+    active_columns = {index for index, item in enumerate(all_classes) if item['id'] in selected_ids}
+    if not active_columns:
+        raise ValueError('No enabled classes for this SLAM scene mode')
+    timings, station_results = {}, []
+    control.event('phase_started', phase='slam_index')
+    control.event('phase_finished', phase='slam_index')
+    control.event('phase_started', phase='slam_segmentation')
+    with E57Reader(source) as reader:
+        for station in stations:
+            control.checkpoint()
+            if votes.completed(station.id, identity):
+                station_results.append({'station': station.id, 'resumed': True, 'views': len(station.camera_indices)})
+                continue
+            station_values = {}
+            usable_views = 0
+            for camera_index in station.camera_indices:
+                camera = cameras[camera_index]
+                item = image_by_index[camera.image_index]
+                for view_number, (_, view) in enumerate(iter_camera_views([camera], config['profile'], config['view_size'], config['view_fov']), 1):
+                    control.checkpoint()
+                    rendered, valid_image, image_hash, mask_hash, view_info = _slam_view_image(reader, item, camera.camera, view, image_cache)
+                    prompts = prompt_classes([item for item in all_classes if item['id'] in selected_ids], config)
+                    selected_indices = [index for index, item in enumerate(all_classes) if item['id'] in selected_ids]
+                    scores, cache_stats = segment_view(rendered, valid_image, prompts, factory, mask_cache, image_hash,
+                        view_info, model_hash, config['image_scale'], config['tile_size'], config['tile_overlap'], control.checkpoint)
+                    label_config = {**config, 'boundary_margin': config['boundary_margin']+config['slam_boundary_margin_extra']}
+                    labels, confidence = evidence_map(scores, [item for item in all_classes if item['id'] in selected_ids], label_config)
+                    visibility, visibility_hit = visibility_cache.visibility_for_view(index, camera.pose, view, config,
+                        intrinsics=camera.camera.params, view=view_info, checkpoint=control.checkpoint,
+                        progress=lambda phase, hit: control.event('progress', phase=phase, station=station.id, image=camera.image_index, cache=hit),
+                        image=rendered, diagnostics_directory=output/'slam_diagnostics')
+                    if not len(visibility.point_indices):
+                        continue
+                    # Point IDs retain original block/record provenance; load only the visible source rows.
+                    world, point_times = _slam_point_values(stores, visibility.point_indices,
+                                                            time_field_by_scan if time_possible else None)
+                    pixels = np.floor(visibility.pixels*np.asarray((labels.shape[1]/rendered.shape[1], labels.shape[0]/rendered.shape[0]))).astype(np.int64)
+                    inside = ((pixels[:, 0] >= 0) & (pixels[:, 0] < labels.shape[1]) & (pixels[:, 1] >= 0) & (pixels[:, 1] < labels.shape[0]))
+                    local_labels = np.full(len(pixels), -1, np.int16)
+                    local_confidence = np.zeros(len(pixels), np.float32)
+                    local_labels[inside] = labels[pixels[inside, 1], pixels[inside, 0]]
+                    local_confidence[inside] = confidence[pixels[inside, 1], pixels[inside, 0]]
+                    if time_possible:
+                        inside &= np.isfinite(point_times) & (np.abs(point_times-camera.timestamp) <= config['slam_time_window'])
+                    weights = local_confidence*slam_observation_weight(visibility.distance, visibility.incidence_angle,
+                                                                          visibility.radial_position, config)
+                    keys = voxel_keys(world, np.asarray(config['voxel_origin']), config['voxel_size'])
+                    for local_class, global_class in enumerate(selected_indices):
+                        take = inside & (local_labels == local_class) & (weights > 0)
+                        for key, weight in zip(keys[take], weights[take]):
+                            marker = (bytes(key), global_class)
+                            station_values[marker] = max(station_values.get(marker, 0.), float(weight))
+                    usable_views += 1
+                    control.event('progress', phase='slam_label_transfer', station=station.id, image=camera.image_index,
+                                  view=view_number, cache=cache_stats, visible_points=len(visibility.point_indices))
+            votes.add_scan(station.id, identity, _slam_batches(station_values, len(all_classes)), codes, station_id=station.id)
+            station_results.append({'station': station.id, 'views': usable_views, 'camera_count': len(station.camera_indices),
+                                    'voxel_class_observations': len(station_values)})
+    control.event('phase_finished', phase='slam_segmentation')
+    control.event('phase_started', phase='voting')
+    priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
+                'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
+    votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority)
+    surface_ties = building = stairs = components = vegetation = None
+    if config['surface_tie_break']:
+        surface_ties = votes.resolve_surface_ties(by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
+            config['surface_tie_share'], config['surface_normal_radius'], config['min_observations'],
+            [float(station.position[2]) for station in stations], control.checkpoint)
+    if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
+        building = votes.split_ground_floor_by_building(by_id['ground'], by_id['floor'],
+            [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
+            config['building_boundary_cell_size'], config['building_boundary_min_height'],
+            config['building_boundary_max_cells'], control.checkpoint)
+    if config['stairs_geometry_check'] and 'stairs' in by_id:
+        stairs = votes.reject_planar_stairs(by_id['stairs'], np.asarray(config['voxel_origin']), config['voxel_size'],
+            config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
+            config['seed'], codes, control.checkpoint)
+    if config['component_cleanup']:
+        rules = []
+        if 'cable' in by_id:
+            rules.append((by_id['cable'], config['cable_component_min_voxels'], config['cable_component_min_span']))
+        if 'electrical' in by_id:
+            rules.append((by_id['electrical'], config['electrical_component_min_voxels'], config['electrical_component_min_span']))
+        components = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'], rules, control.checkpoint)
+    if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
+        vegetation = votes.vegetation_bases_to_ground(by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
+            config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
+    # Origin-based geometric fills and direct label transfer can manufacture a
+    # label for a point never visible from any SLAM camera, so they are disabled.
+    votes.finalize_station_ids()
+    control.event('phase_finished', phase='voting')
+    control.event('phase_started', phase='output')
+    suffix, path = 'classified', output/f'{source.stem}_classified.{config["format"]}'
+    if path.exists():
+        raise FileExistsError('Completed output exists; choose a new run directory')
+    writer = write_e57 if config['format'] == 'e57' else write_cloud
+    progress = lambda phase, fraction, scan: control.event('progress', phase=phase, fraction=fraction, scan=scan)
+    if writer is write_e57:
+        result = writer(path, source, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'], [row['code'] for row in rows], (),
+                        control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=0.,
+                        geometry_planes=None, station_ids=True, station_count=len(stations))
+    else:
+        result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
+                        inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
+                        output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None,
+                        station_ids=True, station_count=len(stations))
+    control.event('phase_finished', phase='output')
+    result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
+                  computed_points=sum(selected_count(store, 'reduced') for store in stores), output_points=result['record_count'], format=config['format'])
+    report = {'schema_version': 1, 'input': inspection['source'], 'input_sha256': input_hash, 'input_mode': inspection['input_mode'],
+              'output': result, 'scans': [{'scan': item['station'], 'scene': config['scene_mode']} for item in station_results],
+              'stations': station_results, 'virtual_stations': len(stations), 'station_ordering': ordering,
+              'views_used': sum(item['views'] for item in station_results), 'warnings': warnings,
+              'slam': {'station_spacing_m': config['slam_station_spacing'], 'visibility_cache_hits': visibility_cache.hits,
+                       'visibility_recomputations': visibility_cache.recomputations, 'time_filter_requested': config['slam_time_filter'],
+                       'time_filter_possible': time_possible, 'time_window_s': config['slam_time_window'],
+                       'weighting': {'distance_scale_m': config['slam_weight_distance_scale'],
+                                     'incidence_power': config['slam_weight_incidence_power'], 'radial_power': config['slam_weight_radial_power'],
+                                     'description': 'SAM confidence multiplied by distance, incidence and image-centre factors.'},
+                       'never_visible_policy': 'No direct-neighbour or plane-fill propagation is used in SLAM mode.'},
+              'sam_calls': 0,
+              'stairs_priority_overrides': votes.priority_overrides, 'created_utc': datetime.now(timezone.utc).isoformat(),
+              'surface_ties': surface_ties, 'building_enclosure': building, 'stairs_geometry': stairs,
+              'component_cleanup': components, 'vegetation_base_to_ground': vegetation,
+              'total_seconds': time.monotonic()-started}
+    write_report(output, report, rows)
+    votes.close()
+    cleanup = cleanup_run_cache(cache, input_hash, identity, mask_cache, config['cache_cleanup'])
+    report['cache_cleanup'] = {key: value for key, value in cleanup.items() if key != 'incomplete'}
+    write_report(output, report, rows)
+    control.event('finished', output=str(path), report=str(output/'report.html'))
+    return report
 
 
 def execute(config, backend_factory=None, listen=True):
@@ -369,12 +818,18 @@ def execute(config, backend_factory=None, listen=True):
         control.event("state", state="running")
         control.event("phase_started", phase="inspection")
         LOG.info("Run started for %s", source)
-        inspection = inspect_file(source)
+        inspection = inspect_file(source, config=config)
         atomic_json(output/"inspect_report.json", inspection)
         atomic_text(output/"inspect_report.md", markdown(inspection))
-        if not any(scan['classification_eligible_metadata'] for scan in inspection['scans']):
+        input_mode = inspection['input_mode']
+        control.event("input_mode", **input_mode)
+        eligible = (any(image.get('classification_eligible_slam') for image in inspection['images'])
+                    if input_mode['mode'] == 'slam'
+                    else any(scan['classification_eligible_metadata'] for scan in inspection['scans']))
+        if not eligible:
             strings = json.loads((Path(__file__).resolve().parents[1]/'gui/strings_de.json').read_text(encoding='utf-8'))
-            reason = 'input_no_images' if inspection['image_count'] == 0 else 'input_no_usable_images'
+            reason = ('input_no_images' if inspection['image_count'] == 0 else
+                      ('input_no_usable_slam_images' if input_mode['mode'] == 'slam' else 'input_no_usable_images'))
             raise InputNotClassifiable(strings[reason])
         store_report = build_store(source, cache/"scan_store", progress=lambda s,n,t: control.checkpoint())
         atomic_json(output/"store_report.json", store_report)
@@ -382,8 +837,23 @@ def execute(config, backend_factory=None, listen=True):
         stores = [reduced_store(store, config["point_reduction"], config["seed"]) for store in full_stores]
         if not stores:
             raise ValueError("E57 contains no scans")
+        input_mode = detect_input_mode(inspection, config,
+                                       points_check=lambda _: pseudo_setup_points_check(full_stores, config=config,
+                                                                                         checkpoint=control.checkpoint))
+        inspection['input_mode'] = input_mode
+        atomic_json(output/"inspect_report.json", inspection)
+        atomic_text(output/"inspect_report.md", markdown(inspection))
+        control.event("input_mode", **input_mode)
+        if input_mode['mode'] == 'slam':
+            control.event("phase_finished", phase="inspection")
+            return execute_slam(config, source, output, cache, inspection, store_report, stores, factory, control, started)
         preset = json.loads(Path(config["preset"]).read_text(encoding="utf-8"))
         semantic_run = config['processing_mode'] == 'classify_and_filter'
+        shared_sam = semantic_run and config['mirror_analysis']
+        # This runtime-only flag keeps the mirror consumer pinned to the same
+        # view identities prepared below.  It is part of the run identity so a
+        # legacy fast-mirror run can never be resumed as a shared-SAM run.
+        config = {**config, '_shared_sam': shared_sam}
         errors, preset_warnings = validate_preset(preset, require_active_classes=semantic_run)
         if errors:
             raise ValueError("Invalid preset: "+"; ".join(errors))
@@ -394,9 +864,9 @@ def execute(config, backend_factory=None, listen=True):
         config = {**config, "voxel_origin": [stores[0].meta["metadata"]["pose"]["translation"][k] for k in "xyz"]}
         model_hash = file_hash(Path(config["model"]))
         input_hash = store_report["source_sha256"]
-        identity = identity_hash({"pipeline_revision": "wall-frame-v3", "source": input_hash, "model": model_hash, "preset": preset,
+        identity = identity_hash({"pipeline_revision": "shared-sam-v1", "source": input_hash, "model": model_hash, "preset": preset,
                                   "config": {k:v for k,v in config.items() if k not in ("output", "cache")}})
-        manifest = {**config, "pipeline_revision": "wall-frame-v3", "identity": identity, "input_sha256": input_hash, "model_sha256": model_hash,
+        manifest = {**config, "pipeline_revision": "shared-sam-v1", "identity": identity, "input_sha256": input_hash, "model_sha256": model_hash,
                     "resolved_preset": preset, "versions": {n: version(n) for n in ("numpy","pye57","Pillow","torch","torchvision","sam3","laspy")}}
         previous = output/"run_config.json"
         if previous.exists() and json.loads(previous.read_text(encoding="utf-8")).get("identity") != identity:
@@ -415,12 +885,8 @@ def execute(config, backend_factory=None, listen=True):
         mapping = preset.get("code_map", {})
         codes = [int(mapping.get(str(c["code"]), c["code"])) for c in all_classes]
         with E57Reader(source) as reader:
-            if config['mirror_analysis']:
-                control.event('phase_started',phase='mirror')
-                mirror_start = time.monotonic()
-                mirrors = build_mirrors(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,image_assets)
-                atomic_json(output/'mirror_registry.json',[p.serialize() for p in mirrors.registry.planes])
-                timings['mirror'] = time.monotonic()-mirror_start
+            sam_records = {}
+            def append_mirror_warnings():
                 warnings.append({'code':'mirror_limits'})
                 for item in mirrors.report['images']:
                     if item.get('failed'):
@@ -429,19 +895,33 @@ def execute(config, backend_factory=None, listen=True):
                     if any(not region['accepted'] for region in item['regions']):
                         warnings.append({'code':'reflection_plane_missing','scan':item['scan'],
                                          'image':item['image'],'mask_kind':item['kind']})
-                control.event('phase_finished',phase='mirror')
-            if semantic_run:
-                control.event("phase_started", phase="segmentation")
-                seg_start = time.monotonic()
-                for store in stores:
-                    control.checkpoint()
-                    scan = store.meta["scan_index"]
-                    mode = config["scene_overrides"].get(str(scan), config["scene_mode"])
-                    classes = select_classes(preset, mode, config['building_enclosure'])
-                    if votes.completed(scan, identity):
-                        scan_results.append({"scan": scan, "scene": mode, "resumed": True})
-                        continue
-                    try:
+
+            def classify_ready_scan(store, record=None):
+                """Classify one scan after its cache and local mirror surfaces exist."""
+                nonlocal skipped
+                control.checkpoint()
+                scan = store.meta["scan_index"]
+                mode = config["scene_overrides"].get(str(scan), config["scene_mode"])
+                classes = select_classes(preset, mode, config['building_enclosure'])
+                if votes.completed(scan, identity):
+                    scan_results.append({"scan": scan, "scene": mode, "resumed": True})
+                    return
+                try:
+                    if shared_sam:
+                        if record is None:
+                            try:
+                                record = json.loads((work/f'scene_{scan:04d}.json').read_text(encoding='utf-8'))
+                            except (OSError, ValueError) as error:
+                                raise RuntimeError('Shared SAM preparation record is missing') from error
+                        if record.get('status') != 'complete':
+                            raise RuntimeError(record.get('error', 'Shared SAM preparation failed'))
+                        scene = record['scene']
+                        mode = record['mode']
+                        wanted = set(record['class_ids'])
+                        classes = [item for item in all_classes if item['id'] in wanted]
+                        if mode in ('unsure', 'mixed'):
+                            warnings.append({'code': 'scene_unsure', 'scan': scan})
+                    else:
                         scene = {'scene': mode, 'manual': True}
                         if mode == 'both':
                             control.event('phase_started', phase='scene', scan=scan)
@@ -454,42 +934,183 @@ def execute(config, backend_factory=None, listen=True):
                             control.event('phase_finished', phase='scene', scan=scan)
                             if mode in ('unsure', 'mixed'):
                                 warnings.append({'code': 'scene_unsure', 'scan': scan})
-                        if not classes:
-                            raise ValueError('No enabled classes for this scene')
-                        rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,
-                            mask_cache, model_hash, factory, control, classes, all_classes, identity, mirrors)
-                        def batches():
-                            reps = np.load(rep_path, mmap_mode="r", allow_pickle=False)
-                            weights = np.load(weights_path, mmap_mode="r", allow_pickle=False)
-                            try:
-                                for start in range(0, len(reps), 50_000):
-                                    control.checkpoint()
-                                    yield reps["key"][start:start+50_000], weights[start:start+50_000]
-                            finally:
-                                reps._mmap.close()
-                                weights._mmap.close()
-                        votes.add_scan(scan, identity, batches(), codes)
-                        # The committed SQLite vote rows are the resume boundary.
-                        # Representatives remain useful for diagnostics, but these
-                        # large per-scan intermediates are no longer needed.
-                        weights_path.unlink(missing_ok=True)
-                        (work/f"scan_{scan:04d}"/"mirror_rep.npy").unlink(missing_ok=True)
-                        scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
-                    except Cancelled:
+                    if not classes:
+                        raise ValueError('No enabled classes for this scene')
+                    rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,
+                        mask_cache, model_hash, factory, control, classes, all_classes, identity, mirrors)
+                    def batches():
+                        reps = np.load(rep_path, mmap_mode="r", allow_pickle=False)
+                        weights = np.load(weights_path, mmap_mode="r", allow_pickle=False)
+                        try:
+                            for start in range(0, len(reps), 50_000):
+                                control.checkpoint()
+                                yield reps["key"][start:start+50_000], weights[start:start+50_000]
+                        finally:
+                            reps._mmap.close()
+                            weights._mmap.close()
+                    votes.add_scan(scan, identity, batches(), codes)
+                    weights_path.unlink(missing_ok=True)
+                    (work/f"scan_{scan:04d}"/"mirror_rep.npy").unlink(missing_ok=True)
+                    scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
+                except Cancelled:
+                    raise
+                except Exception as error:
+                    if config["strict"]:
                         raise
-                    except Exception as error:
-                        if config["strict"]:
-                            raise
-                        LOG.exception("Scan %d failed; retaining original valid points as class 1", scan)
-                        skipped.append(scan)
-                        warning = {"code": "scan_failed", "scan": scan, "detail": str(error)}
-                        warnings.append(warning)
-                        control.event("warning", **warning)
-                        scan_results.append({"scan": scan, "scene": mode, "error": str(error)})
-                timings["segmentation"] = time.monotonic()-seg_start
+                    LOG.exception("Scan %d failed; retaining original valid points as class 1", scan)
+                    skipped.append(scan)
+                    warning = {"code": "scan_failed", "scan": scan, "detail": str(error)}
+                    warnings.append(warning)
+                    control.event("warning", **warning)
+                    scan_results.append({"scan": scan, "scene": mode, "error": str(error)})
+
+            parallel_pipeline = shared_sam and config['pipeline_parallel']
+            if parallel_pipeline:
+                control.event('phase_started', phase='mirror')
+                control.event("phase_started", phase="segmentation")
+                sam_started = time.monotonic()
+                mirror_started = time.monotonic()
+                segmentation_started = time.monotonic()
+                mirrors = MirrorAnalysis(work/'mirrors', config)
+                prepared_images = [inspection['images'][index-1] for store in stores
+                                   for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
+                                   if inspection['images'][index-1]['pose_status'] == 'valid'
+                                   and any(kind != 'visualReferenceRepresentation' for kind in inspection['images'][index-1]['representations'])]
+                image_numbers = {item['index']: number for number, item in enumerate(prepared_images, 1)}
+                ready = queue.Queue(maxsize=config['pipeline_prefetch_scans'])
+                producer_stop = threading.Event()
+                producer_timing = {}
+
+                class ProducerControl:
+                    def checkpoint(self):
+                        if producer_stop.is_set():
+                            raise Cancelled()
+                        control.checkpoint()
+
+                    def event(self, kind, **payload):
+                        control.event(kind, **payload)
+
+                producer_control = ProducerControl()
+
+                def publish(message, check_cancel=True):
+                    while not producer_stop.is_set():
+                        if check_cancel:
+                            producer_control.checkpoint()
+                        try:
+                            ready.put(message, timeout=.1)
+                            return True
+                        except queue.Full:
+                            continue
+                    return False
+
+                def produce_sam():
+                    scan = None
+                    try:
+                        control.event('phase_started', phase='sam')
+                        with E57Reader(source) as producer_reader:
+                            for producer_store in stores:
+                                producer_control.checkpoint()
+                                scan = producer_store.meta['scan_index']
+                                record = prepare_shared_sam(
+                                    producer_reader, [producer_store], inspection, config, work, image_cache, mask_cache,
+                                    model_hash, factory, producer_control, preset, image_assets, camera_depth,
+                                    progress_stores=stores, image_numbers=image_numbers, total_images=len(prepared_images))[scan]
+                                kind = 'scan' if record.get('status') == 'complete' else 'scan_failed'
+                                if not publish(SamProducerMessage(kind, scan, record)):
+                                    return
+                    except Cancelled:
+                        # A backend may raise ``Cancelled`` directly without
+                        # setting Control.cancelled.  Forward that case so the
+                        # consumer cannot wait on an empty queue.
+                        if not control.cancelled.is_set():
+                            publish(SamProducerMessage('cancelled'), check_cancel=False)
+                        return
+                    except BaseException as error:
+                        publish(SamProducerMessage('error', scan, error), check_cancel=False)
+                    finally:
+                        producer_timing['seconds'] = time.monotonic()-sam_started
+                        if not producer_stop.is_set():
+                            control.event('phase_finished', phase='sam')
+                            publish(SamProducerMessage('done'), check_cancel=False)
+
+                producer = threading.Thread(target=produce_sam, name='sam-producer', daemon=True)
+                producer.start()
+                try:
+                    for expected_store in stores:
+                        while True:
+                            control.checkpoint()
+                            try:
+                                message = ready.get(timeout=.1)
+                                break
+                            except queue.Empty:
+                                continue
+                        kind, scan, record = message.kind, message.scan, message.payload
+                        if kind == 'cancelled':
+                            raise Cancelled()
+                        if kind == 'error':
+                            raise record
+                        if kind not in ('scan', 'scan_failed') or scan != expected_store.meta['scan_index']:
+                            raise RuntimeError('SAM producer stopped before all scans were prepared')
+                        sam_records[scan] = record
+                        prepared_failures = {int(index): detail for index, detail in record.get('failed_images', {}).items()}
+                        fit_scan_surfaces(reader, expected_store, inspection, config, mirrors, image_cache, mask_cache,
+                                          model_hash, factory, control, preset, image_assets, prepared_failures, image_numbers)
+                        classify_ready_scan(expected_store, record)
+                    while True:
+                        try:
+                            message = ready.get(timeout=.1)
+                        except queue.Empty:
+                            control.checkpoint()
+                            continue
+                        kind, scan, record = message.kind, message.scan, message.payload
+                        if kind == 'cancelled':
+                            raise Cancelled()
+                        if kind == 'error':
+                            raise record
+                        if kind == 'done':
+                            break
+                finally:
+                    producer_stop.set()
+                    producer.join()
+                timings['sam'] = producer_timing.get('seconds', time.monotonic()-sam_started)
+                finalize_states(mirrors, stores, inspection, config, control)
+                atomic_json(output/'mirror_registry.json',[p.serialize() for p in mirrors.registry.planes])
+                timings['mirror'] = time.monotonic()-mirror_started
+                append_mirror_warnings()
+                control.event('phase_finished', phase='mirror')
+                timings['segmentation'] = time.monotonic()-segmentation_started
                 if len(skipped) == len(stores):
                     raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
                 control.event("phase_finished", phase="segmentation")
+            else:
+                if shared_sam:
+                    control.event('phase_started', phase='sam')
+                    sam_start = time.monotonic()
+                    sam_records = prepare_shared_sam(reader, stores, inspection, config, work, image_cache, mask_cache,
+                                                     model_hash, factory, control, preset, image_assets, camera_depth)
+                    timings['sam'] = time.monotonic()-sam_start
+                    control.event('phase_finished', phase='sam')
+                if config['mirror_analysis']:
+                    control.event('phase_started',phase='mirror')
+                    mirror_start = time.monotonic()
+                    prepared_failures = {int(index): detail for record in sam_records.values()
+                                         for index, detail in record.get('failed_images', {}).items()}
+                    mirrors = build_mirrors(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,image_assets,
+                                            prepared_failures)
+                    atomic_json(output/'mirror_registry.json',[p.serialize() for p in mirrors.registry.planes])
+                    timings['mirror'] = time.monotonic()-mirror_start
+                    append_mirror_warnings()
+                    control.event('phase_finished',phase='mirror')
+                if semantic_run:
+                    control.event("phase_started", phase="segmentation")
+                    seg_start = time.monotonic()
+                    for store in stores:
+                        classify_ready_scan(store, sam_records.get(store.meta['scan_index']))
+                    timings["segmentation"] = time.monotonic()-seg_start
+                    if len(skipped) == len(stores):
+                        raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
+                    control.event("phase_finished", phase="segmentation")
+            if semantic_run:
                 control.event("phase_started", phase="voting")
                 vote_start = time.monotonic()
                 by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
@@ -569,6 +1190,7 @@ def execute(config, backend_factory=None, listen=True):
                       computed_points=sum(selected_count(store, "reduced") for store in stores),
                       output_points=result["record_count"], format=config["format"])
         report = {"schema_version": 1, "input": inspection["source"], "input_sha256": input_hash,
+                  "input_mode": input_mode,
                   "output": result, "scans": scan_results, "skipped_scans": skipped, "warnings": warnings,
                   "invalid_counts": {str(s.meta["scan_index"]): s.meta["invalid_count"] for s in stores},
                   "non_transferred_attributes": omitted, "timing_seconds": timings,

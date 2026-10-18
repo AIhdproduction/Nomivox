@@ -85,8 +85,9 @@ def representatives(store, directory: Path, origin, size, checkpoint=lambda: Non
 
 
 class VoteStore:
-    def __init__(self, path):
+    def __init__(self, path, station_tracking=False):
         self.path = Path(path)
+        self.station_tracking = bool(station_tracking)
         self.db = connect(path)
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS votes(key BLOB, class INTEGER, weight REAL, peak REAL, PRIMARY KEY(key,class)) WITHOUT ROWID;
@@ -96,6 +97,15 @@ class VoteStore:
         """)
         if 'peak' not in {row[1] for row in self.db.execute('PRAGMA table_info(votes)')}:
             raise ValueError('Old vote schema requires a new pipeline cache identity')
+        # Static runs deliberately retain their historic schema.  SLAM stores
+        # station evidence separately, so a static resume database is never
+        # migrated or modified merely by opening it.
+        if self.station_tracking:
+            self.db.executescript("""
+              CREATE TABLE IF NOT EXISTS station_peaks(key BLOB, class INTEGER, station INTEGER, weight REAL,
+                  PRIMARY KEY(key,class,station)) WITHOUT ROWID;
+              CREATE TABLE IF NOT EXISTS station_decisions(key BLOB PRIMARY KEY, station INTEGER) WITHOUT ROWID;
+            """)
         self.priority_overrides = 0
         self._lookup_keys = self._lookup_values = None
         self._lookup_paths = ()
@@ -145,7 +155,7 @@ class VoteStore:
     def completed(self, scan, identity):
         return self.db.execute("SELECT 1 FROM scans WHERE scan=? AND identity=?", (scan, identity)).fetchone() is not None
 
-    def add_scan(self, scan, identity, batches, class_codes):
+    def add_scan(self, scan, identity, batches, class_codes, station_id=None):
         if self.completed(scan, identity):
             return
         with self.db:
@@ -161,6 +171,13 @@ class VoteStore:
                 self.db.executemany("INSERT INTO votes VALUES (?,?,?,?) ON CONFLICT(key,class) DO UPDATE SET weight=weight+excluded.weight, peak=MAX(peak,excluded.peak)",
                                     ((bytes(key), int(code), float(weight), float(weight))
                                      for key, code, weight in zip(keys[rows], codes, values)))
+                if self.station_tracking:
+                    if station_id is None or not 0 < int(station_id) <= 2**32-1:
+                        raise ValueError("SLAM vote requires a valid station ID")
+                    self.db.executemany(
+                        "INSERT INTO station_peaks VALUES (?,?,?,?) ON CONFLICT(key,class,station) DO UPDATE SET weight=MAX(weight,excluded.weight)",
+                        ((bytes(key), int(code), int(station_id), float(weight))
+                         for key, code, weight in zip(keys[rows], codes, values)))
             self.db.execute("INSERT INTO scans VALUES (?,?)", (scan, identity))
         self._invalidate_lookup()
 
@@ -243,6 +260,36 @@ class VoteStore:
             finish(carry)
         flush()
         self.db.commit()
+
+    def finalize_station_ids(self):
+        """Store the strongest station for each final SLAM voxel class."""
+        if not self.station_tracking:
+            return
+        with self.db:
+            self.db.execute("DELETE FROM station_decisions")
+            self.db.execute("""
+                INSERT INTO station_decisions(key,station)
+                SELECT d.key, COALESCE((SELECT p.station FROM station_peaks p
+                  WHERE p.key=d.key AND p.class=d.code
+                  ORDER BY p.weight DESC, p.station ASC LIMIT 1), 0)
+                FROM decisions d
+            """)
+
+    def lookup_station_ids(self, keys):
+        """Return final winning station IDs, or zero for static/unobserved voxels."""
+        keys = np.asarray(keys, 'V24')
+        result = np.zeros(len(keys), np.uint32)
+        if not self.station_tracking or not len(keys):
+            return result
+        unique, inverse = np.unique(keys, return_inverse=True)
+        with self.db:
+            self.db.execute("CREATE TEMP TABLE IF NOT EXISTS lookup_station_keys(key BLOB PRIMARY KEY) WITHOUT ROWID")
+            self.db.execute("DELETE FROM lookup_station_keys")
+            self.db.executemany("INSERT INTO lookup_station_keys VALUES (?)", ((bytes(key),) for key in unique))
+            rows = self.db.execute("SELECT s.key,s.station FROM station_decisions s JOIN lookup_station_keys k ON k.key=s.key").fetchall()
+        mapping = {row[0]: row[1] for row in rows}
+        values = np.fromiter((mapping.get(bytes(key), 0) for key in unique), dtype=np.uint32, count=len(unique))
+        return values[inverse]
 
     def resolve_surface_ties(self, by_id, origin, voxel_size, tie_share=.55, normal_radius=.06,
                              min_observations=1, scanner_heights=(), checkpoint=lambda: None):

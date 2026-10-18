@@ -150,6 +150,21 @@ def agreed_probability(scores, agreement):
     return np.partition(stacked,len(stacked)-required,axis=0)[-required]
 
 
+def reflection_prompt_classes(config, preset):
+    """Return the stable per-phrase mirror prompt identities used by the cache."""
+    kinds = ['mirror_mask', 'reflective_mask']+(['glass_mask'] if config['glass_analysis'] else [])
+    auxiliary = {c['id']: c for c in preset['auxiliary']}
+    fallback = {
+        'glass_mask': ['window glass','glass window pane','glass door','glass facade'],
+        'reflective_mask': ['reflective surface','still water surface','polished metal'],
+    }
+    prompts = [PromptClass(kind,tuple(auxiliary.get(kind,{}).get('prompts',fallback.get(kind,['mirror']))),
+                           config['instance_confidence']) for kind in kinds]
+    phrases = [PromptClass(f'{cls.id}_{i}', (phrase,), cls.instance_threshold)
+               for cls in prompts for i, phrase in enumerate(dict.fromkeys(cls.prompts))]
+    return kinds, prompts, phrases
+
+
 def make_masks(reader,item,config,image_cache,mask_cache,model_hash,factory,control,prompts,assets,progress_context=None):
     camera,image,image_mask,image_hash,mask_hash = assets(reader,item,image_cache)
     width = min(camera.width,config['mirror_mask_width'])
@@ -157,18 +172,21 @@ def make_masks(reader,item,config,image_cache,mask_cache,model_hash,factory,cont
     phrases = [PromptClass(f'{cls.id}_{i}',(phrase,),cls.instance_threshold)
                for cls in prompts for i,phrase in enumerate(dict.fromkeys(cls.prompts))]
     probability = np.zeros((len(phrases),height,width),np.float32)
-    # Reflections are broad, planar surfaces.  Keep exactly the same view
-    # directions as the normal profile but use a single, smaller SAM tile per
-    # direction.  This is substantially faster while avoiding the coverage gap
-    # caused by switching the whole job to the ``fast`` profile.
-    views = plan_views(camera,config['profile'],config['mirror_view_size'],config['view_fov']) or [None]
+    # In the shared SAM mode these are deliberately the semantic views.  The
+    # higher-resolution mirror masks are an accepted result change and make
+    # every call below a cache-only read prepared by the ``sam`` phase.
+    shared_sam = config.get('_shared_sam', False)
+    view_size = config['view_size'] if shared_sam else config['mirror_view_size']
+    scale = config['image_scale'] if shared_sam else config['mirror_image_scale']
+    views = plan_views(camera,config['profile'],view_size,config['view_fov']) or [None]
     for view_index,view in enumerate(views):
         control.checkpoint()
         rendered,valid = render_view(image,image_mask,camera,view) if view else (image,image_mask>0 if image_mask is not None else np.ones(image.shape[:2],bool))
         info = asdict(view) if view else {'kind':camera.kind,'params':camera.params}
         info.update(mask_sha256=mask_hash,torch_version=version('torch'))
         scores,cached = segment_view(rendered,valid,phrases,factory,mask_cache,image_hash,info,model_hash,
-                                     config['mirror_image_scale'],config['tile_size'],config['tile_overlap'],control.checkpoint)
+                                     scale,config['tile_size'],config['tile_overlap'],control.checkpoint,
+                                     cache_only=shared_sam)
         sh,sw = scores[0].shape
         size = [view.size,view.size] if view else [camera.width,camera.height]
         for row in range(0,height,32):
@@ -698,41 +716,46 @@ def fit_surfaces_many(store, camera, pose, masks, config, control):
             for kind, state in prepared.items()}
 
 
-def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,assets):
-    analysis = MirrorAnalysis(work/'mirrors',config)
+def fit_scan_surfaces(reader, store, inspection, config, analysis, image_cache, mask_cache, model_hash,
+                      factory, control, preset, assets, prepared_failures=None, image_numbers=None):
+    """Consume cached masks and fit the reflection surfaces of one scan.
+
+    The resulting ``analysis.images`` entries are all ``classify_scan`` needs.
+    Registry merging and the state-file finalization below are diagnostic/export
+    work and deliberately remain outside this per-scan boundary.
+    """
     # Keep the narrow mirror and glass prompts separate from broadly reflective
     # materials.  Each candidate still needs its own image mask and a confirmed
     # plane before it can affect a point, which prevents a detected object from
     # turning unrelated points into reflections.
-    kinds = ['mirror_mask', 'reflective_mask']+(['glass_mask'] if config['glass_analysis'] else [])
-    auxiliary = {c['id']:c for c in preset['auxiliary']}
-    fallback = {
-        'glass_mask': ['window glass','glass window pane','glass door','glass facade'],
-        'reflective_mask': ['reflective surface','still water surface','polished metal'],
-    }
-    prompts = [PromptClass(kind,tuple(auxiliary.get(kind,{}).get('prompts',fallback.get(kind,['mirror']))),config['instance_confidence']) for kind in kinds]
+    kinds, prompts, _ = reflection_prompt_classes(config, preset)
+    prepared_failures = prepared_failures or {}
     output = Path(config['output'])/'diagnostics'/'reflections'
     output.mkdir(parents=True,exist_ok=True)
-    image_count = sum(1 for store in stores for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
-                      if inspection['images'][index-1]['pose_status']=='valid'
-                      and any(r!='visualReferenceRepresentation' for r in inspection['images'][index-1]['representations']))
-    image_number = 0
-    for store in stores:
-        scan = store.meta['scan_index']
-        for index in inspection['scans'][scan-1]['image_indices']:
+    image_numbers = image_numbers or {}
+    image_count = len(image_numbers) or sum(1 for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
+                                            if inspection['images'][index-1]['pose_status']=='valid'
+                                            and any(r!='visualReferenceRepresentation' for r in inspection['images'][index-1]['representations']))
+    scan = store.meta['scan_index']
+    for index in inspection['scans'][scan-1]['image_indices']:
             item = inspection['images'][index-1]
             if item['pose_status']!='valid' or not any(r!='visualReferenceRepresentation' for r in item['representations']):
                 continue
-            image_number += 1
-            context = dict(image_number=image_number,image_count=image_count,scan=scan,scan_count=len(stores))
+            context = dict(image_number=image_numbers.get(index, 1), image_count=image_count,
+                           scan=scan, scan_count=len(inspection['scans']))
             analysis.images[index] = []
 
             def image_failed(kind, error):
-                LOG.exception('Mirror image processing failed (scan=%s image=%s mask_kind=%s)',scan,index,kind)
                 detail = str(error)
+                LOG.error('Mirror image processing failed (scan=%s image=%s mask_kind=%s): %s',scan,index,kind,detail)
                 control.event('warning',code='mirror_image_failed',scan=scan,image=index,mask_kind=kind,detail=detail)
                 analysis.report['images'].append({'scan':scan,'image':index,'kind':kind,'regions':[],
                                                   'failed':True,'error':detail})
+
+            if index in prepared_failures:
+                for kind in kinds:
+                    image_failed(kind, RuntimeError(prepared_failures[index]))
+                continue
 
             try:
                 camera,pose,masks,preview = make_masks(reader,item,config,image_cache,mask_cache,model_hash,factory,control,prompts,assets,context)
@@ -790,6 +813,10 @@ def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash
                     if surface is not None:
                         analysis.images[index] = [candidate for candidate in analysis.images[index] if candidate is not surface]
                     image_failed(kind,error)
+
+
+def finalize_states(analysis, stores, inspection, config, control):
+    """Write export states after all scan-local surface fits are available."""
     atomic_json(analysis.directory/'registry.json',[p.serialize() for p in analysis.registry.planes])
     for number,store in enumerate(stores,1):
         scan = store.meta['scan_index']
@@ -863,4 +890,19 @@ def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash
         analysis.report['scans'][str(scan)].update(
             counts=counts.tolist(), directly_confirmed_by_other_scans=retained[scan], sha256=file_hash(analysis.paths[scan]))
     atomic_json(Path(config['output'])/'reflection_report.json',analysis.report)
+
+
+def build(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,assets,
+          prepared_failures=None):
+    """Run the serial reflection pipeline used by the compatibility mode."""
+    analysis = MirrorAnalysis(work/'mirrors',config)
+    image_numbers = {item['index']: number for number, item in enumerate(
+        (inspection['images'][index-1] for store in stores
+         for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
+         if inspection['images'][index-1]['pose_status']=='valid'
+         and any(r!='visualReferenceRepresentation' for r in inspection['images'][index-1]['representations'])), 1)}
+    for store in stores:
+        fit_scan_surfaces(reader, store, inspection, config, analysis, image_cache, mask_cache, model_hash,
+                          factory, control, preset, assets, prepared_failures, image_numbers)
+    finalize_states(analysis, stores, inspection, config, control)
     return analysis

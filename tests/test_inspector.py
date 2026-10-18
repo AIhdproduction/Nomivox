@@ -89,3 +89,4 @@ def test_metadata_only_inspection_skips_point_sampling(source):
     report = inspect_file(source, 0)
     assert report["sample_limit_per_scan"] == 0
     assert report["scans"][0]["sample"] == {"records_read": 0}
+    assert report["input_mode"]["mode"] == "static"

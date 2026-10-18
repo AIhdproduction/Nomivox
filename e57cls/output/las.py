@@ -2,6 +2,7 @@
 
 from itertools import product
 from pathlib import Path
+import time
 
 import laspy
 from laspy.vlrs.known import WktCoordinateSystemVlr
@@ -9,15 +10,21 @@ import numpy as np
 
 from e57cls.geometry.cameras import Pose
 from e57cls.output.classify import ClassPointIndex as SharedClassPointIndex, ClassifiedSource, output_chunks, selected_count
+from e57cls.vote.engine import voxel_keys
 
 
-def make_header(stores, crs_wkt="", scale=.001):
+def make_header(stores, crs_wkt="", scale=.001, station_ids=False, station_count=0):
     if len(stores) > 65535:
         raise ValueError("LAS Point Source ID supports at most 65535 scans")
     rgb = any(all(k in s.meta["arrays"] for k in ("colorRed", "colorGreen", "colorBlue")) for s in stores)
     header = laspy.LasHeader(point_format=7 if rgb else 6, version="1.4")
     header.add_extra_dims([laspy.ExtraBytesParams(name="class_conf", type=np.uint8, description="Class winning share 0..255"),
                            laspy.ExtraBytesParams(name="mirror_state", type=np.uint8, description="Mirror evidence state 0..4")])
+    if station_ids:
+        maximum = max(1, int(station_count))
+        station_type = np.uint16 if maximum <= np.iinfo(np.uint16).max else np.uint32
+        header.add_extra_dim(laspy.ExtraBytesParams(name="station_id", type=station_type,
+                                                     description="Strongest SLAM station"))
     corners = []
     for store in stores:
         bounds = store.meta["bounds_local"]
@@ -53,14 +60,15 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 skipped=(), checkpoint=lambda: None, progress=lambda *args: None,
                 mirror=None, no_reflection=False, primary_without_reflections=False,
                 class_transfer_radius=0., output_density="reduced", geometry_planes=None,
-                geometry_fill_tolerance=.02):
-    header = make_header(stores, crs_wkt)
+                geometry_fill_tolerance=.02, station_ids=False, station_count=0):
+    header = make_header(stores, crs_wkt, station_ids=station_ids, station_count=station_count)
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
     extra_temp = extra.with_name(extra.stem+".partial"+extra.suffix)
     counts, written, discarded, inherited_count = np.zeros(256, np.int64), 0, 0, 0
     mirrors = np.zeros(5, np.int64)
     warnings = []
+    timing = {'write': 0., 'readback': 0.}
     sample_indices, sample_xyz, sample_scan = [], [], []
     rng = np.random.default_rng(42)
     total = sum(selected_count(store, output_density) for store in stores)
@@ -73,7 +81,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
     extra_writer = laspy.open(extra_temp, mode="w", header=header, **writer_options) if no_reflection else None
     try:
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
-                              geometry_planes, geometry_fill_tolerance) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
+                              geometry_planes, geometry_fill_tolerance, progress) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]
@@ -94,6 +102,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     points.class_conf = confidence
                     points.mirror_state = states
                     points.point_source_id[:] = scan
+                    if station_ids:
+                        points.station_id = votes.lookup_station_ids(voxel_keys(world, origin, voxel_size))
                     # Unknown return structure is represented by zero, documented in the report.
                     if "intensity" in store.meta["arrays"]:
                         try:
@@ -116,12 +126,18 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     # artifact.  The standard classify-and-filter workflow keeps
                     # its complete cloud and may additionally write this view.
                     if primary_without_reflections:
+                        started = time.perf_counter()
                         writer.write_points(points[codes != 68])
+                        timing['write'] += time.perf_counter()-started
                         discarded += int((codes == 68).sum())
                     else:
+                        started = time.perf_counter()
                         writer.write_points(points)
+                        timing['write'] += time.perf_counter()-started
                     if extra_writer:
+                        started = time.perf_counter()
                         extra_writer.write_points(points[codes != 68])
+                        timing['write'] += time.perf_counter()-started
                         if not primary_without_reflections:
                             discarded += int((codes == 68).sum())
                     left, right = np.searchsorted(wanted, [written, written+n])
@@ -145,8 +161,10 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
             # after reflection points are omitted; still verify the whole file's
             # classes and point count.
             sample_indices, sample_xyz, sample_scan = [], [], []
+        started = time.perf_counter()
         verification = verify_readback(temporary, expected_output_count, sample_indices, sample_xyz, sample_scan, allowed_codes,
                                        laz_backend=laz_backend)
+        timing['readback'] += time.perf_counter()-started
         temporary.replace(path)
         if no_reflection:
             extra_temp.replace(extra)
@@ -159,7 +177,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 "extra_output": str(extra) if no_reflection else None, "extra_removed_count": discarded,
                 "class_transfer_count": inherited_count,
                 "geometry_fill_counts": classified.geometry_fill_counts,
-                "readback": verification, "warnings": warnings, "las_scale_m": header.scales.tolist()}
+                "readback": verification, "warnings": warnings, "las_scale_m": header.scales.tolist(),
+                "timing_seconds": {**classified.timing_seconds, **timing}}
     finally:
         if extra_writer:
             extra_writer.close()
@@ -173,6 +192,8 @@ def verify_readback(path, expected_count, indices, xyz, scans, allowed_codes, la
     valid_codes = allowed_codes[(allowed_codes >= 0) & (allowed_codes < 256)]
     allowed[valid_codes.astype(np.uint8)] = True
     offset = 0
+    if laz_backend is None and Path(path).suffix.lower() == '.laz':
+        laz_backend = getattr(laspy.LazBackend, 'LazrsParallel', laspy.LazBackend.Lazrs)
     options = {"laz_backend": laz_backend} if laz_backend is not None else {}
     with laspy.open(path, **options) as reader:
         if reader.header.point_count != expected_count or reader.header.point_format.id not in (6, 7):

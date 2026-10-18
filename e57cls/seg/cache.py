@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import threading
 from uuid import uuid4
 
 import numpy as np
@@ -41,6 +42,7 @@ class MaskCache:
     def __init__(self, root: Path):
         self.root = root
         self.used_paths = set()
+        self._used_paths_lock = threading.Lock()
         root.mkdir(parents=True, exist_ok=True)
 
     def load(self, identity):
@@ -56,10 +58,15 @@ class MaskCache:
                 score = archive["confidence"]
             if score.dtype != np.float16 or score.ndim != 2 or not np.isfinite(score).all() or np.any((score < 0)|(score > 1)):
                 return None
-            self.used_paths.update((self.root/f"{key}.json", path))
+            with self._used_paths_lock:
+                self.used_paths.update((self.root/f"{key}.json", path))
             return score
         except (OSError, KeyError, ValueError):
             return None
+
+    def used_paths_snapshot(self):
+        with self._used_paths_lock:
+            return set(self.used_paths)
 
     def save(self, identity, scores, effective_tile):
         key = identity_hash(identity)
@@ -71,17 +78,25 @@ class MaskCache:
         manifest = self.root/f"{key}.json"
         atomic_json(manifest, {"identity": identity, "file": name,
                                             "sha256": file_hash(path), "effective_tile_size": effective_tile})
-        self.used_paths.update((manifest, path))
+        with self._used_paths_lock:
+            self.used_paths.update((manifest, path))
+
+
+class MissingMaskCache(RuntimeError):
+    """A phase that must only consume prepared SAM masks found a cache miss."""
 
 
 def segment_view(image, valid, classes, backend_factory, cache: MaskCache, image_hash,
-                 view, model_hash, scale=.75, tile_size=1008, overlap=.2, checkpoint=None):
+                 view, model_hash, scale=.75, tile_size=1008, overlap=.2, checkpoint=None,
+                 cache_only=False):
     if not 0 < scale <= 1:
         raise ValueError("Image scale must be in (0,1]")
     identities = [class_identity(image_hash, view, model_hash, cls, scale, tile_size, overlap) for cls in classes]
     scores = [cache.load(identity) for identity in identities]
     missing = [i for i, score in enumerate(scores) if score is None]
     if missing:
+        if cache_only:
+            raise MissingMaskCache("Prepared SAM mask is missing")
         backend = backend_factory()
         height, width = image.shape[:2]
         size = (max(1, round(width*scale)), max(1, round(height*scale)))

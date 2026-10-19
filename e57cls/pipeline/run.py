@@ -519,7 +519,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
 
 
 def _slam_point_values(stores, point_ids, fields=None):
-    """Read world coordinates (and optionally explicit point times) in bounded runs."""
+    """Read world coordinates (and optionally explicit point times) by source row."""
     point_ids = np.asarray(point_ids, np.int64)
     world = np.empty((len(point_ids), 3), np.float64)
     times = np.full(len(point_ids), np.nan, np.float64)
@@ -533,18 +533,12 @@ def _slam_point_values(stores, point_ids, fields=None):
             raise ValueError('Visibility index refers to an unknown scan')
         ordered = ids[np.argsort(rows[ids], kind='stable')]
         sorted_rows = rows[ordered]
-        starts = np.r_[0, np.flatnonzero(np.diff(sorted_rows) != 1)+1, len(ordered)]
         pose = scan_pose(store.meta['metadata'])
-        for first, last in zip(starts[:-1], starts[1:]):
-            target = ordered[first:last]
-            low, high = int(rows[target[0]]), int(rows[target[-1]])+1
-            local = store.read('xyz_local', low, high)[rows[target]-low]
-            world[target] = pose.to_world(local)
-            field = fields.get(int(scan)) if isinstance(fields, dict) else fields
-            if field and field in store.meta['arrays']:
-                values = store.read(field, low, high)[rows[target]-low]
-                values = np.asarray(values, np.float64)
-                times[target] = np.where(np.isfinite(values), values, np.nan)
+        world[ordered] = pose.to_world(store.read_rows('xyz_local', sorted_rows))
+        field = fields.get(int(scan)) if isinstance(fields, dict) else fields
+        if field and field in store.meta['arrays']:
+            values = np.asarray(store.read_rows(field, sorted_rows), np.float64)
+            times[ordered] = np.where(np.isfinite(values), values, np.nan)
     return world, times
 
 

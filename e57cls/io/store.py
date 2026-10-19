@@ -18,6 +18,13 @@ class ScanStore:
     directory: Path
     meta: dict
 
+    def _decode(self, values: np.ndarray, info: dict) -> np.ndarray:
+        """Decode stored values exactly as the sequential reader does."""
+        if info.get("encoding") == "raw":
+            return decode_raw(values, {"type": "ScaledInteger" if info.get("scale", 1) != 1 or info.get("offset", 0) != 0 else "Integer",
+                                       "scale": info.get("scale", 1), "offset": info.get("offset", 0)})
+        return values
+
     def read(self, key: str, start: int, stop: int) -> np.ndarray:
         if not 0 <= start <= stop <= self.meta["record_count"]:
             raise ValueError("Scan slice is outside the original record range")
@@ -27,10 +34,29 @@ class ScanStore:
             values = np.array(mapping[start:stop], copy=True)
         finally:
             mapping._mmap.close()
-        if info.get("encoding") == "raw":
-            return decode_raw(values, {"type": "ScaledInteger" if info.get("scale", 1) != 1 or info.get("offset", 0) != 0 else "Integer",
-                                       "scale": info.get("scale", 1), "offset": info.get("offset", 0)})
-        return values
+        return self._decode(values, info)
+
+    def read_rows(self, key: str, rows) -> np.ndarray:
+        """Read arbitrary original record rows while opening the array only once."""
+        rows = np.asarray(rows)
+        if rows.ndim != 1:
+            raise ValueError("Scan rows must be a one-dimensional integer array")
+        if rows.size:
+            if np.issubdtype(rows.dtype, np.bool_) or not np.issubdtype(rows.dtype, np.integer):
+                raise ValueError("Scan rows must be a one-dimensional integer array")
+            if np.any(rows < 0) or np.any(rows >= self.meta["record_count"]):
+                raise ValueError("Scan rows are outside the original record range")
+        rows = rows.astype(np.int64, copy=False)
+        info = self.meta["arrays"][key]
+        mapping = np.load(self.directory / info["path"], mmap_mode="r", allow_pickle=False)
+        try:
+            values = np.empty((len(rows), *mapping.shape[1:]), dtype=mapping.dtype)
+            for start in range(0, len(rows), 5_000_000):
+                stop = min(start+5_000_000, len(rows))
+                values[start:stop] = mapping[rows[start:stop]]
+        finally:
+            mapping._mmap.close()
+        return self._decode(values, info)
 
     def read_raw(self, key: str, start: int, stop: int) -> np.ndarray:
         if not 0 <= start <= stop <= self.meta["record_count"]:
@@ -79,6 +105,9 @@ class ReducedStore:
 
     def read(self, key: str, start: int, stop: int) -> np.ndarray:
         return self.store.read(key, start, stop)
+
+    def read_rows(self, key: str, rows) -> np.ndarray:
+        return self.store.read_rows(key, rows)
 
     def read_raw(self, key: str, start: int, stop: int) -> np.ndarray:
         return self.store.read_raw(key, start, stop)

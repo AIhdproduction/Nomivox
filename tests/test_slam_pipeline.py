@@ -8,7 +8,8 @@ import pytest
 
 from e57cls.io.reader import E57Reader
 from e57cls.pipeline.config import resolve_config
-from e57cls.geometry.cameras import Camera, Pose
+from e57cls.geometry.cameras import Camera, Pose, scan_pose
+from e57cls.io.store import ScanStore
 from e57cls.pipeline import run as run_module
 from e57cls.pipeline.run import _slam_scene, execute
 from e57cls.seg.cache import resize_mask_nearest
@@ -73,6 +74,60 @@ def _classify(tmp_path, source, *, name="run", **overrides):
 def _expected_labels(points):
     codes = {"wall": 100, "ceiling": 101, "floor": 102, "box": 76}
     return np.asarray([codes[label] for label in room_labels(points)], np.uint8)
+
+
+def _slam_value_store(path, scan_index, xyz, times, translation):
+    path.mkdir()
+    np.save(path/'xyz.npy', xyz)
+    np.save(path/'time.npy', times)
+    pose = {'rotation': {'w': 1., 'x': 0., 'y': 0., 'z': 0.},
+            'translation': dict(zip('xyz', translation))}
+    return ScanStore(path, {'record_count': len(xyz), 'valid_count': len(xyz), 'scan_index': scan_index,
+                            'arrays': {'xyz_local': {'path': 'xyz.npy'}, 'timeStamp': {'path': 'time.npy'}},
+                            'metadata': {'pose': pose, 'points': {'fields': {}}}})
+
+
+def _old_slam_point_values(stores, point_ids, fields=None):
+    point_ids = np.asarray(point_ids, np.int64)
+    world = np.empty((len(point_ids), 3), np.float64)
+    times = np.full(len(point_ids), np.nan, np.float64)
+    by_scan = {store.meta['scan_index']: store for store in stores}
+    scans = point_ids >> 48
+    rows = point_ids & ((1 << 48)-1)
+    for scan in np.unique(scans):
+        ids = np.flatnonzero(scans == scan)
+        store = by_scan[int(scan)]
+        ordered = ids[np.argsort(rows[ids], kind='stable')]
+        sorted_rows = rows[ordered]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_rows) != 1)+1, len(ordered)]
+        pose = scan_pose(store.meta['metadata'])
+        for first, last in zip(starts[:-1], starts[1:]):
+            target = ordered[first:last]
+            low, high = int(rows[target[0]]), int(rows[target[-1]])+1
+            world[target] = pose.to_world(store.read('xyz_local', low, high)[rows[target]-low])
+            field = fields.get(int(scan)) if isinstance(fields, dict) else fields
+            if field and field in store.meta['arrays']:
+                values = np.asarray(store.read(field, low, high)[rows[target]-low], np.float64)
+                times[target] = np.where(np.isfinite(values), values, np.nan)
+    return world, times
+
+
+def test_slam_point_values_matches_run_reference_for_scattered_rows_and_times(tmp_path):
+    rng = np.random.default_rng(907)
+    stores = []
+    for scan, translation in ((1, (10., -2., .5)), (2, (-3., 4., 1.))):
+        xyz = rng.normal(size=(500, 3)).astype(np.float64)
+        times = rng.normal(size=500).astype(np.float64)
+        times[::31] = np.nan
+        stores.append(_slam_value_store(tmp_path/f'scan_{scan}', scan, xyz, times, translation))
+    point_ids = np.concatenate([(np.int64(scan) << 48) | rng.integers(0, 500, 800, dtype=np.int64)
+                                for scan in (1, 2)])
+    rng.shuffle(point_ids)
+    fields = {1: 'timeStamp', 2: 'timeStamp'}
+    expected = _old_slam_point_values(stores, point_ids, fields)
+    actual = run_module._slam_point_values(stores, point_ids, fields)
+    np.testing.assert_array_equal(actual[0].view(np.uint8), expected[0].view(np.uint8))
+    np.testing.assert_equal(actual[1], expected[1])
 
 
 @pytest.mark.parametrize("pinhole", [True, False])

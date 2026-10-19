@@ -107,6 +107,19 @@ def test_spherical_source_keeps_float64_coordinates(tmp_path):
     assert 'encoding' not in store.meta['arrays']['xyz_local']
 
 
+@pytest.mark.parametrize('spherical', [False, True])
+def test_read_rows_matches_individual_read_slices_for_all_store_encodings(tmp_path, spherical):
+    source = tmp_path / 'rows.e57'
+    _write_scaled_fixture(source, spherical=spherical)
+    store = load_scan(Path(build_store(source, tmp_path / 'cache', 3)['scans'][0]['path']))
+    rows = np.array([6, 2, 3, 0, 6, 1, 4], np.int64)
+    for key in store.meta['arrays']:
+        expected = np.concatenate([store.read(key, int(row), int(row)+1) for row in rows])
+        actual = store.read_rows(key, rows)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(store.read_rows(key, np.array([], np.int64)), store.read(key, 0, 0))
+
+
 def test_full_accounting_preservation_and_resume(source, tmp_path):
     report = build_store(source, tmp_path / "cache", 4)
     assert (report["record_count"], report["valid_count"], report["invalid_count"]) == (11, 10, 1)

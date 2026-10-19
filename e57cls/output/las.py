@@ -8,7 +8,7 @@ import laspy
 from laspy.vlrs.known import WktCoordinateSystemVlr
 import numpy as np
 
-from e57cls.geometry.cameras import Pose
+from e57cls.geometry.cameras import scan_pose
 from e57cls.output.classify import ClassPointIndex as SharedClassPointIndex, ClassifiedSource, output_chunks, selected_count
 from e57cls.vote.engine import voxel_keys
 
@@ -30,7 +30,7 @@ def make_header(stores, crs_wkt="", scale=.001, station_ids=False, station_count
         bounds = store.meta["bounds_local"]
         if bounds:
             box = np.array(list(product(*zip(bounds["min"], bounds["max"]))))
-            corners.append(Pose.from_dict(store.meta["metadata"]["pose"]).to_world(box))
+            corners.append(scan_pose(store.meta["metadata"]).to_world(box))
     if corners:
         all_corners = np.concatenate(corners)
         low, high = all_corners.min(axis=0), all_corners.max(axis=0)
@@ -89,7 +89,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]
-                pose = Pose.from_dict(meta["pose"])
+                pose = scan_pose(meta)
                 for start, xyz, valid in output_chunks(store, output_density):
                     checkpoint()
                     stop = start+len(xyz)

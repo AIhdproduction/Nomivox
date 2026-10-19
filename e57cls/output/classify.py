@@ -11,7 +11,7 @@ import numpy as np
 import psutil
 from scipy.spatial import cKDTree
 
-from e57cls.geometry.cameras import Pose
+from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import PlaneIndex
 from e57cls.vote.engine import voxel_keys
 from e57cls.vote.geometry_rules import TerrainIndex
@@ -21,7 +21,7 @@ def classify_points(store, start, stop, xyz, valid, votes, origin, voxel_size,
                     skipped=(), mirror=None, world=None):
     """Classify the valid rows of one source block without transferring labels."""
     if world is None:
-        world = Pose.from_dict(store.meta["metadata"]["pose"]).to_world(xyz[valid])
+        world = scan_pose(store.meta["metadata"]).to_world(xyz[valid])
     codes, confidence = votes.lookup(voxel_keys(world, origin, voxel_size))
     if store.meta["scan_index"] in skipped:
         codes[:] = 1
@@ -484,8 +484,7 @@ class ClassifiedSource:
                 ids = np.flatnonzero(stations == station)
                 distances[ids] = np.sqrt(((world[ids, None, :]-positions[None, :, :])**2).sum(axis=2).min(axis=1))
         else:
-            translation = store.meta['metadata']['pose']['translation']
-            position = np.asarray([translation[key] for key in 'xyz'], np.float64)
+            position = scan_pose(store.meta['metadata']).translation
             distances = np.linalg.norm(world-position, axis=1)
         radii = np.full(len(world), self.radius, np.float64)
         known = np.isfinite(distances)
@@ -496,7 +495,7 @@ class ClassifiedSource:
         stop = start+len(xyz)
         if self.index is not None and density == 'reduced':
             maps = self.predictions[store.meta['scan_index']]
-            world = Pose.from_dict(store.meta['metadata']['pose']).to_world(xyz[valid]) if world is None else world
+            world = scan_pose(store.meta['metadata']).to_world(xyz[valid]) if world is None else world
             codes, confidence, states = (np.array(mapping[start:stop][valid], copy=True) for mapping in maps)
         else:
             started = time.perf_counter()

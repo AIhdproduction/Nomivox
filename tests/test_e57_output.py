@@ -8,6 +8,7 @@ from e57cls.output.e57 import write_e57
 from e57cls.output.las import write_cloud
 from test_inspector import source
 from test_pipeline import small_project
+from slam_fixtures import write_slam_e57
 
 
 def test_e57_roundtrip_preserves_rgb_pose_and_nomivox_classification(source, tmp_path):
@@ -39,6 +40,20 @@ def test_e57_roundtrip_copies_image_blobs_and_association(tmp_path):
         new = after.root['images2D'][0]
         assert new['associatedData3DGuid'].value() == old['associatedData3DGuid'].value()
         assert new['sphericalRepresentation']['pngImage'].byteCount() == old['sphericalRepresentation']['pngImage'].byteCount()
+
+
+def test_e57_output_preserves_missing_scan_pose(tmp_path):
+    source_path = write_slam_e57(tmp_path/'without-pose.e57', without_pose=True)
+    report = build_store(source_path, tmp_path/'cache')
+    stores = [load_scan(Path(item['path']), report['source_sha256']) for item in report['scans']]
+
+    class Votes:
+        def lookup(self, keys):
+            return np.full(len(keys), 1, np.uint8), np.zeros(len(keys), np.uint8)
+
+    write_e57(tmp_path/'classified.e57', source_path, stores, Votes(), np.zeros(3), .02, [1])
+    with E57Reader(tmp_path/'classified.e57') as reader:
+        assert not reader.root['data3D'][0].isDefined('pose')
 
 
 def test_e57_and_las_share_transfer_and_mirror_results(source, tmp_path):

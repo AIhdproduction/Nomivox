@@ -57,6 +57,8 @@ def _bounds(scan):
 
 
 def _identity_pose(pose):
+    if pose is None:
+        return True
     try:
         rotation = np.array([pose["rotation"][axis] for axis in ("w", "x", "y", "z")], np.float64)
         translation = _translation(pose["translation"])
@@ -112,7 +114,7 @@ def detect_input_mode(inspection, config, points_check=None):
     c_matches = []
     for scan in scans:
         box = _bounds(scan)
-        if not box or not _identity_pose(scan.get("metadata", {}).get("pose", {})):
+        if not box or not _identity_pose(scan.get("metadata", {}).get("pose")):
             continue
         low, high = box
         span = float(np.max(high-low))
@@ -121,6 +123,10 @@ def detect_input_mode(inspection, config, points_check=None):
             c_matches.append({"scan": scan.get("index"), "span_m": span, "image_poses_inside": inside})
     rules.append(_rule("c", c_matches, {"span_m": 30, "image_poses_inside": 2}, bool(c_matches),
                        "Identity-Blockpose mit grosser Ausdehnung und Kameraposen innerhalb der Blockgrenzen"))
+
+    without_origin = [scan.get("index") for scan in scans if scan.get("metadata", {}).get("pose") is None]
+    rules.append(_rule("e", without_origin, 1, bool(without_origin),
+                       "Datenblock ohne Scannerposition"))
 
     if points_check is not None:
         checked = points_check(inspection)
@@ -158,10 +164,17 @@ def pseudo_setup_points_check(stores, inspection=None, sample_limit=200_000, wid
     the SLAM view setting ``slam_splat_max_px`` is not part of this check.
     """
     # Imported here to keep inspector -> input_mode -> camera metadata imports acyclic.
-    from e57cls.geometry.cameras import Pose
+    from e57cls.geometry.cameras import has_scan_origin, scan_pose
     from e57cls.slam.visibility import origin_depth_width, visibility_from_origin
     results = []
+    without_origin = []
     for store in stores:
+        metadata = store.meta.get("metadata", {})
+        if not has_scan_origin(metadata):
+            if metadata.get("pose") is not None:
+                scan_pose(metadata)
+            without_origin.append(store.meta.get("scan_index"))
+            continue
         count = int(store.meta.get("valid_count", 0))
         if not count:
             continue
@@ -177,7 +190,7 @@ def pseudo_setup_points_check(stores, inspection=None, sample_limit=200_000, wid
         points = np.concatenate(samples)
         if len(points) > sample_limit:
             points = points[:sample_limit]
-        pose = Pose.from_dict(store.meta["metadata"]["pose"])
+        pose = scan_pose(metadata)
         world = pose.to_world(points)
         valid = np.isfinite(world).all(axis=1)
         world = world[valid]
@@ -192,6 +205,9 @@ def pseudo_setup_points_check(stores, inspection=None, sample_limit=200_000, wid
         share = float(visible.mean())
         results.append({"scan": store.meta.get("scan_index"), "sampled_points": len(world),
                         "depth_width": depth_width, "visible_share": share})
+    if without_origin:
+        return {"value": "nicht anwendbar", "hit": False,
+                "detail": "Nicht anwendbar: Datenblock ohne Scannerposition."}
     hit = any(item["visible_share"] < .60 for item in results)
     return {"value": results, "hit": hit,
             "detail": "Tiefentest vom Block-Ursprung: auf Stichprobengrösse skalierte Tiefenkarte (7 Pixel je Punkt), 1-Pixel-Footprint; sichtbarer Anteil eigener Punkte unter 60 %"}

@@ -13,6 +13,7 @@ from scipy.ndimage import minimum_filter
 from scipy.spatial import cKDTree
 
 from e57cls.files import atomic_json, atomic_text
+from e57cls.geometry.cameras import scan_origin
 
 
 DISTANCE_BANDS = ((0., 5.), (5., 10.), (10., 15.), (15., 20.), (20., 30.), (30., None))
@@ -50,11 +51,9 @@ def _scene_data(run: Path):
     scenes = {int(item['scan']): item.get('scene', 'unknown') for item in report.get('scans', []) if 'scan' in item}
     positions = {}
     for item in inspection.get('scans', []):
-        try:
-            translation = item['metadata']['pose']['translation']
-            positions[int(item['index'])] = np.array([translation[key] for key in 'xyz'], np.float64)
-        except (KeyError, TypeError, ValueError):
-            continue
+        position = scan_origin(item.get('metadata', {}))
+        if position is not None:
+            positions[int(item['index'])] = position
     return scenes, {scan: position for scan, position in positions.items() if str(scan) in scan_index}
 
 

@@ -12,7 +12,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from e57cls.files import atomic_json, file_hash
-from e57cls.geometry.cameras import Pose
+from e57cls.geometry.cameras import scan_pose
 
 
 def connect(path):
@@ -51,7 +51,7 @@ def representatives(store, directory: Path, origin, size, checkpoint=lambda: Non
     try:
         db.execute("DROP TABLE IF EXISTS reps")
         db.execute("CREATE TABLE reps (key BLOB PRIMARY KEY, x REAL, y REAL, z REAL) WITHOUT ROWID")
-        pose = Pose.from_dict(store.meta["metadata"]["pose"])
+        pose = scan_pose(store.meta["metadata"])
         for _, xyz, valid in store.chunks():
             checkpoint()
             world = pose.to_world(xyz[valid])

@@ -5,7 +5,17 @@ import math
 
 import numpy as np
 
-from e57cls.io.inspector import pose_status
+
+def _pose_status(pose: dict | None) -> str:
+    """Validate one E57 pose without assigning semantics to a missing pose."""
+    if not pose:
+        return "missing"
+    try:
+        q = np.array([pose["rotation"][key] for key in ("w", "x", "y", "z")], np.float64)
+        t = np.array([pose["translation"][key] for key in "xyz"], np.float64)
+    except (KeyError, TypeError, ValueError):
+        return "invalid"
+    return "valid" if np.isfinite(t).all() and np.isfinite(q).all() and abs(np.linalg.norm(q)-1) < 1e-6 else "invalid"
 
 
 @dataclass(frozen=True)
@@ -15,7 +25,7 @@ class Pose:
 
     @classmethod
     def from_dict(cls, value: dict):
-        if pose_status(value) != "valid":
+        if _pose_status(value) != "valid":
             raise ValueError("A finite unit-quaternion pose is required")
         w, x, y, z = (value["rotation"][k] for k in ("w", "x", "y", "z"))
         matrix = np.array([[1-2*y*y-2*z*z, 2*x*y-2*z*w, 2*x*z+2*y*w],
@@ -28,6 +38,39 @@ class Pose:
 
     def from_world(self, world):
         return (np.asarray(world, np.float64) - self.translation) @ self.rotation
+
+
+def has_scan_origin(metadata: dict) -> bool:
+    """Whether an E57 data3D block declares a valid scanner origin."""
+    return scan_origin(metadata) is not None
+
+
+def scan_origin(metadata: dict) -> np.ndarray | None:
+    """Return the declared scanner position, independently of orientation.
+
+    Some existing inspection reports retain only ``pose.translation``.  That
+    is sufficient for distance reporting, but not for transforming points, so
+    ``scan_pose`` deliberately remains stricter.
+    """
+    try:
+        origin = np.asarray([metadata["pose"]["translation"][key] for key in "xyz"], np.float64)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return origin if np.isfinite(origin).all() else None
+
+
+def scan_pose(metadata: dict) -> Pose:
+    """Return a scan transform, using E57's implicit identity for no pose.
+
+    A missing ``data3D.pose`` means that its point coordinates are already in
+    file/world coordinates. It deliberately does not imply a scanner origin.
+    """
+    if not isinstance(metadata, dict):
+        raise ValueError("Scan metadata must be a dictionary")
+    value = metadata.get("pose")
+    if value is None:
+        return Pose(np.eye(3, dtype=np.float64), np.zeros(3, np.float64))
+    return Pose.from_dict(value)
 
 
 def scan_to_camera(local, scan: Pose, camera: Pose):

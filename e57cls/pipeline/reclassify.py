@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from e57cls.files import atomic_json, new_output
+from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
 from e57cls.io.store import load_scan, reduced_store
@@ -247,13 +248,16 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
                                        for store in stores}
             existing = {scan: path for scan, path in representatives_by_scan.items() if path.is_file()}
             votes.rebuild_scan_observations(existing)
+        inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
+        scanner_heights = ([camera.pose.translation[2] for camera in build_camera_list(inspect)]
+                           if input_mode['mode'] == 'slam'
+                           else [scan_pose(store.meta['metadata']).translation[2] for store in stores])
         scan_context = geometry_scan_context(preset, config, scan_scenes)
         stages, planes, terrain = _postprocess(votes, config, by_id,
-            [store.meta['metadata']['pose']['translation']['z'] for store in stores], copied_votes.parent,
+            scanner_heights, copied_votes.parent,
             {row['code'] for row in rows}, scan_context)
         if station_tracking:
             votes.finalize_station_ids()
-        inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
         writer = write_e57 if config['format'] == 'e57' else write_cloud
         mirror = _StoredMirrorStates(vote_directory/'mirrors') if manifest.get('mirror_analysis') else None
         transfer_station_positions = None

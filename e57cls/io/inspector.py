@@ -12,6 +12,7 @@ import numpy as np
 from PIL import ImageFile
 
 from e57cls.files import atomic_json, atomic_text, new_output
+from e57cls.geometry.cameras import scan_pose
 from e57cls.io.reader import E57Reader, metadata
 from e57cls.io.input_mode import detect_input_mode
 
@@ -152,9 +153,9 @@ def inspect_file(source: Path, sample_points: int = 100_000, config: dict | None
                 image.update(association_status="explicit_guid", scan_index=scan["index"])
                 scan["image_indices"].append(index + 1)
                 if pose_status(item.get("pose")) == "valid" and scan["pose_status"] == "valid":
-                    a = scan["metadata"]["pose"]["translation"]
+                    a = scan_pose(scan["metadata"]).translation
                     b = item["pose"]["translation"]
-                    image["camera_scanner_offset_m"] = math.sqrt(sum((a[k] - b[k]) ** 2 for k in "xyz"))
+                    image["camera_scanner_offset_m"] = math.sqrt(sum((a[index] - b[key]) ** 2 for index, key in enumerate("xyz")))
                     usable = []
                     required = {"sphericalRepresentation": ("pixelWidth", "pixelHeight"),
                                 "pinholeRepresentation": ("pixelWidth", "pixelHeight", "focalLength", "principalPointX", "principalPointY"),

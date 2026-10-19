@@ -89,6 +89,24 @@ def test_slam_pipeline_transfers_visible_labels_and_writes_station_id(tmp_path):
     assert any(item["code"] == "slam_reflection_disabled" for item in report["warnings"])
 
 
+def test_slam_pipeline_without_scan_pose_uses_world_coordinates(tmp_path):
+    source = write_slam_e57(tmp_path / "room-without-pose.e57", camera_count=6, labelled_images=True,
+                            pinhole=True, without_pose=True)
+    report, cloud = _classify(tmp_path, source)
+    identity_source = write_slam_e57(tmp_path / "room-with-identity-pose.e57", camera_count=6,
+                                     labelled_images=True, pinhole=True)
+    _, identity_cloud = _classify(tmp_path, identity_source, name="identity")
+    inspection = json.loads((tmp_path / "run" / "inspect_report.json").read_text(encoding="utf-8"))
+    assert inspection["input_mode"]["mode"] == "slam"
+    assert next(item for item in inspection["input_mode"]["rules"] if item["id"] == "e")["hit"]
+    expected = _expected_labels(np.column_stack((cloud.x, cloud.y, cloud.z)))
+    observed = (expected == 100) & (np.asarray(cloud.station_id) >= 1)
+    assert observed.any()
+    assert (np.asarray(cloud.classification)[observed] == 100).mean() >= .90
+    assert np.array_equal(np.asarray(cloud.classification), np.asarray(identity_cloud.classification))
+    assert report["output"]["record_count"] == len(cloud.x)
+
+
 def test_slam_occlusion_prevents_hidden_wall_votes(tmp_path):
     source = write_slam_e57(tmp_path / "occlusion.e57", camera_count=1, labelled_images=True, pinhole=True)
     config = _config(tmp_path, source, output=tmp_path / "out", cache=tmp_path / "cache",

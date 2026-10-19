@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw
 from scipy.ndimage import binary_fill_holes, binary_erosion, label, distance_transform_edt
 from scipy.spatial import ConvexHull, QhullError, cKDTree
 from e57cls.files import atomic_json, file_hash
-from e57cls.geometry.cameras import Pose, plan_views
+from e57cls.geometry.cameras import Pose, plan_views, scan_pose
 from e57cls.geometry.images import render_view
 from e57cls.geometry.planes import fit_plane
 from e57cls.seg.backend import PromptClass
@@ -471,10 +471,10 @@ def _surface_fit_input(camera, mask, config):
 
 def _collect_surface_samples(store, camera, pose, states, control):
     """Collect all mask-type reservoirs during one ordered store traversal."""
-    scan_pose = Pose.from_dict(store.meta['metadata']['pose'])
+    scan_transform = scan_pose(store.meta['metadata'])
     for _,xyz,valid in store.chunks():
         control.checkpoint()
-        world = scan_pose.to_world(xyz[valid])
+        world = scan_transform.to_world(xyz[valid])
         for state in states:
             values = np.concatenate((state['depth_samples'],world))
             keys = np.r_[state['depth_priorities'],state['depth_rng'].random(len(world))]
@@ -507,7 +507,7 @@ def fit_surfaces(store,camera,pose,mask,config,control,_allow_expand=True,kind=N
     if _prepared is None:
         _collect_surface_samples(store, camera, pose, [prepared], control)
     samples, depth_samples = prepared['samples'], prepared['depth_samples']
-    scan_pose = Pose.from_dict(store.meta['metadata']['pose'])
+    scan_transform = scan_pose(store.meta['metadata'])
     planes,details = {},[]
     for region in regions:
         selected = samples[region]
@@ -519,7 +519,7 @@ def fit_surfaces(store,camera,pose,mask,config,control,_allow_expand=True,kind=N
         if fit is None or fit['residual_p95']>config['mirror_fit_tolerance'] or len(fit['points'])<30:
             detail['reason']='insufficient_frame_plane'
             continue
-        if (scan_pose.translation-fit['center'])@fit['normal']<0:
+        if (scan_transform.translation-fit['center'])@fit['normal']<0:
             fit['normal'] *= -1
         region_mask = labels == region
         by,bx = np.nonzero(region_mask & ~binary_erosion(region_mask))
@@ -574,10 +574,10 @@ def fit_surfaces(store,camera,pose,mask,config,control,_allow_expand=True,kind=N
                     detail.update(shape='rejected:degenerate')
                 else:
                     if shape['kind'] == 'rectangle':
-                        shape,edge_shift = _refine_rectangle(shape,depth_samples,scan_pose.translation,plane,
+                        shape,edge_shift = _refine_rectangle(shape,depth_samples,scan_transform.translation,plane,
                                                               config['mirror_plane_tolerance'],config['mirror_edge_search'],control)
                     else:
-                        shape,edge_shift = _refine_round(shape,depth_samples,scan_pose.translation,plane,
+                        shape,edge_shift = _refine_round(shape,depth_samples,scan_transform.translation,plane,
                                                           config['mirror_plane_tolerance'],config['mirror_edge_search'],control)
                     if not _valid_shape(shape,.02,.005):
                         detail.update(shape='rejected:degenerate')
@@ -642,7 +642,7 @@ def protect_direct_multiscan_points(analysis, stores, inspection, config, contro
     index_path.unlink(missing_ok=True)
     origin_value = config.get('voxel_origin')
     if origin_value is None:
-        origin_value = Pose.from_dict(stores[0].meta['metadata']['pose']).translation
+        origin_value = scan_pose(stores[0].meta['metadata']).translation
     origin = np.asarray(origin_value, np.float64)
     direct = DirectIndex(index_path, origin)
     retained = {store.meta['scan_index']: 0 for store in stores}
@@ -651,7 +651,7 @@ def protect_direct_multiscan_points(analysis, stores, inspection, config, contro
         # never used as confirmation for a different scan's candidate.
         for store in stores:
             scan = store.meta['scan_index']
-            pose = Pose.from_dict(store.meta['metadata']['pose'])
+            pose = scan_pose(store.meta['metadata'])
             states = np.load(analysis.paths[scan], mmap_mode='r', allow_pickle=False)
             try:
                 for start,xyz,valid in _state_chunks(store, config):
@@ -666,7 +666,7 @@ def protect_direct_multiscan_points(analysis, stores, inspection, config, contro
         # state of 3 is deliberately not exported as class 68.
         for store in stores:
             scan = store.meta['scan_index']
-            pose = Pose.from_dict(store.meta['metadata']['pose'])
+            pose = scan_pose(store.meta['metadata'])
             writable = np.load(analysis.paths[scan], mmap_mode='r+', allow_pickle=False)
             try:
                 for start,xyz,valid in _state_chunks(store, config):
@@ -820,7 +820,7 @@ def finalize_states(analysis, stores, inspection, config, control):
     atomic_json(analysis.directory/'registry.json',[p.serialize() for p in analysis.registry.planes])
     for number,store in enumerate(stores,1):
         scan = store.meta['scan_index']
-        pose = Pose.from_dict(store.meta['metadata']['pose'])
+        pose = scan_pose(store.meta['metadata'])
         path = analysis.directory/f'states_{scan:04d}.npy'
         temp = path.with_suffix('.partial.npy')
         out = np.lib.format.open_memmap(temp,mode='w+',dtype=np.uint8,shape=(store.meta['record_count'],))

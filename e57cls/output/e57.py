@@ -46,6 +46,8 @@ def _node(image, description, name):
 
 
 def _set_pose(image, parent, pose):
+    if pose is None:
+        return
     value = lib.StructureNode(image)
     rotation = lib.StructureNode(image)
     translation = lib.StructureNode(image)
@@ -112,7 +114,7 @@ def _scan_node(image, store, fields, coordinate_fields, bounds, station_ids=Fals
     node = lib.StructureNode(image)
     node.set("guid", lib.StringNode(image, meta.get("guid") or "{%s}" % uuid4()))
     node.set("name", lib.StringNode(image, meta.get("name") or f"Scan {store.meta['scan_index']}"))
-    _set_pose(image, node, meta["pose"])
+    _set_pose(image, node, meta.get("pose"))
     box = lib.StructureNode(image)
     for axis, low, high in zip("xyz", bounds[0], bounds[1]):
         box.set(axis+"Minimum", lib.FloatNode(image, float(low)))

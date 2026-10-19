@@ -10,7 +10,7 @@ from uuid import uuid4
 import numpy as np
 
 from e57cls.files import atomic_json
-from e57cls.geometry.cameras import Pose
+from e57cls.geometry.cameras import scan_pose
 
 
 _RECORD = np.dtype([("xyz", "<f8", (3,)), ("point_id", "<i8"), ("spacing", "<f4"), ("normal", "<f4", (3,))])
@@ -184,7 +184,7 @@ def build_spatial_index(stores, directory: Path, source_hash: str, tile_size=2.0
 
     def batches():
         for store in stores:
-            pose = Pose.from_dict(store.meta["metadata"]["pose"])
+            pose = scan_pose(store.meta["metadata"])
             for start, local, valid in store.full_chunks(capacity):
                 checkpoint()
                 # Keep record positions, not compacted ordinal positions.

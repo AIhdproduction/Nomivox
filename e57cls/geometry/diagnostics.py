@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from e57cls.files import atomic_json, atomic_text, file_hash, new_output
-from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_to_camera
+from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_pose, scan_to_camera
 from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.reference import project_point
 from e57cls.geometry.visibility import DepthBuffer
@@ -70,7 +70,7 @@ def diagnose(source: Path, inspection: Path, store_report: Path, output: Path,
                 continue
             try:
                 scan = report["scans"][scan_index-1]
-                scan_pose = Pose.from_dict(scan["metadata"]["pose"])
+                scan_transform = scan_pose(scan["metadata"])
                 camera_pose = Pose.from_dict(item["metadata"]["pose"])
                 kind = next(r for r in item["representations"] if r != "visualReferenceRepresentation")
                 params = item["metadata"][kind]
@@ -83,7 +83,7 @@ def diagnose(source: Path, inspection: Path, store_report: Path, output: Path,
                 inside = behind = total = 0
                 for _, xyz, valid in store.chunks():
                     xyz = xyz[valid]
-                    transformed = scan_to_camera(xyz, scan_pose, camera_pose)
+                    transformed = scan_to_camera(xyz, scan_transform, camera_pose)
                     uv, depth, projected = camera.project(transformed)
                     buffer.add(uv*np.array([width/camera.width, height/camera.height]), depth, projected)
                     total += len(xyz)
@@ -95,9 +95,11 @@ def diagnose(source: Path, inspection: Path, store_report: Path, output: Path,
                 if not len(candidates):
                     raise ValueError("No valid points available for projection probes")
                 points = candidates[np.linspace(0, len(candidates)-1, min(200, len(candidates)), dtype=int)]
-                cam_points = scan_to_camera(points, scan_pose, camera_pose)
+                cam_points = scan_to_camera(points, scan_transform, camera_pose)
                 production, probe_depth, _ = camera.project(cam_points)
-                reference = np.array([project_point(p, scan["metadata"]["pose"], item["metadata"]["pose"], kind, params) for p in points])
+                reference_scan_pose = scan["metadata"].get("pose") or {"rotation": {"w": 1., "x": 0., "y": 0., "z": 0.},
+                                                                         "translation": {"x": 0., "y": 0., "z": 0.}}
+                reference = np.array([project_point(p, reference_scan_pose, item["metadata"]["pose"], kind, params) for p in points])
                 delta = np.abs(production-reference)
                 if camera.wraps:
                     delta[:, 0] = np.minimum(delta[:, 0], camera.width-delta[:, 0])

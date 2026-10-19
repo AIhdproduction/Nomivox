@@ -139,24 +139,23 @@ def _room_points(timestamps=False):
     return values
 
 
-def _write_timed_scan(writer, data):
-    """Write the small fixture scan with E57's optional per-point time field."""
+def _write_scan(writer, data, with_pose=True):
+    """Write the small fixture scan and optionally omit the data3D pose."""
     image = writer.image_file
     points = np.column_stack((data["cartesianX"], data["cartesianY"], data["cartesianZ"]))
     node = lib.StructureNode(image)
     writer.root["data3D"].append(node)
     node.set("guid", lib.StringNode(image, "{%s}" % uuid4()))
     node.set("name", lib.StringNode(image, "mobile-room"))
-    pose = _pose(image, (0., 0., 0.))
-    node.set("pose", pose)
+    if with_pose:
+        node.set("pose", _pose(image, (0., 0., 0.)))
     bounds = lib.StructureNode(image)
     for axis, low, high in zip("xyz", points.min(axis=0), points.max(axis=0)):
         bounds.set(axis+"Minimum", lib.FloatNode(image, float(low)))
         bounds.set(axis+"Maximum", lib.FloatNode(image, float(high)))
     node.set("cartesianBounds", bounds)
     prototype = lib.StructureNode(image)
-    for name, values in (("cartesianX", data["cartesianX"]), ("cartesianY", data["cartesianY"]),
-                         ("cartesianZ", data["cartesianZ"]), ("timeStamp", data["timeStamp"])):
+    for name, values in data.items():
         prototype.set(name, lib.FloatNode(image, float(values.mean()), lib.E57_DOUBLE,
                                           float(values.min()), float(values.max())))
     vector = lib.CompressedVectorNode(image, prototype, lib.VectorNode(image, True))
@@ -172,14 +171,15 @@ def _write_timed_scan(writer, data):
         stream.close()
 
 
-def write_slam_e57(path, associated=False, camera_count=50, timestamps=False, labelled_images=False, pinhole=False):
-    """Write one identity block and a configurable posed camera trajectory."""
+def write_slam_e57(path, associated=False, camera_count=50, timestamps=False, labelled_images=False, pinhole=False,
+                   without_pose=False):
+    """Write one mobile block and a configurable posed camera trajectory."""
     writer = pye57.E57(str(path), "w")
     points = _room_points(timestamps)
-    if timestamps:
-        _write_timed_scan(writer, points)
-    else:
-        writer.write_scan_raw(points, name="mobile-room", translation=np.zeros(3))
+    # Keep the encoded point payload identical for the identity-pose and
+    # missing-pose variants.  The fixtures must isolate pose semantics rather
+    # than test incidental differences between two writer implementations.
+    _write_scan(writer, points, with_pose=not without_pose)
     guid = writer.data3d[0]["guid"].value() if associated else None
     for index, x in enumerate(np.linspace(-5., 5., camera_count), 1):
         _image(writer, index, (x, 0., .6), guid, timestamp=0. if timestamps else None,

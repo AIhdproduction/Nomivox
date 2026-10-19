@@ -2,7 +2,7 @@
 from dataclasses import asdict
 from importlib.metadata import version
 import numpy as np
-from e57cls.geometry.cameras import Pose, View
+from e57cls.geometry.cameras import Pose, View, scan_pose
 from e57cls.geometry.images import render_view
 from e57cls.geometry.planes import fit_plane
 from e57cls.seg.backend import PromptClass
@@ -28,7 +28,7 @@ def decide(metrics, config):
 
 def detect(reader, store, inspection, config, image_cache, mask_cache, model_hash, factory, control, preset, assets, depth_builder):
     scan = store.meta['scan_index']
-    scan_pose = Pose.from_dict(store.meta['metadata']['pose'])
+    scan_transform = scan_pose(store.meta['metadata'])
     # Equal-area upper-hemisphere rays in world axes, 8192 samples.
     azimuth, z = np.meshgrid(np.linspace(-np.pi, np.pi, 128, endpoint=False), (np.arange(64)+.5)/64)
     rays = np.column_stack((np.sqrt(1-z.ravel()**2)*np.cos(azimuth.ravel()),
@@ -47,7 +47,7 @@ def detect(reader, store, inspection, config, image_cache, mask_cache, model_has
         pose = Pose.from_dict(item['metadata']['pose'])
         camera_rays = rays@pose.rotation
         uv, _, in_image = camera.project(camera_rays)
-        depth = depth_builder(store, scan_pose, pose, camera, 512, control)
+        depth = depth_builder(store, scan_transform, pose, camera, 512, control)
         pixel = np.floor(uv*np.array([depth.width/camera.width, depth.height/camera.height])).astype(int)
         ids = np.flatnonzero(in_image)
         pixel[:, 0] = pixel[:, 0].clip(0, depth.width-1)
@@ -84,7 +84,7 @@ def detect(reader, store, inspection, config, image_cache, mask_cache, model_has
     for start, xyz, valid in store.chunks():
         control.checkpoint()
         selected = valid & ((np.arange(start, start+len(xyz)) % stride) == 0)
-        world = scan_pose.to_world(xyz[selected])-scan_pose.translation
+        world = scan_transform.to_world(xyz[selected])-scan_transform.translation
         overhead.append(world[(world[:,2] > .5) & (world[:,2] <= config['scene_overhead_range'])])
     plane = fit_plane(np.concatenate(overhead) if overhead else np.empty((0,3)), config['scene_plane_tolerance'],
                       config['seed'], min_fraction=config['scene_plane_fraction'], horizontal=True)

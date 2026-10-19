@@ -17,7 +17,7 @@ import psutil
 from scipy.ndimage import label, maximum_filter, minimum_filter
 
 from e57cls.files import atomic_json, atomic_text, file_hash
-from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_to_camera
+from e57cls.geometry.cameras import Camera, Pose, plan_views, scan_pose, scan_to_camera
 from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
@@ -400,7 +400,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
     by_id = {c["id"]: i for i,c in enumerate(all_classes)}
     global_columns = np.array([by_id[c["id"]] for c in classes])
     prompts = prompt_classes(classes, config)
-    scan_pose = Pose.from_dict(store.meta["metadata"]["pose"])
+    scan_transform = scan_pose(store.meta["metadata"])
     stats = {"hits": 0, "misses": 0, "views": 0, "representatives": count,
              "depth_gate": {'components': 0, 'rejected_representatives': 0, 'seconds': 0.}}
     rep_states = None
@@ -409,7 +409,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
             rep_states = np.lib.format.open_memmap(work/f'scan_{scan:04d}'/'mirror_rep.npy', mode='w+', dtype=np.uint8, shape=(count,))
             for start in range(0,count,50000):
                 control.checkpoint()
-                rep_states[start:start+50000] = mirrors.states(reps['xyz'][start:start+50000],scan,scan_pose.translation,scan_meta['image_indices'])
+                rep_states[start:start+50000] = mirrors.states(reps['xyz'][start:start+50000],scan,scan_transform.translation,scan_meta['image_indices'])
         images = [inspection["images"][i-1] for i in scan_meta["image_indices"]]
         usable = [i for i in images if i["pose_status"] == "valid" and any(r != "visualReferenceRepresentation" for r in i["representations"])]
         if not usable:
@@ -417,7 +417,7 @@ def classify_scan(reader, store, inspection, config, work, image_cache, mask_cac
         for item in usable:
             camera, image, mask, image_hash, mask_hash = image_assets(reader, item, image_cache)
             camera_pose = Pose.from_dict(item["metadata"]["pose"])
-            depth_buffer = camera_depth(store, scan_pose, camera_pose, camera, config["depth_width"], control)
+            depth_buffer = camera_depth(store, scan_transform, camera_pose, camera, config["depth_width"], control)
             projection = ImageProjectionCache(work/f"scan_{scan:04d}", item["index"], count)
             camera_points = camera_uv = camera_range = camera_valid = visible = uv = projected = None
             try:
@@ -534,7 +534,7 @@ def _slam_point_values(stores, point_ids, fields=None):
         ordered = ids[np.argsort(rows[ids], kind='stable')]
         sorted_rows = rows[ordered]
         starts = np.r_[0, np.flatnonzero(np.diff(sorted_rows) != 1)+1, len(ordered)]
-        pose = Pose.from_dict(store.meta['metadata']['pose'])
+        pose = scan_pose(store.meta['metadata'])
         for first, last in zip(starts[:-1], starts[1:]):
             target = ordered[first:last]
             low, high = int(rows[target[0]]), int(rows[target[-1]])+1
@@ -650,6 +650,17 @@ def _slam_scene(config, preset, cameras, image_by_index, reader, index, stores, 
                    'method': 'sky masks plus visible points above cameras; no upper-hemisphere return rule'}
 
 
+def _slam_voxel_origin(cameras, stores):
+    """Choose a nearby world-space origin without assuming a scanner origin."""
+    if cameras:
+        return cameras[0].pose.translation.tolist()
+    for store in stores:
+        bounds = store.meta.get('bounds_local')
+        if bounds and all(axis in bounds for axis in ('min', 'max')):
+            return np.asarray(bounds['min'], np.float64).tolist()
+    return scan_pose(stores[0].meta['metadata']).translation.tolist()
+
+
 def execute_slam(config, source, output, cache, inspection, store_report, stores, factory, control, started):
     """Run the mobile path without changing the static TLS processing path."""
     preset = json.loads(Path(config['preset']).read_text(encoding='utf-8'))
@@ -667,7 +678,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         raise InputNotClassifiable('No decodable SLAM camera with a valid pose and camera model')
     stations, membership, ordering = cluster_stations(cameras, config['slam_station_spacing'])
     reflection_masks_requested = bool(config['mirror_analysis'] or config['glass_analysis'])
-    config = {**config, 'voxel_origin': [stores[0].meta['metadata']['pose']['translation'][key] for key in 'xyz'],
+    config = {**config, 'voxel_origin': _slam_voxel_origin(cameras, stores),
               '_slam': True, '_shared_sam': False, 'mirror_analysis': False}
     model_hash, input_hash = file_hash(Path(config['model'])), store_report['source_sha256']
     identity = identity_hash({'pipeline_revision': 'slam-v1', 'source': input_hash, 'model': model_hash,
@@ -972,6 +983,11 @@ def execute(config, backend_factory=None, listen=True):
         atomic_text(output/"inspect_report.md", markdown(inspection))
         input_mode = inspection['input_mode']
         control.event("input_mode", **input_mode)
+        for scan in inspection['scans']:
+            if scan.get('pose_status') == 'invalid':
+                scan_pose(scan['metadata'])
+        if input_mode['mode'] == 'static' and any(scan.get('pose_status') == 'missing' for scan in inspection['scans']):
+            raise InputNotClassifiable('Datenblock ohne Scannerposition – bitte „Kinematisch (SLAM)“ wählen oder mit Pose exportieren.')
         eligible = (any(image.get('classification_eligible_slam') for image in inspection['images'])
                     if input_mode['mode'] == 'slam'
                     else any(scan['classification_eligible_metadata'] for scan in inspection['scans']))
@@ -1010,7 +1026,12 @@ def execute(config, backend_factory=None, listen=True):
         all_classes = [c for c in preset["classes"] if c.get("enabled", True)]
         if semantic_run and not all_classes:
             raise ValueError("No active classes")
-        config = {**config, "voxel_origin": [stores[0].meta["metadata"]["pose"]["translation"][k] for k in "xyz"]}
+        missing_origins = [store.meta['scan_index'] for store in stores if store.meta['metadata'].get('pose') is None]
+        if missing_origins:
+            raise InputNotClassifiable('Datenblock ohne Scannerposition – bitte „Kinematisch (SLAM)“ wählen oder mit Pose exportieren.')
+        for store in stores:
+            scan_pose(store.meta['metadata'])
+        config = {**config, "voxel_origin": scan_pose(stores[0].meta["metadata"]).translation.tolist()}
         model_hash = file_hash(Path(config["model"]))
         input_hash = store_report["source_sha256"]
         identity = identity_hash({"pipeline_revision": "shared-sam-v1", "source": input_hash, "model": model_hash, "preset": preset,
@@ -1272,7 +1293,7 @@ def execute(config, backend_factory=None, listen=True):
                     surface_tie_report = votes.resolve_surface_ties(
                         by_id, np.array(config['voxel_origin']), config['voxel_size'], config['surface_tie_share'],
                         config['surface_normal_radius'], config['min_observations'],
-                        [store.meta['metadata']['pose']['translation']['z'] for store in stores], control.checkpoint)
+                        [scan_pose(store.meta['metadata']).translation[2] for store in stores], control.checkpoint)
                     timings['surface_ties'] = time.monotonic()-tie_started
                 if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
                     barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]

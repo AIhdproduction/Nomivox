@@ -368,12 +368,13 @@ class ClassPointIndex:
             self._cache_bytes -= old[3]
         return cached
 
-    def nearest_codes(self, points, radius):
+    def nearest_codes(self, points, radius, return_distances=False):
         self._finalize()
         points = np.asarray(points, np.float64)
         result = np.zeros(len(points), np.uint8)
+        selected_distances = np.full(len(points), np.inf, np.float64)
         if not len(points):
-            return result
+            return (result, selected_distances) if return_distances else result
         roots = np.floor((points-self.origin)/self.block).astype(np.int64)
         tags = [self._tile_key(point, root) for point, root in zip(points, roots)]
         order = np.argsort(np.asarray([repr(tag) for tag in tags]), kind='stable')
@@ -390,6 +391,7 @@ class ClassPointIndex:
             valid = np.isfinite(distances[:, 0])
             if valid.any():
                 result[ids[valid]] = labels[local[valid, 0]]
+                selected_distances[ids[valid]] = distances[valid, 0]
             if count > 1:
                 tied = valid & np.isfinite(distances[:, 1]) & np.isclose(distances[:, 0], distances[:, 1], rtol=0, atol=1e-12)
                 for output_id, distance in zip(ids[tied], distances[tied, 0]):
@@ -399,7 +401,7 @@ class ClassPointIndex:
                         exact = candidates[np.isclose(np.sqrt(squared), distance, rtol=0, atol=1e-12)]
                         chosen = exact[np.argmin(ordinals[exact])]
                         result[output_id] = labels[chosen]
-        return result
+        return (result, selected_distances) if return_distances else result
 
     def close(self):
         if self._closed:
@@ -420,9 +422,15 @@ class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
                  geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
-                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None):
+                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None,
+                 class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
+        self.radius_max = float(radius if class_transfer_radius_max is None else class_transfer_radius_max)
+        self.range_factor = float(class_transfer_range_factor)
+        self.transfer_station_positions = {int(key): np.asarray(value, np.float64)
+                                           for key, value in (transfer_station_positions or {}).items()}
+        self.adaptive_transfer = bool(self.radius_max > self.radius and self.range_factor > 0.)
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
         self.geometry = PlaneIndex(geometry_planes) if geometry_planes else None
         self.terrain = TerrainIndex(terrain) if terrain else None
@@ -436,10 +444,10 @@ class ClassifiedSource:
         self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0., 'terrain_fill': 0.}
 
     def __enter__(self):
-        if not self.radius: return self
+        if not self.radius_max: return self
         try:
             self.temporary = tempfile.TemporaryDirectory(prefix='e57cls_class_neighbours_', dir=self.directory)
-            self.index = ClassPointIndex(Path(self.temporary.name)/'classes', self.origin, radius=self.radius, checkpoint=self.checkpoint)
+            self.index = ClassPointIndex(Path(self.temporary.name)/'classes', self.origin, radius=self.radius_max, checkpoint=self.checkpoint)
             total = max(1, sum(selected_count(store, 'reduced') for store in self.stores))
             prepared = 0
             for store in self.stores:
@@ -462,6 +470,28 @@ class ClassifiedSource:
             self.close()
             raise
 
+    def _transfer_radii(self, store, world):
+        """Return per-point transfer radii from the owning scanner or station."""
+        if not self.adaptive_transfer:
+            return np.full(len(world), self.radius, np.float64)
+        distances = np.full(len(world), np.nan, np.float64)
+        if self.transfer_station_positions:
+            stations = self.votes.lookup_station_ids(voxel_keys(world, self.origin, self.voxel_size))
+            for station in np.unique(stations):
+                positions = self.transfer_station_positions.get(int(station))
+                if positions is None or not len(positions):
+                    continue
+                ids = np.flatnonzero(stations == station)
+                distances[ids] = np.sqrt(((world[ids, None, :]-positions[None, :, :])**2).sum(axis=2).min(axis=1))
+        else:
+            translation = store.meta['metadata']['pose']['translation']
+            position = np.asarray([translation[key] for key in 'xyz'], np.float64)
+            distances = np.linalg.norm(world-position, axis=1)
+        radii = np.full(len(world), self.radius, np.float64)
+        known = np.isfinite(distances)
+        radii[known] = np.clip(self.range_factor*distances[known], self.radius, self.radius_max)
+        return radii
+
     def block(self, store, start, xyz, valid, density, world=None):
         stop = start+len(xyz)
         if self.index is not None and density == 'reduced':
@@ -474,7 +504,14 @@ class ClassifiedSource:
             self.timing_seconds['lookup_mirror'] += time.perf_counter()-started
         if self.index is not None:
             started = time.perf_counter()
-            unknown = codes == 1; inherited = self.index.nearest_codes(world[unknown], self.radius); assigned = inherited != 0
+            unknown = codes == 1
+            query_points = world[unknown]
+            if self.adaptive_transfer:
+                inherited, distances = self.index.nearest_codes(query_points, self.radius_max, return_distances=True)
+                assigned = (inherited != 0) & (distances <= self._transfer_radii(store, query_points))
+            else:
+                inherited = self.index.nearest_codes(query_points, self.radius)
+                assigned = inherited != 0
             ids = np.flatnonzero(unknown)[assigned]; codes[ids], confidence[ids] = inherited[assigned], np.maximum(confidence[ids], 128)
             self.class_transfer_count += len(ids)
             self.timing_seconds['transfer'] += time.perf_counter()-started

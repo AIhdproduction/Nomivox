@@ -139,6 +139,11 @@ The default voxel size is **2 cm**. Voxels combine classification evidence;
 the export contains the valid original points, not just voxel representatives.
 Stairs with at least **0.65 confidence** take priority over ground, floor, and
 ceiling in conflicting observations, including observations from different scans.
+Their vote share must also reach 25%. Post-processing preserves only geometrically
+stepped stair components, retains sparse semantic surfaces when their connected
+10 cm cell component is large enough, and expands direct class transfer from
+3 mm per metre of scanner distance up to 5 cm. A zero transfer range factor
+keeps the previous fixed-radius behaviour.
 
 Raw masks are cached. Changing prompts recomputes the affected classes. Changes
 to voting thresholds can reuse existing raw masks. If GPU memory runs out, the

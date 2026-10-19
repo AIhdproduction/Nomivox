@@ -1,5 +1,14 @@
 # Decisions
 
+- 2026-10-19: Stair labels require a stepped geometric profile: at least three
+  horizontal levels with a configured rise and tread. Small stair components
+  are restored rather than preserved, and levels matching a nearby floor are
+  returned to that floor. Cleanup retains sparse components when their shared
+  10 cm feature-cell component is sufficiently large; cable and electrical
+  rules keep their existing voxel/span behavior. Class transfer may grow with
+  distance to the source scanner (or observed SLAM station), while a zero
+  range factor preserves the historic fixed-radius result.
+
 - 2026-10-18: The previous no-extrapolation rule is lifted only for the
   class-2 terrain fill. An unclassified output point may become ground when
   the persisted DTM marks its cell as uncovered terrain and its height is

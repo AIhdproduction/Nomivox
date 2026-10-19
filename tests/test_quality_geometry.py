@@ -78,6 +78,23 @@ def test_geometry_fill_closes_small_hole_without_growing_forever(tmp_path):
         votes.close()
 
 
+def test_geometry_fill_closes_hole_in_thin_six_centimetre_wall(tmp_path):
+    wall = _grid((0, 0, 0), 1, 2, spacing=.06, hole=(.18, .58, .18, .58))
+    votes = _multi_class_votes(tmp_path/'thin-wall.sqlite', [(100, wall)])
+    try:
+        config = {**DEFAULTS, 'geometry_fill_classes': ['wall'], 'geometry_fill_min_area': .1,
+                  'geometry_fill_max_gap': .30, 'geometry_fill_tolerance': .03, 'seed': 42}
+        target = tmp_path/'thin-wall.npz'
+        extract_planes(votes, {'wall': 100}, np.zeros(3), .02, config, target)
+        planes = PlaneIndex(target)
+        try:
+            assert planes.fill(np.array([[0., .36, .36], [0., 1.2, 1.2]]), .03).tolist() == [100, 0]
+        finally:
+            planes.close()
+    finally:
+        votes.close()
+
+
 def test_quality_defaults_and_door_prompt():
     preset = json.loads((PROJECT/'presets'/'default.json').read_text(encoding='utf-8'))
     door = next(item for item in preset['classes'] if item['id'] == 'door')
@@ -178,6 +195,33 @@ def test_plane_grid_matches_brute_force_plane_selection(tmp_path):
             planes.close()
     finally:
         votes.close()
+
+
+def test_geometry_fill_is_stable_after_small_vote_perturbation_and_ignores_islands(tmp_path):
+    ceiling = _grid((0, 0, 2), 0, 1, spacing=.05, hole=(.65, .95, .65, .95))
+    wall_a = _grid((0, 0, 0), 1, 2, spacing=.05)
+    wall_b = _grid((2, 0, 0), 1, 2, spacing=.05)
+    island = _grid((8, 8, 2), 0, 1, spacing=.05)[:10]
+    config = {**DEFAULTS, 'geometry_fill_classes': ['ceiling', 'wall'], 'geometry_fill_min_area': .1,
+              'geometry_fill_max_gap': .30, 'geometry_fill_tolerance': .03,
+              'geometry_fill_min_component_voxels': 20, 'seed': 91}
+    probes = np.array([(x, y, 2.) for x in np.arange(.68, .92, .05) for y in np.arange(.68, .92, .05)])
+    counts = []
+    for number, removed in enumerate((set(), set(range(0, len(ceiling), 200)))):
+        points = [point for index, point in enumerate(ceiling) if index not in removed]
+        votes = _multi_class_votes(tmp_path/f'stable-{number}.sqlite', [(101, points+island), (100, wall_a+wall_b)])
+        try:
+            target = tmp_path/f'stable-{number}.npz'
+            extract_planes(votes, {'wall': 100, 'ceiling': 101}, np.zeros(3), .02, config, target)
+            planes = PlaneIndex(target)
+            try:
+                counts.append(int(np.count_nonzero(planes.fill(probes, .03))))
+                assert planes.fill(np.array([[8.1, 8.1, 2.]]), .03).tolist() == [0]
+            finally:
+                planes.close()
+        finally:
+            votes.close()
+    assert abs(counts[1]-counts[0]) <= max(1, round(counts[0]*.02))
 
 
 @pytest.mark.slow

@@ -9,11 +9,12 @@ from scipy.ndimage import binary_dilation
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from e57cls.geometry.planes import fit_plane
+from e57cls.geometry.planes import fit_plane_robust, refine_plane
 
 
 CELL_SIZE = .05
 CELL_EPSILON = 1e-8
+ISLAND_CELL_SIZE = .10
 
 
 def _keys(cells):
@@ -95,6 +96,87 @@ def _plane_points(votes, code, origin, voxel_size, checkpoint):
     return np.concatenate(parts) if parts else np.empty((0, 3), np.float64)
 
 
+def _component_labels(cells):
+    """Return sparse 26-neighbour component labels for unique integer cells."""
+    cells = np.unique(np.asarray(cells, np.int64), axis=0)
+    values = np.ascontiguousarray(cells, dtype='<i8').view([('x', '<i8'), ('y', '<i8'), ('z', '<i8')]).reshape(-1)
+    order = np.argsort(values, kind='stable')
+    sorted_values = values[order]
+    source, target = [], []
+    for dx in (0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if ((dx, dy, dz) == (0, 0, 0) or (dx == 0 and dy < 0)
+                        or (dx == 0 and dy == 0 and dz < 0)):
+                    continue
+                shifted = np.ascontiguousarray(cells+np.array((dx, dy, dz), np.int64), dtype='<i8').view(values.dtype).reshape(-1)
+                found = np.searchsorted(sorted_values, shifted)
+                present = found < len(sorted_values)
+                present[present] &= sorted_values[found[present]] == shifted[present]
+                found_ids = np.flatnonzero(present)
+                if len(found_ids):
+                    source.append(found_ids)
+                    target.append(order[found[found_ids]])
+    if source:
+        graph = coo_matrix((np.ones(sum(map(len, source)), np.uint8),
+                           (np.concatenate(source), np.concatenate(target))), shape=(len(cells), len(cells)))
+    else:
+        graph = coo_matrix((len(cells), len(cells)), dtype=np.uint8)
+    return connected_components(graph, directed=False, return_labels=True)
+
+
+def _without_small_islands(points, origin, voxel_size, minimum_voxels):
+    """Discard small spatial components before they can seed a plane fit.
+
+    Dense components keep the original voxel-level filtering.  Only a coarse
+    component made entirely of sparse fragments is evaluated on 10-cm cells.
+    This retains thin, regularly scanned surfaces without letting nearby noise
+    attach to dense real surfaces and perturb their plane fit.
+    """
+    if minimum_voxels <= 1 or len(points) < minimum_voxels:
+        return points
+    fine_cells, fine_inverse = np.unique(
+        np.rint((points-origin)/voxel_size-.5).astype(np.int64), axis=0, return_inverse=True)
+    fine_count, fine_labels = _component_labels(fine_cells)
+    fine_point_labels = fine_labels[fine_inverse]
+    fine_sizes = np.bincount(fine_point_labels, minlength=fine_count)
+    fine_keep = fine_sizes[fine_point_labels] >= minimum_voxels
+
+    cell_size = max(ISLAND_CELL_SIZE, voxel_size)
+    coarse_cells, coarse_inverse = np.unique(
+        np.floor((points-origin)/cell_size).astype(np.int64), axis=0, return_inverse=True)
+    coarse_count, coarse_labels = _component_labels(coarse_cells)
+    coarse_point_labels = coarse_labels[coarse_inverse]
+    coarse_sizes = np.bincount(coarse_point_labels, minlength=coarse_count)
+    coarse_keep = coarse_sizes[coarse_point_labels] >= minimum_voxels
+    coarse_has_dense = np.bincount(coarse_point_labels[fine_keep], minlength=coarse_count).astype(bool)
+    keep = fine_keep | (coarse_keep & ~coarse_has_dense[coarse_point_labels])
+    return points[keep]
+
+
+def _merge_coplanar_pieces(pieces, tolerance):
+    """Join adjacent occupancy patches when their supporting planes agree."""
+    merged = []
+    cosine = np.cos(np.deg2rad(3.))
+    for piece in pieces:
+        for current in merged:
+            if abs(float(np.dot(piece['normal'], current['normal']))) < cosine:
+                continue
+            if abs(float(np.dot(piece['center']-current['center'], current['normal']))) >= tolerance:
+                continue
+            uv = piece['cells'].astype(np.float64)*CELL_SIZE
+            world = uv@piece['basis'] + piece['normal']*np.dot(piece['center'], piece['normal'])
+            projected = _cells_from_uv(world@current['basis'].T)
+            combined = np.unique(np.vstack((current['cells'], projected)), axis=0)
+            if len(_split_cells(combined)) == 1:
+                current['cells'] = combined
+                current['area'] += piece['area']
+                break
+        else:
+            merged.append(piece)
+    return merged
+
+
 def extract_planes(votes, by_id, origin, voxel_size, config, target: Path, checkpoint=lambda: None):
     """Extract supported plane pieces for every configured geometric class.
 
@@ -109,22 +191,33 @@ def extract_planes(votes, by_id, origin, voxel_size, config, target: Path, check
         if class_id not in by_id:
             continue
         remaining = _plane_points(votes, by_id[class_id], origin, voxel_size, checkpoint)
+        remaining = _without_small_islands(remaining, origin, voxel_size,
+                                           config.get('geometry_fill_min_component_voxels', 20))
         if len(remaining) < 12:
             continue
         iteration = 0
         tolerance = max(config['geometry_fill_tolerance'], voxel_size*1.5)
+        pieces = []
         while len(remaining) >= 12 and iteration < config['geometry_fill_max_planes']:
             checkpoint()
             # RANSAC scores a reproducible bounded sample; support and the
             # occupancy mask are always evaluated on every remaining voxel.
-            plane = fit_plane(remaining, tolerance=tolerance,
-                              seed=config['seed']+int(by_id[class_id])*1009+iteration,
-                              trials=160, min_fraction=.001, sample_limit=200_000)
+            plane = fit_plane_robust(remaining, tolerance=tolerance,
+                                    seed=config['seed']+int(by_id[class_id])*1009+iteration,
+                                    trials=config.get('geometry_fill_ransac_trials', 256), min_fraction=.001,
+                                    sample_limit=200_000,
+                                    max_trials=config.get('geometry_fill_ransac_max_trials', 1024))
             if not plane:
                 break
             normal = np.asarray(plane['normal'], np.float64)
             center, basis = np.asarray(plane['center']), np.asarray(plane['basis'])
             inlier_mask = np.abs((remaining-center)@normal) <= tolerance
+            refined = refine_plane(remaining, inlier_mask, tolerance)
+            if refined is None:
+                break
+            normal = np.asarray(refined['normal'], np.float64)
+            center, basis = np.asarray(refined['center']), np.asarray(refined['basis'])
+            inlier_mask = refined['inliers']
             inliers, remaining = remaining[inlier_mask], remaining[~inlier_mask]
             iteration += 1
             if len(inliers) < 12:
@@ -139,15 +232,28 @@ def extract_planes(votes, by_id, origin, voxel_size, config, target: Path, check
                 # The minimum area deliberately applies before dilation, so a
                 # sparse accident cannot turn into a large artificial surface.
                 area = len(piece)*CELL_SIZE**2
-                if area < config['geometry_fill_min_area']:
+                # Small voxel islands have already been rejected before
+                # RANSAC.  A quarter square metre is still a substantial
+                # supported patch at the 5-cm occupancy resolution, while
+                # retaining narrow, real wall fragments between large planes.
+                minimum_area = min(config['geometry_fill_min_area'], .25)
+                if area < minimum_area:
                     continue
-                dilated = _dilate(piece, int(np.ceil(config['geometry_fill_max_gap']/CELL_SIZE)))
-                key = f'cells_{len(result["planes"])}'
-                arrays[key] = dilated
-                lower, upper = _piece_bounds(dilated, center, normal, basis, config['geometry_fill_tolerance'])
-                result['planes'].append({'class_id': class_id, 'code': int(by_id[class_id]), 'center': center.tolist(),
-                                         'normal': normal.tolist(), 'basis': basis.tolist(), 'cells': key,
-                                         'bbox_min': lower, 'bbox_max': upper, 'area_m2': float(area)})
+                pieces.append({'center': center, 'normal': normal, 'basis': basis, 'cells': piece, 'area': float(area)})
+        for piece in _merge_coplanar_pieces(pieces, tolerance):
+            # A cell centre may be half a cell inside the visible boundary.
+            # Keep the configured physical gap after this quantization error
+            # instead of making identical planes depend on the cell phase.
+            dilation_radius = int(np.ceil((config['geometry_fill_max_gap']+CELL_SIZE*.5)/CELL_SIZE))
+            dilated = _dilate(piece['cells'], dilation_radius)
+            key = f'cells_{len(result["planes"])}'
+            arrays[key] = dilated
+            lower, upper = _piece_bounds(dilated, piece['center'], piece['normal'], piece['basis'],
+                                         config['geometry_fill_tolerance'])
+            result['planes'].append({'class_id': class_id, 'code': int(by_id[class_id]),
+                                     'center': piece['center'].tolist(), 'normal': piece['normal'].tolist(),
+                                     'basis': piece['basis'].tolist(), 'cells': key, 'bbox_min': lower,
+                                     'bbox_max': upper, 'area_m2': piece['area']})
         iterations[class_id] = iteration
     target.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(target, metadata=np.array(json.dumps(result)), **arrays)

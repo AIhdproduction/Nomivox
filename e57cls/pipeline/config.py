@@ -27,15 +27,18 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "slam_weight_radial_power": 1.0, "slam_time_filter": False,
             "slam_time_window": 10.0,
             "seed": 42, "scene_overrides": {}, "diagnostics": "sample",
-            "component_cleanup": True, "component_min_voxels": 12,
+            "component_cleanup": True, "component_min_voxels": 12, "component_min_cells": 4,
+            "component_sparse_max_voxels_per_cell": 1,
             "cable_component_min_voxels": 8, "cable_component_min_span": .20,
             "electrical_component_min_voxels": 8, "electrical_component_min_span": .06,
-            "class_transfer_radius": .01,
+            "class_transfer_radius": .01, "class_transfer_range_factor": .003,
+            "class_transfer_radius_max": .05,
             "depth_gate_classes": ["door"], "door_depth_limit": 1.0,
             "door_max_width": 1.4, "door_max_height": 2.6,
             "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "floor", "ground", "road", "sidewalk"],
-            "geometry_fill_min_area": .5, "geometry_fill_max_gap": .30, "geometry_fill_tolerance": .02,
-            "geometry_fill_max_planes": 400,
+            "geometry_fill_min_area": .5, "geometry_fill_max_gap": .35, "geometry_fill_tolerance": .02,
+            "geometry_fill_max_planes": 400, "geometry_fill_min_component_voxels": 20,
+            "geometry_fill_ransac_trials": 256, "geometry_fill_ransac_max_trials": 1024,
             "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
             "geometry_rules_outdoor_vegetation": True, "geometry_rules_ground_floor": True,
             "geometry_halo": 1.5, "geometry_knn": 24, "geometry_knn_radius": 1.,
@@ -53,9 +56,15 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "scene_plane_fraction": .5, "scene_ceiling_supported": .15, "scene_upper_returns_indoor": .75,
             "scene_open_sky_outdoor": .10, "scene_open_sky_indoor_max": .05,
             "scene_sky_confidence": .65, "scene_ceiling_confidence": .5,
-            "stairs_priority": True, "stairs_min_confidence": .65,
+            "stairs_priority": True, "stairs_min_confidence": .65, "stairs_priority_min_share": .25,
             "stairs_priority_over": ["floor", "ground"], "stairs_geometry_check": True,
             "stairs_plane_tolerance": .03, "stairs_planar_fraction": .85, "stairs_min_rise": .25,
+            "stairs_min_voxels": 50, "stairs_min_levels": 3, "stairs_level_tolerance": .03,
+            "stairs_step_rise_min": .10, "stairs_step_rise_max": .23,
+            "stairs_step_tread_min": .20, "stairs_step_tread_max": .45,
+            "stairs_floor_ring_radius": 2., "stairs_floor_level_tolerance": .03,
+            "stairs_underside_min_voxels": 1000, "stairs_underside_cluster_size": 3,
+            "stairs_underside_max_gap": .20,
             # Reflection masks keep the complete angular coverage of a panorama,
             # but do not need the much more expensive classification resolution.
             # A 1008 px view at 75 % scale fits in one SAM tile instead of the
@@ -170,7 +179,7 @@ def resolve_config(config: dict, base: Path = PROJECT):
     for key in ('scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor',
                 'scene_sky_indoor_max','scene_plane_fraction','mirror_mask_confidence','scene_ceiling_supported',
                 'scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max',
-                'scene_sky_confidence','scene_ceiling_confidence','stairs_min_confidence'):
+                'scene_sky_confidence','scene_ceiling_confidence','stairs_min_confidence', 'stairs_priority_min_share'):
         if not 0 <= value[key] <= 1:
             raise ValueError(f'Invalid {key}')
     for key in ('mirror_mask_confidence', 'scene_sky_confidence', 'scene_ceiling_confidence', 'stairs_min_confidence'):
@@ -182,13 +191,26 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'mirror_shape_max_growth','mirror_edge_search'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
-    for key in ('stairs_plane_tolerance', 'stairs_min_rise'):
+    for key in ('stairs_plane_tolerance', 'stairs_min_rise', 'stairs_level_tolerance',
+                'stairs_step_rise_min', 'stairs_step_rise_max', 'stairs_step_tread_min',
+                'stairs_step_tread_max', 'stairs_floor_ring_radius', 'stairs_floor_level_tolerance',
+                'stairs_underside_max_gap'):
         if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
                 or not 0 < value[key] < float('inf')):
             raise ValueError(f'Invalid {key}')
     if (not isinstance(value['stairs_planar_fraction'], (int, float)) or isinstance(value['stairs_planar_fraction'], bool)
             or not 0 <= value['stairs_planar_fraction'] <= 1):
         raise ValueError('Invalid stairs planar fraction')
+    for key in ('stairs_min_voxels', 'stairs_min_levels', 'stairs_underside_min_voxels',
+                'stairs_underside_cluster_size'):
+        if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
+            raise ValueError(f'Invalid {key}')
+    if value['stairs_min_levels'] < 3:
+        raise ValueError('Invalid stairs minimum levels')
+    if value['stairs_step_rise_min'] > value['stairs_step_rise_max']:
+        raise ValueError('Invalid stairs rise range')
+    if value['stairs_step_tread_min'] > value['stairs_step_tread_max']:
+        raise ValueError('Invalid stairs tread range')
     if not isinstance(value['stairs_priority_over'], list) or not all(isinstance(item, str) for item in value['stairs_priority_over']):
         raise ValueError('Invalid stairs priority classes')
     if (not isinstance(value['vote_families'], list) or any(not isinstance(family, list)
@@ -200,10 +222,12 @@ def resolve_config(config: dict, base: Path = PROJECT):
             or not isinstance(value['geometry_rules_outdoor_vegetation'], bool)
             or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)):
         raise ValueError('Invalid component cleanup setting')
-    for key in ('component_min_voxels','cable_component_min_voxels','electrical_component_min_voxels','geometry_fill_max_planes'):
+    for key in ('component_min_voxels', 'component_min_cells', 'component_sparse_max_voxels_per_cell', 'cable_component_min_voxels',
+                'electrical_component_min_voxels', 'geometry_fill_max_planes', 'geometry_fill_min_component_voxels',
+                'geometry_fill_ransac_trials', 'geometry_fill_ransac_max_trials'):
         if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
             raise ValueError(f'Invalid {key}')
-    for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius','reflection_neighbor_radius',
+    for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius', 'class_transfer_radius_max', 'reflection_neighbor_radius',
                 'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
                 'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_cell_size', 'geometry_tile_size',
                 'geometry_halo', 'geometry_knn_radius', 'terrain_cell_size', 'terrain_max_gap', 'terrain_max_slope',
@@ -211,6 +235,14 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'tree_crown_radius', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['class_transfer_range_factor'], (int, float))
+            or isinstance(value['class_transfer_range_factor'], bool)
+            or not 0 <= value['class_transfer_range_factor'] < float('inf')):
+        raise ValueError('Invalid class_transfer_range_factor')
+    if value['class_transfer_radius_max'] < value['class_transfer_radius']:
+        raise ValueError('Invalid class transfer radius range')
+    if value['geometry_fill_ransac_max_trials'] < value['geometry_fill_ransac_trials']:
+        raise ValueError('Invalid geometry fill RANSAC trial range')
     if (not isinstance(value['geometry_knn'], int) or isinstance(value['geometry_knn'], bool)
             or not 3 <= value['geometry_knn'] <= 128):
         raise ValueError('Invalid geometry neighbour count')

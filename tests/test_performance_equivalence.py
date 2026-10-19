@@ -227,6 +227,46 @@ def test_write_cloud_transfer_reuses_exact_predictions_and_mirror_states(tmp_pat
     assert cloud.mirror_state.tolist() == [4, 4, 4]
 
 
+def _distant_transfer_store(tmp_path):
+    xyz = np.array([[10., 0, 0], [10.025, 0, 0]], np.float64)
+    valid = np.ones(len(xyz), bool)
+    np.save(tmp_path/'distant_xyz.npy', xyz)
+    np.save(tmp_path/'distant_valid.npy', valid)
+    pose = {'rotation': {'w': 1., 'x': 0., 'y': 0., 'z': 0.}, 'translation': {'x': 0., 'y': 0., 'z': 0.}}
+    return ScanStore(tmp_path, {'record_count': len(xyz), 'valid_count': len(xyz), 'scan_index': 1,
+        'arrays': {'xyz_local': {'path': 'distant_xyz.npy'}, 'valid': {'path': 'distant_valid.npy'}},
+        'metadata': {'pose': pose, 'points': {'fields': []}},
+        'bounds_local': {'min': xyz.min(axis=0).tolist(), 'max': xyz.max(axis=0).tolist()}})
+
+
+def test_transfer_radius_grows_with_own_scanner_distance(tmp_path):
+    class Votes:
+        def lookup(self, keys):
+            return np.array([1, 2], np.uint8), np.array([0, 200], np.uint8)
+
+    fixed = write_cloud(tmp_path/'fixed.las', [_distant_transfer_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2],
+                        class_transfer_radius=.01, class_transfer_range_factor=0., class_transfer_radius_max=.05)
+    adaptive = write_cloud(tmp_path/'adaptive.las', [_distant_transfer_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2],
+                           class_transfer_radius=.01, class_transfer_range_factor=.003, class_transfer_radius_max=.05)
+    assert fixed['class_transfer_count'] == 0
+    assert adaptive['class_transfer_count'] == 1
+    assert laspy.read(tmp_path/'adaptive.las').classification.tolist() == [2, 2]
+
+
+def test_zero_range_factor_keeps_transfer_output_identical(tmp_path):
+    class Votes:
+        def lookup(self, keys):
+            return np.array([1, 2], np.uint8), np.array([0, 200], np.uint8)
+
+    old_path, fixed_path = tmp_path/'old.las', tmp_path/'zero-factor.las'
+    write_cloud(old_path, [_distant_transfer_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2], class_transfer_radius=.01)
+    write_cloud(fixed_path, [_distant_transfer_store(tmp_path)], Votes(), np.zeros(3), .01, '', [1, 2],
+                class_transfer_radius=.01, class_transfer_range_factor=0., class_transfer_radius_max=.05)
+    old, fixed = laspy.read(old_path), laspy.read(fixed_path)
+    np.testing.assert_array_equal(old.classification, fixed.classification)
+    np.testing.assert_array_equal(old.class_conf, fixed.class_conf)
+
+
 def test_tiled_transfer_matches_reference_for_large_negative_boundary_data(tmp_path):
     """The tiled path retains the old nearest-neighbour result without ties."""
     rng = np.random.default_rng(103)

@@ -796,7 +796,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     control.event('phase_finished', phase='slam_segmentation')
     control.event('phase_started', phase='voting')
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
-                'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
+                'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority, families)
     surface_ties = building = stairs = components = vegetation = geometry_rules = None
@@ -819,14 +819,26 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         stairs = votes.reject_planar_stairs(by_id['stairs'], np.asarray(config['voxel_origin']), config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
-            config['seed'], codes, control.checkpoint)
+            config['seed'], codes, control.checkpoint, minimum_voxels=config['stairs_min_voxels'],
+            minimum_levels=config['stairs_min_levels'], level_tolerance=config['stairs_level_tolerance'],
+            rise_minimum=config['stairs_step_rise_min'], rise_maximum=config['stairs_step_rise_max'],
+            tread_minimum=config['stairs_step_tread_min'], tread_maximum=config['stairs_step_tread_max'],
+            floor_code=by_id.get('floor'), floor_ring_radius=config['stairs_floor_ring_radius'],
+            floor_level_tolerance=config['stairs_floor_level_tolerance'],
+            underside_minimum_voxels=config['stairs_underside_min_voxels'],
+            underside_cluster_size=config['stairs_underside_cluster_size'],
+            underside_maximum_gap=config['stairs_underside_max_gap'])
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
             rules.append((by_id['cable'], config['cable_component_min_voxels'], config['cable_component_min_span']))
         if 'electrical' in by_id:
             rules.append((by_id['electrical'], config['electrical_component_min_voxels'], config['electrical_component_min_span']))
-        components = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'], rules, control.checkpoint)
+        components = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'], rules, control.checkpoint,
+                                                   component_min_cells=config['component_min_cells'],
+                                                   feature_cell_size=config['geometry_cell_size'],
+                                                   sparse_maximum_voxels_per_cell=config['component_sparse_max_voxels_per_cell'],
+                                                   outdoor_codes=[by_id[name] for name in ('building', 'ground', 'low_vegetation', 'tree', 'road', 'sidewalk') if name in by_id])
     if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
         vegetation = votes.vegetation_bases_to_ground(by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
             config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
@@ -848,9 +860,13 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             never_visible += int((~values[start:start+len(xyz)] & valid).sum())
     total_valid = sum(store.meta['valid_count'] for store in stores)
     force_unclassified = lambda store, start, valid: ~np.asarray(observed[store.meta['scan_index']][start:start+len(valid)])[valid]
+    transfer_station_positions = {station.id: np.asarray([cameras[index].pose.translation for index in station.camera_indices], np.float64)
+                                  for station in stations}
     if writer is write_e57:
         result = writer(path, source, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'], [row['code'] for row in rows], (),
-                        control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=0.,
+                        control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
+                        class_transfer_range_factor=config['class_transfer_range_factor'],
+                        class_transfer_radius_max=config['class_transfer_radius_max'], transfer_station_positions=transfer_station_positions,
                         geometry_planes=None, terrain=terrain, terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
@@ -858,7 +874,10 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
-                        output_density=config['output_density'], class_transfer_radius=0., geometry_planes=None, terrain=terrain,
+                        output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
+                        class_transfer_range_factor=config['class_transfer_range_factor'],
+                        class_transfer_radius_max=config['class_transfer_radius_max'], transfer_station_positions=transfer_station_positions,
+                        geometry_planes=None, terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
@@ -1245,7 +1264,7 @@ def execute(config, backend_factory=None, listen=True):
                 vote_start = time.monotonic()
                 by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
                 priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
-                            'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
+                            'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
                 families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
                 votes.decide(config["min_observations"], config["min_winning_share"], codes, control.checkpoint, priority, families)
                 if config['surface_tie_break']:
@@ -1274,7 +1293,15 @@ def execute(config, backend_factory=None, listen=True):
                     stairs_geometry_report = votes.reject_planar_stairs(
                         by_id['stairs'], np.array(config['voxel_origin']), config['voxel_size'],
                         config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
-                        config['seed'], codes, control.checkpoint)
+                        config['seed'], codes, control.checkpoint, minimum_voxels=config['stairs_min_voxels'],
+                        minimum_levels=config['stairs_min_levels'], level_tolerance=config['stairs_level_tolerance'],
+                        rise_minimum=config['stairs_step_rise_min'], rise_maximum=config['stairs_step_rise_max'],
+                        tread_minimum=config['stairs_step_tread_min'], tread_maximum=config['stairs_step_tread_max'],
+                        floor_code=by_id.get('floor'), floor_ring_radius=config['stairs_floor_ring_radius'],
+                        floor_level_tolerance=config['stairs_floor_level_tolerance'],
+                        underside_minimum_voxels=config['stairs_underside_min_voxels'],
+                        underside_cluster_size=config['stairs_underside_cluster_size'],
+                        underside_maximum_gap=config['stairs_underside_max_gap'])
                 if config['component_cleanup']:
                     cleanup_rules = []
                     if 'cable' in by_id:
@@ -1284,7 +1311,11 @@ def execute(config, backend_factory=None, listen=True):
                         cleanup_rules.append((by_id['electrical'], config['electrical_component_min_voxels'],
                                               config['electrical_component_min_span']))
                     cleanup_report = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'],
-                                                                     cleanup_rules, control.checkpoint)
+                                                                     cleanup_rules, control.checkpoint,
+                                                                     component_min_cells=config['component_min_cells'],
+                                                                     feature_cell_size=config['geometry_cell_size'],
+                                                                     sparse_maximum_voxels_per_cell=config['component_sparse_max_voxels_per_cell'],
+                                                                     outdoor_codes=[by_id[name] for name in ('building', 'ground', 'low_vegetation', 'tree', 'road', 'sidewalk') if name in by_id])
                 if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
                     vegetation_report = votes.vegetation_bases_to_ground(
                         by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
@@ -1318,6 +1349,8 @@ def execute(config, backend_factory=None, listen=True):
         result = writer(*output_args, mirror=mirrors.output if mirrors else None,
                         no_reflection=config['extra_no_reflection'], primary_without_reflections=not semantic_run,
                         class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.,
+                        class_transfer_range_factor=config['class_transfer_range_factor'] if semantic_run else 0.,
+                        class_transfer_radius_max=config['class_transfer_radius_max'] if semantic_run else 0.,
                         output_density=config['output_density'],
                         geometry_planes=geometry_planes if semantic_run and config['geometry_fill'] else None,
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain if semantic_run else None,

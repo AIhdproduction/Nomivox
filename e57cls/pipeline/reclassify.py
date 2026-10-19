@@ -19,6 +19,8 @@ from e57cls.output.las import write_cloud
 from e57cls.output.reports import legend_rows, write_legends, write_report
 from e57cls.pipeline.config import DEFAULTS, resolve_config
 from e57cls.pipeline.run import geometry_scan_context
+from e57cls.slam.cameras import build_camera_list
+from e57cls.slam.stations import cluster_stations
 from e57cls.vote.engine import VoteStore
 
 
@@ -26,10 +28,13 @@ from e57cls.vote.engine import VoteStore
 # Keep this deliberately central: later quality packages can append new
 # post-processing settings here without opening the segmentation cache to edits.
 RECLASSIFY_OVERRIDE_KEYS = frozenset({
-    'min_observations', 'min_winning_share', 'stairs_priority', 'stairs_min_confidence',
+    'min_observations', 'min_winning_share', 'stairs_priority', 'stairs_min_confidence', 'stairs_priority_min_share',
     'stairs_priority_over', 'stairs_geometry_check', 'stairs_plane_tolerance',
-    'stairs_planar_fraction', 'stairs_min_rise', 'surface_tie_break', 'surface_tie_share',
-    'surface_normal_radius', 'component_cleanup', 'component_min_voxels',
+    'stairs_planar_fraction', 'stairs_min_rise', 'stairs_min_voxels', 'stairs_min_levels',
+    'stairs_level_tolerance', 'stairs_step_rise_min', 'stairs_step_rise_max',
+    'stairs_step_tread_min', 'stairs_step_tread_max', 'stairs_floor_ring_radius',
+    'stairs_floor_level_tolerance', 'surface_tie_break', 'surface_tie_share',
+    'surface_normal_radius', 'component_cleanup', 'component_min_voxels', 'component_min_cells',
     'cable_component_min_voxels', 'cable_component_min_span', 'electrical_component_min_voxels',
     'electrical_component_min_span', 'vegetation_base_to_ground', 'vegetation_ground_cell_size',
     'vegetation_ground_band', 'building_enclosure', 'building_boundary_cell_size',
@@ -40,7 +45,8 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
     'geometry_rules_outdoor_vegetation', 'geometry_rules_ground_floor', 'terrain_cell_size',
     'terrain_max_gap', 'terrain_max_slope', 'terrain_ground_tolerance', 'terrain_fill',
     'terrain_cover_min_height', 'terrain_cover_max_height', 'tree_crown_radius', 'tree_crown_max_height',
-    'tree_crown_grow_radius', 'class_transfer_radius', 'output_density', 'format', 'extra_no_reflection',
+    'tree_crown_grow_radius', 'class_transfer_radius', 'class_transfer_range_factor',
+    'class_transfer_radius_max', 'output_density', 'format', 'extra_no_reflection',
     'cache_cleanup', 'vote_families',
 })
 RECLASSIFY_POST_VOTE_PREFIXES = ('stairs_', 'surface_tie_', 'component_', 'cable_', 'electrical_',
@@ -146,7 +152,7 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     """Apply precisely the decision/output stages from the regular pipeline."""
     codes = list(by_id.values())
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],
-                'confidence': config['stairs_min_confidence']} if config['stairs_priority'] and 'stairs' in by_id else None
+                'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority, vote_families=families)
     result = {'surface_ties': None, 'building_enclosure': None, 'stairs_geometry': None,
@@ -166,14 +172,26 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
                                                          active_codes=active_codes, scan_context=scan_context)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         result['stairs_geometry'] = votes.reject_planar_stairs(by_id['stairs'], origin, config['voxel_size'],
-            config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'], config['seed'], codes)
+            config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'], config['seed'], codes,
+            minimum_voxels=config['stairs_min_voxels'], minimum_levels=config['stairs_min_levels'],
+            level_tolerance=config['stairs_level_tolerance'], rise_minimum=config['stairs_step_rise_min'],
+            rise_maximum=config['stairs_step_rise_max'], tread_minimum=config['stairs_step_tread_min'],
+            tread_maximum=config['stairs_step_tread_max'], floor_code=by_id.get('floor'),
+            floor_ring_radius=config['stairs_floor_ring_radius'], floor_level_tolerance=config['stairs_floor_level_tolerance'],
+            underside_minimum_voxels=config['stairs_underside_min_voxels'],
+            underside_cluster_size=config['stairs_underside_cluster_size'],
+            underside_maximum_gap=config['stairs_underside_max_gap'])
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
             rules.append((by_id['cable'], config['cable_component_min_voxels'], config['cable_component_min_span']))
         if 'electrical' in by_id:
             rules.append((by_id['electrical'], config['electrical_component_min_voxels'], config['electrical_component_min_span']))
-        result['component_cleanup'] = votes.remove_small_components(config['voxel_size'], config['component_min_voxels'], rules)
+        result['component_cleanup'] = votes.remove_small_components(
+            config['voxel_size'], config['component_min_voxels'], rules,
+            component_min_cells=config['component_min_cells'], feature_cell_size=config['geometry_cell_size'],
+            sparse_maximum_voxels_per_cell=config['component_sparse_max_voxels_per_cell'],
+            outdoor_codes=[by_id[name] for name in ('building', 'ground', 'low_vegetation', 'tree', 'road', 'sidewalk') if name in by_id])
     if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
         result['vegetation_base_to_ground'] = votes.vegetation_bases_to_ground(by_id['low_vegetation'], by_id['ground'],
             config['voxel_size'], config['vegetation_ground_cell_size'], config['vegetation_ground_band'])
@@ -238,6 +256,12 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
         writer = write_e57 if config['format'] == 'e57' else write_cloud
         mirror = _StoredMirrorStates(vote_directory/'mirrors') if manifest.get('mirror_analysis') else None
+        transfer_station_positions = None
+        if station_tracking:
+            cameras = build_camera_list(inspect)
+            stations, _, _ = cluster_stations(cameras, config['slam_station_spacing'])
+            transfer_station_positions = {station.id: np.asarray([cameras[index].pose.translation
+                for index in station.camera_indices], np.float64) for station in stations}
         terrain_outdoor_scans = ({store.meta['scan_index'] for store in stores}
                                  if input_mode['mode'] == 'slam' and any(context['outdoor'] for context in scan_context.values())
                                  else {scan for scan, context in scan_context.items() if context['outdoor']})
@@ -249,6 +273,9 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
                 inspect['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows])
         result = writer(*args, mirror=mirror.output if mirror else None, no_reflection=config['extra_no_reflection'],
                         output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
+                        class_transfer_range_factor=config['class_transfer_range_factor'],
+                        class_transfer_radius_max=config['class_transfer_radius_max'],
+                        transfer_station_positions=transfer_station_positions,
                         geometry_planes=planes if config['geometry_fill'] else None,
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],

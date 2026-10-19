@@ -9,10 +9,10 @@ import psutil
 from scipy.ndimage import binary_propagation, generate_binary_structure
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 from e57cls.files import atomic_json, file_hash
 from e57cls.geometry.cameras import Pose
-from e57cls.geometry.planes import fit_plane
 
 
 def connect(path):
@@ -259,13 +259,16 @@ class VoteStore:
                 candidate = ((codes == priority['code']) & (peaks >= priority['confidence']))
                 eligible = np.zeros(len(starts), bool)
                 eligible[groups[candidate]] = True
-                override = np.isin(winner, priority['over']) & eligible & (observations[starts] >= min_observations)
+                priority_weight = np.zeros(len(starts), np.float64)
+                priority_rows = np.flatnonzero(candidate)
+                priority_groups = groups[priority_rows]
+                priority_weight[priority_groups] = weights[priority_rows]
+                priority_share = np.divide(priority_weight, total, out=np.zeros_like(priority_weight), where=total > 0)
+                override = (np.isin(winner, priority['over']) & eligible
+                            & (observations[starts] >= min_observations)
+                            & (priority_share >= priority.get('min_share', 0.)))
                 if np.any(override):
-                    priority_rows = np.flatnonzero(candidate)
-                    priority_groups = groups[priority_rows]
                     # Every key/class pair is unique, hence at most one row per group.
-                    priority_weight = np.zeros(len(starts), np.float64)
-                    priority_weight[priority_groups] = weights[priority_rows]
                     winner[override] = priority['code']
                     maximum[override] = priority_weight[override]
                     self.priority_overrides += int(override.sum())
@@ -481,9 +484,95 @@ class VoteStore:
             graph = coo_matrix((len(coordinates), len(coordinates)), dtype=np.uint8)
         return connected_components(graph, directed=False, return_labels=True)
 
+    @staticmethod
+    def _stair_levels(coordinates, voxel_size, level_tolerance):
+        """Extract broad horizontal levels from a stair component's voxels."""
+        horizontal = np.column_stack((np.floor(coordinates[:, :2]*voxel_size/.10).astype(np.int64), coordinates[:, 2]))
+        horizontal = np.unique(horizontal, axis=0)
+        heights, counts = np.unique(horizontal[:, 2], return_counts=True)
+        if not len(heights):
+            return np.empty(0), np.empty((0, 2))
+        # A landing can cover far more 10 cm cells than each tread. Keep every
+        # broad horizontal level and exclude only the narrow vertical risers.
+        minimum_cells = 3
+        heights, counts = heights[counts >= minimum_cells], counts[counts >= minimum_cells]
+        if not len(heights):
+            return np.empty(0), np.empty((0, 2))
+        starts = np.r_[0, np.flatnonzero(np.diff(heights)*voxel_size > level_tolerance)+1, len(heights)]
+        levels, centres = [], []
+        for start, stop in zip(starts[:-1], starts[1:]):
+            selected, weights = heights[start:stop], counts[start:stop]
+            height = float(np.average(selected*voxel_size, weights=weights))
+            points = coordinates[np.isin(coordinates[:, 2], selected), :2]*voxel_size
+            levels.append(height)
+            centres.append(points.mean(axis=0))
+        return np.asarray(levels), np.asarray(centres)
+
+    @staticmethod
+    def _stair_shape(levels, centres, minimum_levels, rise_minimum, rise_maximum, tread_minimum, tread_maximum):
+        """Accept one or more monotone flights separated by a landing."""
+        if len(levels) < minimum_levels:
+            return False
+        rises = np.diff(levels)
+        if not np.all((rises >= rise_minimum) & (rises <= rise_maximum)):
+            return False
+        vectors = np.diff(centres, axis=0)
+        lengths = np.linalg.norm(vectors, axis=1)
+        flights, current = [], []
+        for index, (vector, length) in enumerate(zip(vectors, lengths)):
+            if not tread_minimum <= length <= tread_maximum:
+                if current:
+                    flights.append(current)
+                    current = []
+                continue
+            direction = vector/length
+            # A landing may turn the next flight by 90 or 180 degrees.  Split
+            # at that turn and test each run in its own forward direction.
+            if current and float(direction @ current[-1][1]) < .5:
+                flights.append(current)
+                current = []
+            current.append((index, direction))
+        if current:
+            flights.append(current)
+        return any(len(flight) >= minimum_levels-1 for flight in flights)
+
+    @staticmethod
+    def _boxes_touch(first, second, maximum_gap):
+        """Return whether two axis-aligned component boxes meet within a gap."""
+        return np.maximum(first[0]-second[1], second[0]-first[1]).max() <= maximum_gap
+
+    def _restore_stairs(self, keys, indices, stairs_code, order, result, checkpoint):
+        """Restore rejected stair voxels to their strongest permitted alternative."""
+        for start in range(0, len(indices), 500):
+            checkpoint()
+            component_keys = [keys[index] for index in indices[start:start+500]]
+            evidence = {key: [] for key in component_keys}
+            statement = 'SELECT key,class,weight FROM votes WHERE key IN ('+','.join('?' for _ in component_keys)+')'
+            for key, code, weight in self.db.execute(statement, component_keys):
+                evidence[bytes(key)].append((int(code), float(weight)))
+            updates = []
+            for key in component_keys:
+                votes = evidence[key]
+                alternatives = [item for item in votes if item[0] != stairs_code]
+                if not alternatives:
+                    updates.append((1, 0, key))
+                    result['reclassified_voxels']['1'] = result['reclassified_voxels'].get('1', 0)+1
+                    continue
+                code, weight = min(alternatives, key=lambda item: (-item[1], order.get(item[0], 1000+item[0])))
+                total = sum(item[1] for item in votes)
+                confidence = int(round(weight*255/total)) if total else 0
+                updates.append((code, confidence, key))
+                target = str(code)
+                result['reclassified_voxels'][target] = result['reclassified_voxels'].get(target, 0)+1
+            self.db.executemany('UPDATE decisions SET code=?,confidence=? WHERE key=?', updates)
+
     def reject_planar_stairs(self, stairs_code, origin, voxel_size, plane_tolerance, planar_fraction,
-                             minimum_rise, seed, class_order=(), checkpoint=lambda: None):
-        """Restore stair components which geometrically form one plane or are flat."""
+                             minimum_rise, seed, class_order=(), checkpoint=lambda: None, *, minimum_voxels=50,
+                             minimum_levels=3, level_tolerance=.03, rise_minimum=.10, rise_maximum=.23,
+                             tread_minimum=.20, tread_maximum=.45, floor_code=None, floor_ring_radius=2.,
+                             floor_level_tolerance=.03, underside_minimum_voxels=1000,
+                             underside_cluster_size=3, underside_maximum_gap=.20):
+        """Keep only components with a physically plausible stepped profile."""
         result = {'checked_components': 0, 'rejected_components': 0, 'reclassified_voxels': {}}
         rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (int(stairs_code),)))
         if not rows:
@@ -496,46 +585,107 @@ class VoteStore:
         origin = np.asarray(origin, np.float64)
         component_order = np.argsort(labels, kind='stable')
         component_offsets = np.r_[0, np.cumsum(np.bincount(labels, minlength=count))]
+        floor_tree = floor_heights = None
+        if floor_code is not None:
+            floor_rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (int(floor_code),)))
+            if floor_rows:
+                floor_coordinates = np.frombuffer(b''.join(bytes(row[0]) for row in floor_rows), dtype='<i8').reshape(-1, 3)
+                floor_points = origin+(floor_coordinates+.5)*voxel_size
+                floor_tree, floor_heights = cKDTree(floor_points[:, :2]), floor_points[:, 2]
 
+        component_data = []
         for component in range(count):
             indices = component_order[component_offsets[component]:component_offsets[component+1]]
-            if len(indices) < 50:
-                continue
             checkpoint()
             result['checked_components'] += 1
-            points = origin+(coordinates[indices]+.5)*voxel_size
-            plane = fit_plane(points, plane_tolerance, seed, min_fraction=planar_fraction)
-            vertical_span = (coordinates[indices, 2].max()-coordinates[indices, 2].min())*voxel_size
-            if plane is None and vertical_span >= minimum_rise:
+            component_coordinates = coordinates[indices]
+            levels, centres = self._stair_levels(component_coordinates, voxel_size, level_tolerance)
+            stepped = len(indices) >= minimum_voxels and self._stair_shape(
+                levels, centres, minimum_levels, rise_minimum, rise_maximum, tread_minimum, tread_maximum)
+            returned = np.empty(0, np.int64)
+            if floor_tree is not None and len(levels):
+                distance, nearby = floor_tree.query(centres, distance_upper_bound=floor_ring_radius, workers=-1)
+                matching = np.zeros(len(levels), bool)
+                valid_floor = np.isfinite(distance)
+                matching[valid_floor] = np.abs(floor_heights[nearby[valid_floor]]-levels[valid_floor]) <= floor_level_tolerance
+                if matching.any():
+                    height_match = np.zeros(len(indices), bool)
+                    for level in levels[matching]:
+                        height_match |= np.abs((component_coordinates[:, 2]+.5)*voxel_size-level) <= level_tolerance
+                    returned = indices[height_match]
+                    self.db.executemany('UPDATE decisions SET code=?,confidence=confidence WHERE key=?',
+                                        ((int(floor_code), keys[index]) for index in returned))
+                    target = str(int(floor_code))
+                    result['reclassified_voxels'][target] = result['reclassified_voxels'].get(target, 0)+len(returned)
+            # Sparse scans often retain the inclined underside of each flight
+            # but not enough tread tops for the level test.  A single slope is
+            # deliberately not accepted: it is indistinguishable from a roof
+            # or ceiling.  Several large, touching flights (or an underside
+            # next to a verified stepped flight) are a staircase assembly.
+            span = (component_coordinates.max(axis=0)-component_coordinates.min(axis=0)+1)*voxel_size
+            underside = (len(indices) >= underside_minimum_voxels and span[2] >= minimum_rise
+                         and np.linalg.norm(span[:2]) >= tread_minimum)
+            component_data.append({'indices': indices, 'stepped': stepped, 'underside': underside,
+                                   'box': np.stack((component_coordinates.min(axis=0)*voxel_size,
+                                                    component_coordinates.max(axis=0)*voxel_size))})
+
+        parents = np.arange(count, dtype=np.int64)
+
+        def find(value):
+            while parents[value] != value:
+                parents[value] = parents[parents[value]]
+                value = parents[value]
+            return value
+
+        for first in range(count):
+            if not (component_data[first]['stepped'] or component_data[first]['underside']):
+                continue
+            for second in range(first):
+                if not (component_data[second]['stepped'] or component_data[second]['underside']):
+                    continue
+                if self._boxes_touch(component_data[first]['box'], component_data[second]['box'], underside_maximum_gap):
+                    parents[find(first)] = find(second)
+
+        groups = {}
+        for component, data in enumerate(component_data):
+            if data['stepped'] or data['underside']:
+                groups.setdefault(find(component), []).append(component)
+        accepted = set()
+        for members in groups.values():
+            has_steps = any(component_data[item]['stepped'] for item in members)
+            enough_flights = sum(component_data[item]['underside'] for item in members) >= underside_cluster_size
+            if has_steps or enough_flights:
+                accepted.update(item for item in members if component_data[item]['stepped'] or component_data[item]['underside'])
+
+        for component, data in enumerate(component_data):
+            if component in accepted:
                 continue
             result['rejected_components'] += 1
-            for start in range(0, len(indices), 500):
-                checkpoint()
-                component_keys = [keys[index] for index in indices[start:start+500]]
-                evidence = {key: [] for key in component_keys}
-                statement = 'SELECT key,class,weight FROM votes WHERE key IN ('+','.join('?' for _ in component_keys)+')'
-                for key, code, weight in self.db.execute(statement, component_keys):
-                    evidence[bytes(key)].append((int(code), float(weight)))
-                updates = []
-                for key in component_keys:
-                    votes = evidence[key]
-                    alternatives = [item for item in votes if item[0] != stairs_code]
-                    if not alternatives:
-                        updates.append((1, 0, key))
-                        result['reclassified_voxels']['1'] = result['reclassified_voxels'].get('1', 0)+1
-                        continue
-                    code, weight = min(alternatives, key=lambda item: (-item[1], order.get(item[0], 1000+item[0])))
-                    total = sum(item[1] for item in votes)
-                    confidence = int(round(weight*255/total)) if total else 0
-                    updates.append((code, confidence, key))
-                    target = str(code)
-                    result['reclassified_voxels'][target] = result['reclassified_voxels'].get(target, 0)+1
-                self.db.executemany('UPDATE decisions SET code=?,confidence=? WHERE key=?', updates)
+            indices = data['indices']
+            # A component can contain a horizontal floor-level fragment even
+            # when the full component is rejected.  Preserve that correction.
+            component_coordinates = coordinates[indices]
+            levels, centres = self._stair_levels(component_coordinates, voxel_size, level_tolerance)
+            returned = np.empty(0, np.int64)
+            if floor_tree is not None and len(levels):
+                distance, nearby = floor_tree.query(centres, distance_upper_bound=floor_ring_radius, workers=-1)
+                matching = np.zeros(len(levels), bool)
+                valid_floor = np.isfinite(distance)
+                matching[valid_floor] = np.abs(floor_heights[nearby[valid_floor]]-levels[valid_floor]) <= floor_level_tolerance
+                if matching.any():
+                    height_match = np.zeros(len(indices), bool)
+                    for level in levels[matching]:
+                        height_match |= np.abs((component_coordinates[:, 2]+.5)*voxel_size-level) <= level_tolerance
+                    returned = indices[height_match]
+            remaining = indices[~np.isin(indices, returned)]
+            self._restore_stairs(keys, remaining, stairs_code, order, result, checkpoint)
         self.db.commit()
         self._invalidate_lookup()
         return result
 
-    def remove_small_components(self, voxel_size, default_minimum, special_rules=(), checkpoint=lambda: None):
+    def remove_small_components(self, voxel_size, default_minimum, special_rules=(), checkpoint=lambda: None,
+                                *, component_min_cells=1, feature_cell_size=.10,
+                                sparse_maximum_voxels_per_cell=1, outdoor_codes=()):
         """Turn isolated semantic voxel islands back into class 1.
 
         Components use 26-neighbour connectivity so a thin diagonal cable is
@@ -544,10 +694,23 @@ class VoteStore:
         default minimum and no span requirement.
         """
         rules = {int(code): (int(minimum), float(span)) for code, minimum, span in special_rules}
+        outdoor_codes = {int(code) for code in outdoor_codes}
         removed, components = 0, 0
         codes = [row[0] for row in self.db.execute('SELECT DISTINCT code FROM decisions WHERE code != 1')]
+        feature_cells_available = self.db.execute(
+            "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='geometry_voxels'").fetchone() is not None
         for code in codes:
-            rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (code,)))
+            if feature_cells_available and code not in rules:
+                rows = list(self.db.execute('''SELECT d.key,g.cx,g.cy,g.cz,COALESCE(c.outdoor,0),COALESCE(c.indoor,0)
+                                             FROM decisions d JOIN geometry_voxels g USING(key)
+                                             LEFT JOIN geometry_context c USING(key) WHERE d.code=?''', (code,)))
+                cells = np.asarray([row[1:] for row in rows], np.int64) if rows else np.empty((0, 3), np.int64)
+                contexts = cells[:, 3:] if len(cells) else np.empty((0, 2), np.int64)
+                cells = cells[:, :3]
+            else:
+                rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (code,)))
+                cells = None
+                contexts = None
             if not rows:
                 continue
             keys = [bytes(row[0]) for row in rows]
@@ -559,7 +722,34 @@ class VoteStore:
             high = np.full((count, 3), np.iinfo(np.int64).min, np.int64)
             np.minimum.at(low, labels, coordinates)
             np.maximum.at(high, labels, coordinates)
-            rejected = np.flatnonzero(((sizes < minimum) | ((high-low).max(axis=1)*voxel_size < minimum_span))[labels])
+            too_small = ((sizes < minimum) | ((high-low).max(axis=1)*voxel_size < minimum_span))[labels]
+            # Cable and electrical exceptions intentionally keep their historic
+            # voxel/span rule.  A coarse-cell exception is only for genuinely
+            # sparse observations made from an outdoor scan.  Dense interiors,
+            # and every component without positive exterior evidence, keep the
+            # historic voxel threshold even where 10 cm cells connect.
+            if code not in rules and component_min_cells > 1:
+                if cells is None:
+                    cells = np.floor(coordinates*voxel_size/feature_cell_size).astype(np.int64)
+                # Coarse cells may bridge 2 cm gaps in a thin distant raster.
+                # Keep that shared connectivity, but measure density per voxel
+                # component so dense interior islands cannot borrow a remote
+                # sparse grid as an exemption.
+                unique_cells, cell_inverse = np.unique(cells, axis=0, return_inverse=True)
+                cell_count, cell_labels = self._sparse_components(unique_cells)
+                feature_sizes = np.bincount(cell_labels, minlength=cell_count)
+                pairs, inverse = np.unique(np.column_stack((labels, cells)), axis=0, return_inverse=True)
+                occupancies = np.bincount(inverse)
+                spare = np.zeros(count, bool)
+                for component in np.flatnonzero(sizes < minimum):
+                    local = occupancies[pairs[:, 0] == component]
+                    sparse = np.median(local) <= sparse_maximum_voxels_per_cell
+                    local_feature_labels = np.unique(cell_labels[cell_inverse[labels == component]])
+                    connected = np.any(feature_sizes[local_feature_labels] >= component_min_cells)
+                    outdoor_observed = contexts is not None and np.any(contexts[labels == component, 0])
+                    spare[component] = connected and sparse and outdoor_observed
+                too_small &= ~spare[labels]
+            rejected = np.flatnonzero(too_small)
             components += count
             for start in range(0, len(rejected), 50000):
                 checkpoint()

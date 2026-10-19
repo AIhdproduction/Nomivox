@@ -126,6 +126,7 @@
   "input_mode_slam": "Kinematisch (SLAM)",
   "input_mode_static_detected": "Aufnahmeart: Statisch (TLS)",
   "input_mode_slam_detected": "Aufnahmeart: Kinematisch (SLAM)",
+  "input_mode_unknown": "Aufnahmeart: Unbekannt",
   "input_mode_reasons": "Gründe: {reasons}",
   "input_mode_no_slam_evidence": "Keine Hinweise auf eine kinematische Aufnahme erkannt.",
   "input_mode_mixed": "Warnung: Gemischte Hinweise erkannt; kinematische Aufnahme wird verwendet.",

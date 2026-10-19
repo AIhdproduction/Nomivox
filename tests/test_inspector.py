@@ -7,7 +7,7 @@ import pye57
 import pytest
 
 from e57cls.files import file_hash
-from e57cls.io.inspector import image_header, inspect_file, pose_status, write_inspection
+from e57cls.io.inspector import INSPECTION_SCHEMA, image_header, inspect_file, pose_status, write_inspection
 from e57cls.io.reader import E57Reader, coordinates
 
 
@@ -30,6 +30,7 @@ def test_bounded_inspection_preserves_input_and_reports_absent_images(source, tm
     report = write_inspection(source, tmp_path / "out", 4)
     assert file_hash(source) == before
     assert report["record_count"] == 11
+    assert report["schema_version"] == INSPECTION_SCHEMA
     assert report["image_count"] == 0
     sample = report["scans"][0]["sample"]
     assert sample["records_read"] == 4

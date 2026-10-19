@@ -17,6 +17,7 @@ from e57cls.io.input_mode import detect_input_mode
 
 REPRESENTATIONS = ("sphericalRepresentation", "pinholeRepresentation",
                    "cylindricalRepresentation", "visualReferenceRepresentation")
+INSPECTION_SCHEMA = 2
 LOG = logging.getLogger(__name__)
 
 
@@ -203,7 +204,7 @@ def inspect_file(source: Path, sample_points: int = 100_000, config: dict | None
     after = source.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise RuntimeError("Input changed during inspection")
-    report = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
+    report = {"schema_version": INSPECTION_SCHEMA, "created_utc": datetime.now(timezone.utc).isoformat(),
             "source": {"path": str(source), "bytes": before.st_size, "mtime_ns": before.st_mtime_ns},
             "versions": {"python": platform.python_version(), **{k: version(k) for k in ("pye57", "numpy", "Pillow")}},
             "metadata": file_meta, "scan_count": len(scans), "image_count": len(images),

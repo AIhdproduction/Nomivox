@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication,QFileDialog,QInputDialog,QMessageBox
 from e57cls.gui.eta import RunEstimator
 from e57cls.gui import window as window_module
 from e57cls.gui.window import MainWindow,tr
+from e57cls.io.inspector import INSPECTION_SCHEMA
 
 
 @pytest.fixture(scope='session')
@@ -119,7 +120,9 @@ def test_preview_uses_cached_report_without_process(tmp_path, qt_application):
     key = window.source_preview_key()
     directory = window.preview_directory(key)
     directory.mkdir(parents=True)
-    report = dict(scan_count=1,image_count=0,record_count=11,images=[],metadata={'guid':'cached'},
+    report = dict(schema_version=INSPECTION_SCHEMA,
+                  input_mode=dict(mode='static', requested='auto', mixed=False, warnings=[], rules=[]),
+                  scan_count=1,image_count=0,record_count=11,images=[],metadata={'guid':'cached'},
                   scans=[dict(metadata={'name':'cached'},record_count=11,image_indices=[],
                               pose_status='valid',classification_eligible_metadata=False)])
     (directory/'inspect_report.json').write_text(json.dumps(report),encoding='utf-8')
@@ -129,6 +132,33 @@ def test_preview_uses_cached_report_without_process(tmp_path, qt_application):
         assert window.preview_process.state() == QProcess.ProcessState.NotRunning
         assert window.summary.text() == tr('input_summary',scans=1,images=0,points=11)
         assert window.scan_table.item(0,1).text() == 'cached'
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_preview_ignores_old_cached_report_and_recreates_it(tmp_path, qt_application):
+    source = tmp_path/'fixture.e57'
+    write_preview_source(source, 11)
+    window = MainWindow(None,auto_start=False)
+    window.cache_path.setText(str(tmp_path/'cache'))
+    window.source = source
+    directory = window.preview_directory(window.source_preview_key())
+    directory.mkdir(parents=True)
+    old_report = dict(scan_count=1,image_count=0,record_count=11,images=[],metadata={'guid':'cached'},
+                      scans=[dict(metadata={'name':'cached'},record_count=11,image_indices=[],
+                                  pose_status='valid',classification_eligible_metadata=False)])
+    report_path = directory/'inspect_report.json'
+    report_path.write_text(json.dumps(old_report),encoding='utf-8')
+    try:
+        window.update_source_ui()
+        window.start_preview()
+        wait_for_gui(qt_application,lambda:window.summary.text() == tr('input_summary',scans=1,images=0,points=11))
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+        assert report['schema_version'] == INSPECTION_SCHEMA
+        assert report['input_mode']['mode'] == 'static'
+        assert window.scan_table.item(0,1).text() == 'fixture'
     finally:
         window.close()
         window.deleteLater()
@@ -148,6 +178,21 @@ def test_input_mode_is_shown_from_preview_report(tmp_path, qt_application):
         assert 'Kinematisch (SLAM)' in window.input_mode_status.text()
         assert '6 Bilder' in window.input_mode_status.text()
         assert 'Gemischte Hinweise' in window.input_mode_status.text()
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+
+
+def test_old_run_report_shows_unknown_input_mode(tmp_path, qt_application):
+    report = dict(scan_count=1, image_count=0, record_count=11, images=[], metadata={}, scans=[])
+    path = tmp_path/'inspect_report.json'
+    path.write_text(json.dumps(report), encoding='utf-8')
+    window = MainWindow(tmp_path/'input.e57', auto_start=False)
+    window.config = {'output': str(tmp_path)}
+    try:
+        assert window.read_inspection(path)
+        assert window.input_mode_status.text() == tr('input_mode_unknown')
     finally:
         window.close()
         window.deleteLater()

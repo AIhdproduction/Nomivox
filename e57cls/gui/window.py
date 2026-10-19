@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QForm
 from e57cls.files import atomic_json
 from e57cls.geometry.cameras import Camera, plan_views
 from e57cls.gui.eta import RunEstimator, load_profile, save_profile
+from e57cls.io.inspector import INSPECTION_SCHEMA
 from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
 from e57cls.scene.presets import validate_preset
@@ -208,9 +209,9 @@ class MainWindow(QMainWindow):
         source = self.source.resolve()
         try:
             stat = source.stat()
-            value = f'{source}|{stat.st_size}|{stat.st_mtime_ns}'
+            value = f'{source}|{stat.st_size}|{stat.st_mtime_ns}|inspection-schema:{INSPECTION_SCHEMA}'
         except OSError:
-            value = f'{source}|missing'
+            value = f'{source}|missing|inspection-schema:{INSPECTION_SCHEMA}'
         return sha256(value.encode('utf-8')).hexdigest()
 
     def preview_directory(self,key):
@@ -229,7 +230,9 @@ class MainWindow(QMainWindow):
     def preview_report_complete(self,path):
         try:
             report = json.loads(path.read_text(encoding='utf-8'))
-            return all(key in report for key in ('scan_count','image_count','record_count','scans','images','metadata'))
+            return (report.get('schema_version') == INSPECTION_SCHEMA
+                    and isinstance(report.get('input_mode'), dict)
+                    and all(key in report for key in ('scan_count','image_count','record_count','scans','images','metadata')))
         except (OSError,ValueError,TypeError):
             return False
 
@@ -1178,7 +1181,13 @@ class MainWindow(QMainWindow):
             return False
 
     def show_input_mode(self, value):
-        if not value or not hasattr(self, 'input_mode_status'):
+        if not hasattr(self, 'input_mode_status'):
+            return
+        if not isinstance(value, dict) or value.get('mode') not in ('static', 'slam'):
+            self.input_mode_status.setText(tr('input_mode_unknown'))
+            self.input_mode_status.setProperty('status', 'warning')
+            self.input_mode_status.style().unpolish(self.input_mode_status)
+            self.input_mode_status.style().polish(self.input_mode_status)
             return
         mode = value.get('mode', 'static')
         title = tr('input_mode_slam_detected') if mode == 'slam' else tr('input_mode_static_detected')

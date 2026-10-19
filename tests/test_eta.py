@@ -33,6 +33,19 @@ def test_current_stage_accounts_for_partial_unit_time():
     assert (total, maximum) == (2980.0, 5280.0)
 
 
+def test_view_progress_uses_variable_view_counts_as_work_units():
+    value = RunEstimator(applies={'segmentation': True}, unit_counts={'segmentation': 25})
+    value.phase_started('segmentation', 0)
+    value.progress('segmentation', 0, scan=1, image=1, view=1, view_count=17)
+    _, _, stage, _ = value.remaining(0)
+    assert stage == 25*DEFAULT_PROFILE['segmentation']['avg_seconds']
+    value.progress('segmentation', 10, scan=1, image=1, view=2, view_count=17)
+    assert value.measurements['segmentation'] == [10.0]
+    assert value.current_unit == (1, 2)
+    value.progress('segmentation', 20, scan=1, image=2, view=1, view_count=8)
+    assert value.current_unit == (2, 1)
+
+
 def test_mirror_stage_transition_uses_last_mask_progress_for_evidence_start():
     value = RunEstimator(applies={'mirror_masks': True, 'mirror_evidence': True},
                          unit_counts={'mirror_masks': 2, 'mirror_evidence': 2})

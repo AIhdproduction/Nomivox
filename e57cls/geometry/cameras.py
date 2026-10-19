@@ -152,7 +152,18 @@ def plan_views(camera: Camera, profile: str = "balanced", cap: int = 1512, fov: 
         return []
     if profile not in ("fast", "balanced", "high"):
         raise ValueError("Unknown view profile")
-    size = min(cap, max(1, round(2*math.tan(math.radians(fov)/2)/min(camera.params["pixelWidth"], camera.params["pixelHeight"]))))
-    rings = [(0, 6), (50, 3)] if profile == "fast" else [(0, 8), (50, 4), (-50, 4), (90, 1)]
-    return [View(f"view_{i:02d}", yaw, pitch, fov, size)
-            for i, (yaw, pitch) in enumerate((360*j/n, pitch) for pitch, n in rings for j in range(n))]
+    rings = ([(0, 6, fov), (50, 3, fov)] if profile == "fast"
+             else [(0, 8, fov), (50, 4, fov), (-50, 4, fov), (90, 1, fov)])
+    if profile == "high":
+        # Keep the established views and their IDs intact so their cached SAM
+        # masks remain reusable.  The dedicated narrow-FOV ring follows them.
+        rings.append((-10, 8, 50))
+
+    def size_for(view_fov):
+        return min(cap, max(1, round(2*math.tan(math.radians(view_fov)/2)
+                                    / min(camera.params["pixelWidth"], camera.params["pixelHeight"]))))
+
+    return [View(f"view_{i:02d}", yaw, pitch, view_fov,
+                 size_for(view_fov))
+            for i, (yaw, pitch, view_fov) in enumerate((360*j/n, pitch, view_fov)
+                                                         for pitch, n, view_fov in rings for j in range(n))]

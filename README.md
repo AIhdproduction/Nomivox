@@ -118,6 +118,9 @@ can change substantially. Until enough progress is available, it displays
 2. **Prepare images.** Panoramas are rendered into perspective views for SAM.
    Scan and camera poses are handled separately. Spherical, cylindrical, and
    pinhole camera models are implemented; the real test dataset contains panoramas.
+   The **Hohe Genauigkeit** profile additionally renders eight 50° views at −10°
+   pitch for distant surfaces just below the horizon. This increases SAM work by
+   approximately 45% and does not affect the fast or balanced profiles.
 3. **Analyze mirrors and glass.** Text prompts produce masks. Planes are estimated
    from their outer edges and neighboring walls; the depth rule determines class 68.
 4. **Determine the scene.** Sky, ceiling, and upper-hemisphere laser returns provide

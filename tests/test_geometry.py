@@ -61,6 +61,27 @@ def test_view_projection_uses_axis_depth_not_radial():
     assert len(plan_views(spherical(), profile="fast")) == 9
 
 
+def test_high_profile_adds_narrow_far_range_views_without_changing_existing_plans():
+    camera = spherical()
+    balanced = plan_views(camera, profile="balanced")
+    fast = plan_views(camera, profile="fast")
+    high = plan_views(camera, profile="high")
+    expected_balanced = [(f"view_{i:02d}", yaw, pitch, 95, 125)
+                         for i, (yaw, pitch) in enumerate((360*j/n, pitch)
+                                                              for pitch, n in ((0, 8), (50, 4), (-50, 4), (90, 1))
+                                                              for j in range(n))]
+    expected_fast = [(f"view_{i:02d}", yaw, pitch, 95, 125)
+                     for i, (yaw, pitch) in enumerate((360*j/n, pitch)
+                                                          for pitch, n in ((0, 6), (50, 3))
+                                                          for j in range(n))]
+    assert [(v.id, v.yaw, v.pitch, v.fov_degrees, v.size) for v in balanced] == expected_balanced
+    assert [(v.id, v.yaw, v.pitch, v.fov_degrees, v.size) for v in fast] == expected_fast
+    assert [(v.id, v.yaw, v.pitch, v.fov_degrees, v.size) for v in high[:17]] == expected_balanced
+    assert [(v.id, v.yaw, v.pitch, v.fov_degrees, v.size) for v in high[17:]] == [
+        (f"view_{i:02d}", 45*(i-17), -10, 50, 53) for i in range(17, 25)]
+    assert all(view.size <= 60 for view in plan_views(camera, profile="high", cap=60))
+
+
 def test_visibility_rejects_background_and_uses_max_tolerance():
     buffer = DepthBuffer(5, 5, radius=0)
     uv = np.array([[2.5, 2.5], [2.5, 2.5], [2.5, 2.5]])

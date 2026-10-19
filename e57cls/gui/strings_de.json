@@ -141,6 +141,7 @@
   "profile_fast": "Schnell",
   "profile_balanced": "Ausgewogen",
   "profile_high": "Hohe Genauigkeit",
+  "profile_high_tooltip": "Hoch: zusätzliche Fernbereich-Ansichten knapp unter dem Horizont (ca. +45 % Rechenzeit)",
   "output_format": "Ausgabeformat",
   "output_format_e57": "E57 (mit Bildern und Klassen)",
   "output_format_e57_tooltip": "Die Klassen stehen im E57-Erweiterungsfeld nomivox:classification; nicht jedes Programm zeigt dieses Feld an.",

@@ -50,7 +50,7 @@ def load_profile(path):
 
 
 class RunEstimator:
-    """Estimate remaining work from completed scan-sized units.
+    """Estimate remaining work from completed units.
 
     Paused intervals are removed when matching ``state`` events are supplied.
     Without those events, elapsed time is necessarily treated as active time.
@@ -153,7 +153,9 @@ class RunEstimator:
             return
         if phase not in STAGES:
             return
-        if phase == "sam" and isinstance(event.get("scan_count"), int):
+        view_unit = (isinstance(event.get("image"), int) and isinstance(event.get("view"), int)
+                     and event["view"] >= 1)
+        if phase == "sam" and not view_unit and isinstance(event.get("scan_count"), int):
             self.set_unit_count(phase, event["scan_count"])
             if self.unit_indices[phase] is None:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
@@ -164,7 +166,8 @@ class RunEstimator:
             if self.unit_indices[phase] is None:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
         self._start_stage(phase, now)
-        unit = event.get("image") if phase == "mirror_masks" else event.get("scan")
+        unit = ((event["image"], event["view"]) if view_unit
+                else event.get("image") if phase == "mirror_masks" else event.get("scan"))
         if phase == "mirror_evidence":
             self._complete_current(now)
             if isinstance(unit, int):

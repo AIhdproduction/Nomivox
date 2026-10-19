@@ -187,6 +187,25 @@ def test_full_pipeline_and_voting_only_rerun(tmp_path):
     assert resumed['sam_calls'] < report['sam_calls']
 
 
+def test_high_profile_pipeline_runs_with_fake_backend(tmp_path):
+    source = tmp_path/'high-profile.e57'
+    small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset['scene_resolved_pairs'] = []
+    preset_path = tmp_path/'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path/'model.pt'; model.write_bytes(b'synthetic backend')
+    config = resolve_config(dict(source=str(source), cache=str(tmp_path/'cache'), output=str(tmp_path/'out'),
+                                 preset=str(preset_path), model=str(model), profile='high', scene_mode='indoor',
+                                 view_size=128, boundary_margin=0, depth_width=256, mirror_analysis=True,
+                                 component_cleanup=False, point_reduction=0, format='las', cache_cleanup='keep_masks'))
+    backend = RecordingBackend()
+    report = execute(config, lambda: backend, listen=False)
+    assert backend.calls == 25
+    assert report['sam_calls'] == 25
+    assert report['output']['class_counts']['100'] == 121
+
+
 def test_shared_sam_batches_class_and_reflection_prompts_once_per_view(tmp_path, monkeypatch):
     """Shared mode intentionally creates reflection masks at class-view resolution."""
     source = tmp_path/'shared.e57'

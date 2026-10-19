@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QForm
     QProgressBar,QFileDialog,QMessageBox,QDoubleSpinBox,QSpinBox,QScrollArea,QInputDialog,QFrame,
     QListWidget,QToolButton)
 from e57cls.files import atomic_json
+from e57cls.geometry.cameras import Camera, plan_views
 from e57cls.gui.eta import RunEstimator, load_profile, save_profile
 from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
@@ -483,6 +484,7 @@ class MainWindow(QMainWindow):
         for key in ('fast','balanced','high'):
             self.profile.addItem(tr('profile_'+key),key)
         self.profile.setCurrentIndex(1)
+        self.profile.setToolTip(tr('profile_high_tooltip'))
         self.settings_row(sections['settings_group_profile_output'],tr('profile'),self.profile)
         self.controls = {}
         specifications = {
@@ -1195,14 +1197,27 @@ class MainWindow(QMainWindow):
         report = getattr(self,'inspection_report',None)
         if report is None:
             return
-        self.estimator.set_unit_count('mirror_masks',sum(bool(scan['image_indices']) for scan in report['scans']))
+        config = {**DEFAULTS, **(self.config or {})}
+
+        def planned_views(item):
+            if item.get('pose_status') != 'valid':
+                return 0
+            try:
+                kind = next(kind for kind in item['representations'] if kind != 'visualReferenceRepresentation')
+                camera = Camera(kind, item['metadata'][kind])
+                return len(plan_views(camera, config['profile'], config['view_size'], config['view_fov']) or [None])
+            except (KeyError, StopIteration, TypeError, ValueError):
+                return 0
+
+        image_views = {item['index']: planned_views(item) for item in report['images']}
+        scan_view_counts = [sum(image_views.get(index, 0) for index in scan['image_indices']) for scan in report['scans']]
+        eligible_view_count = sum(count for count, scan in zip(scan_view_counts, report['scans'])
+                                  if scan['classification_eligible_metadata'])
+        self.estimator.set_unit_count('mirror_masks',sum(scan_view_counts))
         self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
-        self.estimator.set_unit_count('sam',report['scan_count'])
-        self.estimator.set_unit_count('segmentation',sum(bool(scan['classification_eligible_metadata']) for scan in report['scans']))
+        self.estimator.set_unit_count('sam',eligible_view_count)
+        self.estimator.set_unit_count('segmentation',eligible_view_count)
         self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
-        self.estimator.set_unit_indices('sam',range(1,report['scan_count']+1))
-        self.estimator.set_unit_indices('segmentation',[index for index,scan in enumerate(report['scans'],1)
-                                                        if scan['classification_eligible_metadata']])
 
     def set_running(self,running):
         self.class_widget.setEnabled(not running and self.processing_mode.currentData() != 'filter_only')

@@ -1,5 +1,10 @@
 # Decisions
 
+- 2026-10-19: The high image profile retains the established 17-view plan and
+  adds eight 50° perspectives at −10° pitch for distant surfaces below the
+  horizon. Existing fast and balanced view IDs and cache identities remain
+  unchanged; ETA accounting uses the actual view count of each image.
+
 - 2026-10-19: Stair labels require a stepped geometric profile: at least three
   horizontal levels with a configured rise and tread. Small stair components
   are restored rather than preserved, and levels matching a nearby floor are

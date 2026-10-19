@@ -193,6 +193,30 @@ def test_reflection_eta_uses_parent_phase_and_measured_segmentation_rate(qt_appl
     finally:
         window.close()
         window.deleteLater()
+
+
+def test_high_profile_tooltip_and_eta_use_per_image_view_count(qt_application):
+    window = MainWindow(Path('test.e57'), auto_start=False)
+    window.config = {'profile': 'high', 'view_size': 1512, 'view_fov': 95}
+    window.inspection_report = {
+        'scan_count': 1,
+        'images': [
+            {'index': 1, 'pose_status': 'valid', 'representations': ['sphericalRepresentation'],
+             'metadata': {'sphericalRepresentation': {'imageWidth': 360, 'imageHeight': 180,
+                                                       'pixelWidth': np.pi/180, 'pixelHeight': np.pi/180}}}
+        ],
+        'scans': [{'image_indices': [1], 'classification_eligible_metadata': True}],
+    }
+    window.estimator = RunEstimator(applies={'sam': True, 'mirror_masks': True, 'segmentation': True})
+    try:
+        window.apply_inspection_counts()
+        assert window.profile.toolTip() == tr('profile_high_tooltip')
+        assert window.estimator.unit_counts['sam'] == 25
+        assert window.estimator.unit_counts['mirror_masks'] == 25
+        assert window.estimator.unit_counts['segmentation'] == 25
+    finally:
+        window.close()
+        window.deleteLater()
         QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 

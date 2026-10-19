@@ -8,7 +8,10 @@ import pytest
 
 from e57cls.io.reader import E57Reader
 from e57cls.pipeline.config import resolve_config
-from e57cls.pipeline.run import execute
+from e57cls.geometry.cameras import Camera, Pose
+from e57cls.pipeline import run as run_module
+from e57cls.pipeline.run import _slam_scene, execute
+from e57cls.seg.cache import resize_mask_nearest
 from slam_fixtures import _COLORS, room_labels, write_slam_e57
 
 
@@ -72,9 +75,11 @@ def _expected_labels(points):
     return np.asarray([codes[label] for label in room_labels(points)], np.uint8)
 
 
-def test_slam_pipeline_transfers_visible_labels_and_writes_station_id(tmp_path):
-    source = write_slam_e57(tmp_path / "room.e57", camera_count=6, labelled_images=True, pinhole=True)
-    report, cloud = _classify(tmp_path, source)
+@pytest.mark.parametrize("pinhole", [True, False])
+@pytest.mark.parametrize("image_scale", [1., .9])
+def test_slam_pipeline_transfers_visible_labels_and_writes_station_id(tmp_path, pinhole, image_scale):
+    source = write_slam_e57(tmp_path / "room.e57", camera_count=6, labelled_images=True, pinhole=pinhole)
+    report, cloud = _classify(tmp_path, source, image_scale=image_scale, view_size=127)
     station = np.asarray(cloud.station_id)
     actual = np.asarray(cloud.classification)
     expected = _expected_labels(np.column_stack((cloud.x, cloud.y, cloud.z)))
@@ -87,6 +92,49 @@ def test_slam_pipeline_transfers_visible_labels_and_writes_station_id(tmp_path):
         assert observed.any()
         assert (actual[observed] == code).mean() >= .90
     assert any(item["code"] == "slam_reflection_disabled" for item in report["warnings"])
+
+
+def test_slam_scene_counts_sky_in_score_coordinates(monkeypatch):
+    rendered = np.zeros((5, 7, 3), np.uint8)
+    valid = np.zeros((5, 7), bool)
+    valid[:3, :4] = True
+    scores = np.zeros((4, 6), np.float16)
+    scores[:2] = 1.
+
+    class CameraRecord:
+        camera = Camera("pinholeRepresentation", {"imageWidth": 7, "imageHeight": 5,
+                 "pixelWidth": 1., "pixelHeight": 1., "focalLength": 4.,
+                 "principalPointX": 3.5, "principalPointY": 2.5})
+        pose = Pose(np.eye(3), np.zeros(3))
+        image_index = 1
+
+        def views(self, *args):
+            return [self.camera]
+
+    camera = CameraRecord()
+
+    monkeypatch.setattr(run_module, "_slam_view_image",
+                        lambda *args: (rendered, valid, "image", None, {"id": "native"}))
+    monkeypatch.setattr(run_module, "segment_view", lambda *args: ([scores], {"hits": 0, "misses": 1}))
+
+    class VisibilityCache:
+        def visibility_for_view(self, *args, **kwargs):
+            return type("Visibility", (), {"point_indices": np.empty(0, np.int64)})(), False
+
+    config = {"scene_mode": "auto", "scene_overrides": {}, "slam_max_range": 20.,
+              "slam_max_range_indoor": 20., "slam_max_range_outdoor": 40., "profile": "fast",
+              "view_size": 127, "view_fov": 95., "image_scale": .9, "tile_size": 336,
+              "tile_overlap": 0., "scene_sky_confidence": .5, "scene_sky_outdoor": .2}
+    preset = {"auxiliary": [{"id": "sky", "prompts": ["sky"]}]}
+    control = type("Control", (), {"checkpoint": lambda self: None})()
+
+    scene, info = _slam_scene(config, preset, [camera], {1: {"index": 1}}, None, None, [], VisibilityCache(),
+                              None, None, "model", lambda: None, control)
+
+    score_valid = resize_mask_nearest(valid, scores.shape)
+    expected = ((scores >= .5) & score_valid).sum() / score_valid.sum()
+    assert scene == "outdoor"
+    assert info["sky_fraction"] == expected
 
 
 def test_slam_pipeline_without_scan_pose_uses_world_coordinates(tmp_path):

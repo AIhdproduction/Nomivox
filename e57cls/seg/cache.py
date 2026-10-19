@@ -15,6 +15,17 @@ from e57cls.seg.backend import BACKEND_VERSION, SAM_REVISION
 SCORE_FLOOR = .2
 
 
+def resize_mask_nearest(mask, shape):
+    """Resize a two-dimensional validity mask without interpolating pixels."""
+    mask = np.asarray(mask, bool)
+    height, width = map(int, shape)
+    if mask.ndim != 2 or height < 1 or width < 1:
+        raise ValueError("A two-dimensional mask and positive target shape are required")
+    if mask.shape == (height, width):
+        return mask
+    return np.array(Image.fromarray(mask).resize((width, height), Image.Resampling.NEAREST), bool)
+
+
 def identity_hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -101,7 +112,7 @@ def segment_view(image, valid, classes, backend_factory, cache: MaskCache, image
         height, width = image.shape[:2]
         size = (max(1, round(width*scale)), max(1, round(height*scale)))
         scaled = Image.fromarray(image).resize(size, Image.Resampling.LANCZOS)
-        valid_scaled = np.array(Image.fromarray(valid).resize(size, Image.Resampling.NEAREST), bool)
+        valid_scaled = resize_mask_nearest(valid, (size[1], size[0]))
         effective = tile_size
         while True:
             merged = np.zeros((len(missing), size[1], size[0]), np.float32)

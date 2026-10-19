@@ -33,7 +33,7 @@ from e57cls.output.reports import legend_rows, write_legends, write_report
 from e57cls.output.diagnostics import save_overlay
 from e57cls.pipeline.control import Cancelled, Control
 from e57cls.seg.backend import PromptClass, SAM3Backend
-from e57cls.seg.cache import MaskCache, identity_hash, segment_view
+from e57cls.seg.cache import MaskCache, identity_hash, resize_mask_nearest, segment_view
 from e57cls.vote.engine import VoteStore, representatives, voxel_keys
 from e57cls.slam.cameras import build_camera_list, iter_camera_views
 from e57cls.slam.cache import VisibilityCache
@@ -633,8 +633,11 @@ def _slam_scene(config, preset, cameras, image_by_index, reader, index, stores, 
             scores, _ = segment_view(rendered, valid, [PromptClass('sky', tuple(sky['prompts']))], factory,
                 mask_cache, image_hash, {**info, 'slam_scene': True}, model_hash, config['image_scale'],
                 config['tile_size'], config['tile_overlap'], control.checkpoint)
-            sky_pixels += int(((scores[0] >= config['scene_sky_confidence']) & valid).sum())
-            sky_total += int(valid.sum())
+            # SAM scores are stored at ``image_scale``.  Count sky evidence in
+            # that coordinate system so the score and validity masks align.
+            score_valid = resize_mask_nearest(valid, scores[0].shape)
+            sky_pixels += int(((scores[0] >= config['scene_sky_confidence']) & score_valid).sum())
+            sky_total += int(score_valid.sum())
         # Only z-buffer-visible points contribute to the overhead decision.
         if len(visibility.point_indices):
             world, _ = _slam_point_values(stores, visibility.point_indices)

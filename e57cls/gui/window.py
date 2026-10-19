@@ -72,6 +72,8 @@ class MainWindow(QMainWindow):
         self.estimate_phase = ''
         self.estimate_fraction = 0.
         self.estimator = RunEstimator()
+        self.run_input_mode = None
+        self.slam_plan = {}
         self.timing_profile_path = None
         # Applying the theme here keeps direct MainWindow construction in tests
         # visually identical to the normal launcher path.
@@ -642,10 +644,14 @@ class MainWindow(QMainWindow):
         frame,card = self.card('card_status')
         self.phase = QLabel(tr('ready'))
         self.phase.setObjectName('cardHeading')
+        self.run_input_mode_status = QLabel()
+        self.run_input_mode_status.setWordWrap(True)
+        self.run_input_mode_status.setProperty('class', 'hint')
         self.details = QLabel()
         self.phase_progress = QProgressBar()
         self.phase_progress.setRange(0,1000)
         card.addWidget(self.phase)
+        card.addWidget(self.run_input_mode_status)
         card.addWidget(self.details)
         card.addWidget(self.phase_progress)
         layout.addWidget(frame)
@@ -672,6 +678,9 @@ class MainWindow(QMainWindow):
         self.stop_preview()
         self.config = json.loads((Path(output)/'run.json').read_text(encoding='utf-8'))
         self.reset_estimator()
+        self.run_input_mode = None
+        self.slam_plan = {}
+        self.show_run_input_mode(None)
         self.elapsed_at_event = None
         self.elapsed_event_clock = None
         self.watching = True
@@ -963,6 +972,9 @@ class MainWindow(QMainWindow):
         self.estimate_phase = ''
         self.estimate_fraction = 0.
         self.reset_estimator()
+        self.run_input_mode = None
+        self.slam_plan = {}
+        self.show_run_input_mode(None)
         self.finished_ok = False
         self.input_rejected = False
         self.process.setProcessEnvironment(self.process_environment(self.config['cache']))
@@ -978,6 +990,7 @@ class MainWindow(QMainWindow):
         parallel_shared = (self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter'
                            and bool(self.config.get('mirror_analysis',False))
                            and bool(self.config.get('pipeline_parallel',DEFAULTS['pipeline_parallel'])))
+        slam = self.config.get('input_mode') == 'slam'
         applies = {
             # In the parallel pipeline SAM and local mirror fitting overlap the
             # scan-paced CPU work.  Counting them separately would double-count
@@ -986,7 +999,9 @@ class MainWindow(QMainWindow):
                     and bool(self.config.get('mirror_analysis',False))),
             'mirror_masks': bool(self.config.get('mirror_analysis',False)) and not parallel_shared,
             'mirror_evidence': bool(self.config.get('mirror_analysis',False)),
-            'segmentation': self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
+            'segmentation': not slam and self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
+            'slam_scene': slam,
+            'slam_segmentation': slam and self.config.get('processing_mode','classify_and_filter') == 'classify_and_filter',
         }
         self.estimator = RunEstimator(applies=applies,profile=load_profile(self.timing_profile_path),parallel=parallel_shared)
         self.apply_inspection_counts()
@@ -1065,7 +1080,7 @@ class MainWindow(QMainWindow):
             self.estimator.phase_started(started_phase,timestamp)
             # Only pipeline root phases have a meaningful duration.  Scene
             # detection is performed once per scan inside segmentation.
-            if started_phase in ('inspection','sam','mirror','segmentation','voting','output'):
+            if started_phase in ('inspection','sam','mirror','segmentation','slam_index','slam_scene','slam_segmentation','voting','output'):
                 self.estimate_phase = started_phase
                 self.estimate_fraction = 0.
                 self.phase_fraction = 0.
@@ -1080,7 +1095,7 @@ class MainWindow(QMainWindow):
             self.phase_progress.setValue(round(fraction*1000))
             phase = event.get('phase')
             estimate_phase = 'mirror' if phase in ('mirror_masks','mirror_evidence') else ('output' if phase == 'output_prepare' else phase)
-            if estimate_phase in ('inspection','sam','mirror','segmentation','voting','output'):
+            if estimate_phase in ('inspection','sam','mirror','segmentation','slam_scene','slam_segmentation','voting','output'):
                 self.estimate_phase = estimate_phase
                 self.estimate_fraction = (.1*fraction if phase == 'output_prepare' else (.1+.9*fraction if phase == 'output' else fraction))
             output_fraction = .1*fraction if phase == 'output_prepare' else .1+.9*fraction if phase == 'output' else 0.
@@ -1091,7 +1106,11 @@ class MainWindow(QMainWindow):
             if parallel_shared and phase in ('sam','mirror_masks','segmentation'):
                 self.phase_key = 'parallel'
                 self.phase.setText(STRINGS.get('phase_parallel',tr('state_running')))
-            overall = (.1+.7*fraction if phase == 'segmentation' and parallel_shared
+            weighted_slam = self.estimator.slam_overall_fraction(phase, fraction)
+            overall = (weighted_slam if weighted_slam is not None else .03*fraction if phase == 'slam_index'
+                       else .03+.07*fraction if phase == 'slam_scene'
+                       else .1+.8*fraction if phase in ('slam_segmentation','slam_label_transfer')
+                       else .1+.7*fraction if phase == 'segmentation' and parallel_shared
                        else .1+.35*fraction if phase in ('sam','mirror_masks') and parallel_shared
                        else .3*fraction if phase == 'sam' else .5+.4*fraction if phase == 'segmentation' and shared_sam
                         else .3+.2*fraction if phase in ('mirror_masks','mirror_evidence') and shared_sam
@@ -1119,8 +1138,19 @@ class MainWindow(QMainWindow):
             if report is not None:
                 report['input_mode'] = {key: event[key] for key in ('mode', 'requested', 'rules', 'mixed', 'warnings') if key in event}
             self.show_input_mode(event)
+            self.run_input_mode = event
+            self.estimator.set_slam_mode(event.get('mode') == 'slam',
+                                         (self.config or {}).get('processing_mode', 'classify_and_filter') == 'classify_and_filter')
+            self.show_run_input_mode(event)
+        elif kind == 'slam_plan':
+            self.slam_plan = {**self.slam_plan, **{key: value for key, value in event.items()
+                                                    if key in ('cameras', 'views_total', 'stations', 'scene')}}
+            self.estimator.set_slam_plan(cameras=self.slam_plan.get('cameras'),
+                                         views_total=self.slam_plan.get('views_total'),
+                                         stations=self.slam_plan.get('stations'))
+            self.show_run_input_mode(self.run_input_mode)
         elif kind == 'warning':
-            self.log.appendPlainText(STRINGS.get(event.get('code'),tr('technical_warning')))
+            pass
         elif kind == 'cache_cleanup':
             self.cache_cleanup_freed = event.get('freed_bytes', 0)
         elif kind == 'error':
@@ -1146,14 +1176,15 @@ class MainWindow(QMainWindow):
             freed = getattr(self, 'cache_cleanup_freed', 0)/1_000_000_000
             self.result_label.setText(tr('result_ready',path=event['output'])+f'\nZwischenspeicher freigegeben: {freed:.2f} GB')
             elapsed = int(event.get('elapsed_seconds',0))
-            self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+tr('run_done'))
+            prefix = tr('slam_prefix') if self.estimator.is_slam else ''
+            self.bottom.setText(prefix+tr('elapsed',duration=format_duration(elapsed,True))+' · '+tr('run_done'))
             if self.timing_profile_path:
                 try:
                     save_profile(self.timing_profile_path,self.estimator)
                 except Exception as error:
                     self.log.appendPlainText(str(error))
         if kind != 'progress':
-            self.log.appendPlainText(json.dumps(event,ensure_ascii=False))
+            self.log.appendPlainText(self.format_event(event))
 
     def read_inspection(self,path=None):
         try:
@@ -1173,6 +1204,8 @@ class MainWindow(QMainWindow):
             self.metadata.setPlainText(json.dumps(report['metadata'],ensure_ascii=False,indent=2)[:30000])
             self.inspection_report = report
             self.show_input_mode(report.get('input_mode'))
+            self.run_input_mode = report.get('input_mode')
+            self.show_run_input_mode(self.run_input_mode)
             self.update_slam_ui()
             self.apply_inspection_counts()
             return True
@@ -1202,6 +1235,64 @@ class MainWindow(QMainWindow):
         self.input_mode_status.style().unpolish(self.input_mode_status)
         self.input_mode_status.style().polish(self.input_mode_status)
 
+    def show_run_input_mode(self, value):
+        """Show the detected input mode prominently in the run status card."""
+        if not hasattr(self, 'run_input_mode_status'):
+            return
+        if not isinstance(value, dict) or value.get('mode') not in ('static', 'slam'):
+            self.run_input_mode_status.clear()
+            self.run_input_mode_status.setToolTip('')
+            return
+        rules = value.get('rules', [])
+        rule_a = next((item.get('value', {}) for item in rules if item.get('id') == 'a'), {})
+        if not isinstance(rule_a, dict):
+            rule_a = {}
+        mode = value['mode']
+        if mode == 'slam':
+            images = rule_a.get('valid_images', (self.inspection_report or {}).get('image_count', '–'))
+            blocks = rule_a.get('data3d_blocks', (self.inspection_report or {}).get('scan_count', '–'))
+            stations = self.slam_plan.get('stations', tr('run_input_mode_stations_pending'))
+            text = tr('run_input_mode_slam', images=images, blocks=blocks, stations=stations)
+        else:
+            scans = rule_a.get('data3d_blocks', (self.inspection_report or {}).get('scan_count', '–'))
+            text = tr('run_input_mode_static', scans=scans)
+        details = [f"{item.get('id', '?')}: {item.get('detail', '')}" for item in rules if item.get('detail')]
+        self.run_input_mode_status.setText(text)
+        self.run_input_mode_status.setToolTip('\n'.join(details))
+        self.run_input_mode_status.setProperty('status', 'warning' if mode == 'slam' else 'success')
+        self.run_input_mode_status.style().unpolish(self.run_input_mode_status)
+        self.run_input_mode_status.style().polish(self.run_input_mode_status)
+
+    def format_event(self, event):
+        """Make known worker events useful to people reading a watched run."""
+        kind = event.get('event')
+        utc = str(event.get('utc', ''))
+        stamp = utc[11:19] if len(utc) >= 19 else ''
+        prefix = f'{stamp} ' if stamp else ''
+        phase = STRINGS.get('phase_'+str(event.get('phase', '')), str(event.get('phase', '')))
+        if kind == 'input_mode':
+            rules = ', '.join(str(item.get('id')) for item in event.get('rules', []) if item.get('hit')) or '–'
+            mode = 'SLAM' if event.get('mode') == 'slam' else 'statisch'
+            return prefix+tr('log_input_mode', mode=mode, rules=rules)
+        if kind == 'phase_started':
+            return prefix+tr('log_phase_started', phase=phase)
+        if kind == 'phase_finished':
+            return prefix+tr('log_phase_finished', phase=phase)
+        if kind == 'scene':
+            return prefix+tr('log_scene', scene=tr('scene_'+str(event.get('scene', 'both'))))
+        if kind == 'slam_plan':
+            scene = event.get('scene')
+            suffix = f" · {tr('scene_'+scene)}" if scene in ('indoor', 'outdoor', 'both') else ''
+            return prefix+tr('log_slam_plan', cameras=event.get('cameras', '–'), views=event.get('views_total', '–'),
+                             stations=event.get('stations', '–'), scene=suffix)
+        if kind == 'warning':
+            return prefix+tr('log_warning', detail=event.get('detail') or STRINGS.get(event.get('code'), tr('technical_warning')))
+        if kind == 'error':
+            return prefix+tr('log_error', detail=event.get('detail') or event.get('code', '–'))
+        if kind == 'finished':
+            return prefix+tr('log_finished', output=event.get('output', '–'))
+        return prefix+json.dumps(event, ensure_ascii=False)
+
     def apply_inspection_counts(self):
         report = getattr(self,'inspection_report',None)
         if report is None:
@@ -1226,6 +1317,8 @@ class MainWindow(QMainWindow):
         self.estimator.set_unit_count('mirror_evidence',report['scan_count'])
         self.estimator.set_unit_count('sam',eligible_view_count)
         self.estimator.set_unit_count('segmentation',eligible_view_count)
+        self.estimator.set_unit_count('slam_scene',sum(1 for item in report['images'] if image_views.get(item['index'], 0)))
+        self.estimator.set_unit_count('slam_segmentation',eligible_view_count)
         self.estimator.set_unit_indices('mirror_evidence',range(1,report['scan_count']+1))
 
     def set_running(self,running):
@@ -1267,7 +1360,8 @@ class MainWindow(QMainWindow):
             return
         elapsed = self.current_elapsed()
         remaining = self.estimator.remaining(elapsed)
-        self.bottom.setText(tr('elapsed',duration=format_duration(elapsed,True))+' · '+
+        prefix = tr('slam_prefix') if self.estimator.is_slam else ''
+        self.bottom.setText(prefix+tr('elapsed',duration=format_duration(elapsed,True))+' · '+
                             (tr('remaining',duration=format_duration(remaining[2]),max_duration=format_duration(remaining[3])) if remaining is not None else tr('estimate_pending'))+' · '+
                             (tr('total_remaining',duration=format_duration(remaining[0]),max_duration=format_duration(remaining[1])) if remaining is not None else tr('total_estimate_pending')))
 

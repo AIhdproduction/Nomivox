@@ -240,6 +240,82 @@ def test_reflection_eta_uses_parent_phase_and_measured_segmentation_rate(qt_appl
         window.deleteLater()
 
 
+def test_slam_events_update_progress_details_and_eta(qt_application):
+    window = MainWindow(Path('test.e57'), auto_start=False)
+    try:
+        window.config = {'input_mode': 'slam', 'processing_mode': 'classify_and_filter'}
+        window.estimator = RunEstimator(applies={'slam_scene': True, 'slam_segmentation': True},
+                                        unit_counts={'slam_scene': 2, 'slam_segmentation': 4})
+        window.handle_event(dict(event='phase_started', phase='slam_scene', elapsed_seconds=0))
+        window.handle_event(dict(event='progress', phase='slam_scene', fraction=.5, image=1, image_count=2,
+                                 elapsed_seconds=10))
+        assert window.current_fraction == .065
+        window.handle_event(dict(event='phase_started', phase='slam_segmentation', elapsed_seconds=10))
+        window.handle_event(dict(event='progress', phase='slam_segmentation', fraction=.5, station=1, station_count=2,
+                                 image=1, image_count=2, view=2, view_count=4, elapsed_seconds=20))
+        assert window.current_fraction == .5
+        assert window.details.text() == tr('progress_detail', scan='–', scans='–', image=1, images=2, view=2, views=4)
+        assert window.estimator.remaining(20) is not None
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_run_status_shows_input_mode_and_formats_known_watch_events(qt_application):
+    window = MainWindow(Path('test.e57'), auto_start=False)
+    try:
+        slam = dict(event='input_mode', mode='slam', requested='auto', mixed=False, warnings=[], rules=[
+            dict(id='a', hit=True, value={'valid_images': 71, 'data3d_blocks': 1}, detail='71 Bilder mit gültiger Pose')])
+        window.handle_event(slam)
+        window.handle_event(dict(event='slam_plan', cameras=71, views_total=1207, stations=19))
+        assert 'mobil / SLAM' in window.run_input_mode_status.text()
+        assert '71 Kamerabilder' in window.run_input_mode_status.text()
+        assert '19 virtuelle Standpunkte' in window.run_input_mode_status.text()
+        assert 'a: 71 Bilder' in window.run_input_mode_status.toolTip()
+        window.handle_event(dict(event='phase_started', phase='slam_segmentation', utc='2026-10-19T13:46:33+00:00'))
+        window.handle_event(dict(event='progress', phase='slam_segmentation', fraction=.5, image=1, view=1))
+        assert 'Phase gestartet: SLAM-Bilder mit SAM segmentieren' in window.log.toPlainText()
+        assert '"event": "progress"' not in window.log.toPlainText()
+        window.handle_event(dict(event='input_mode', mode='static', requested='auto', mixed=False, warnings=[], rules=[
+            dict(id='a', hit=False, value={'valid_images': 2, 'data3d_blocks': 4}, detail='Statische Zuordnung')]))
+        assert 'Eingabe: statisch – 4 Scans' == window.run_input_mode_status.text()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_watch_replays_slam_events_with_readable_log(tmp_path, qt_application):
+    preset = Path('presets/default.json').resolve()
+    config = {'output': str(tmp_path), 'cache': str(tmp_path/'cache'), 'preset': str(preset),
+              'processing_mode': 'classify_and_filter', 'input_mode': 'auto', 'scene_mode': 'both'}
+    report = {'scan_count': 1, 'image_count': 71, 'record_count': 1, 'images': [], 'scans': [], 'metadata': {},
+              'input_mode': {'mode': 'slam', 'requested': 'auto', 'mixed': False, 'warnings': [],
+                             'rules': [dict(id='a', hit=True,
+                                            value={'valid_images': 71, 'data3d_blocks': 1}, detail='71 Bilder mit gültiger Pose')]}}
+    events = [
+        {'version': 1, 'event': 'input_mode', **report['input_mode'], 'utc': '2026-10-19T13:46:30+00:00', 'elapsed_seconds': 0},
+        {'version': 1, 'event': 'slam_plan', 'cameras': 71, 'views_total': 1207, 'stations': 19,
+         'utc': '2026-10-19T13:46:31+00:00', 'elapsed_seconds': 1},
+        {'version': 1, 'event': 'phase_started', 'phase': 'slam_segmentation',
+         'utc': '2026-10-19T13:46:33+00:00', 'elapsed_seconds': 3},
+        {'version': 1, 'event': 'progress', 'phase': 'slam_segmentation', 'fraction': .5, 'image': 1,
+         'image_count': 71, 'view': 1, 'view_count': 17, 'elapsed_seconds': 4},
+    ]
+    (tmp_path/'run.json').write_text(json.dumps(config), encoding='utf-8')
+    (tmp_path/'inspect_report.json').write_text(json.dumps(report), encoding='utf-8')
+    (tmp_path/'events.jsonl').write_text('\n'.join(json.dumps(event) for event in events)+'\n', encoding='utf-8')
+    window = MainWindow(Path('test.e57'), auto_start=False)
+    try:
+        window.watch(tmp_path)
+        assert 'mobil / SLAM' in window.run_input_mode_status.text()
+        assert '13:46:30 Eingabemodus: SLAM (a)' in window.log.toPlainText()
+        assert 'Phase gestartet: SLAM-Bilder mit SAM segmentieren' in window.log.toPlainText()
+        assert '"event": "progress"' not in window.log.toPlainText()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def test_high_profile_tooltip_and_eta_use_per_image_view_count(qt_application):
     window = MainWindow(Path('test.e57'), auto_start=False)
     window.config = {'profile': 'high', 'view_size': 1512, 'view_fov': 95}

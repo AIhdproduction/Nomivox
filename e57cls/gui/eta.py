@@ -13,14 +13,17 @@ from pathlib import Path
 from e57cls.files import atomic_json
 
 
-STAGES = ("sam", "mirror_masks", "mirror_evidence", "segmentation")
+STAGES = ("sam", "mirror_masks", "mirror_evidence", "segmentation", "slam_scene", "slam_segmentation")
 DEFAULT_PROFILE = {
     "sam": {"avg_seconds": 275.0, "max_seconds": 472.0},
     "mirror_masks": {"avg_seconds": 40.0, "max_seconds": 70.0},
     "mirror_evidence": {"avg_seconds": 103.0, "max_seconds": 511.0},
     "segmentation": {"avg_seconds": 275.0, "max_seconds": 472.0},
+    "slam_scene": {"avg_seconds": 45.0, "max_seconds": 120.0},
+    "slam_segmentation": {"avg_seconds": 275.0, "max_seconds": 472.0},
 }
 PRIOR_WEIGHT = 3
+SLAM_FIXED_PHASE_SECONDS = {"slam_index": 20.0, "voting": 90.0, "output": 90.0}
 
 
 def _number(value):
@@ -43,7 +46,8 @@ def load_profile(path):
         units = value.get("units")
         average = value.get("avg_seconds")
         maximum = value.get("max_seconds")
-        if (isinstance(units, int) and units >= 3 and _number(average) and _number(maximum)
+        minimum_units = 1 if stage in ("slam_scene", "slam_segmentation") else 3
+        if (isinstance(units, int) and units >= minimum_units and _number(average) and _number(maximum)
                 and maximum >= average):
             profile[stage] = {"avg_seconds": float(average), "max_seconds": float(maximum), "units": units}
     return profile
@@ -77,14 +81,48 @@ class RunEstimator:
         self.last_progress_at = {stage: None for stage in STAGES}
         self.phase_started_at = {}
         self.phase_fraction = {}
+        self.current_phase = None
         self.paused_since = None
         self.paused_seconds = 0.0
+        self.slam_plan_received = False
+        self.slam_mode_detected = False
+        self.slam_seen_units = set()
+
+    @property
+    def is_slam(self):
+        return ((self.slam_mode_detected or self.slam_plan_received)
+                and (self.applies["slam_scene"] or self.applies["slam_segmentation"]))
+
+    def set_slam_mode(self, enabled=True, semantic=True):
+        """Enable SLAM accounting after the inspected input mode becomes known."""
+        if enabled:
+            self.slam_mode_detected = True
+            self.applies["slam_scene"] = True
+            self.applies["slam_segmentation"] = bool(semantic)
+            self.applies["segmentation"] = False
+
+    def set_slam_plan(self, cameras=None, views_total=None, stations=None):
+        """Apply the exact mobile-work plan supplied by the pipeline."""
+        self.slam_plan_received = True
+        if isinstance(cameras, int) and cameras >= 0:
+            self.set_unit_count("slam_scene", cameras)
+        if isinstance(views_total, int) and views_total >= 0:
+            self.set_unit_count("slam_segmentation", views_total)
+
+    def _profile_is_learned(self, stage):
+        return int(self.prior_profile[stage].get("units", 0)) >= 1
+
+    def _slam_measurement_count(self):
+        return len(self.measurements["slam_scene"])+len(self.measurements["slam_segmentation"])
+
+    def _slam_seen_count(self):
+        return len(self.slam_seen_units)
 
     @property
     def counts_known(self):
         # ``sam`` is introduced only by the shared pipeline.  Older callers
         # can keep their persisted timing profile without supplying its count.
-        return all(not self.applies[stage] or stage == 'sam' or isinstance(self.unit_counts[stage], int)
+        return all(not self.applies[stage] or stage in ('sam', 'slam_scene', 'slam_segmentation') or isinstance(self.unit_counts[stage], int)
                    and self.unit_counts[stage] >= 0 for stage in STAGES)
 
     def set_unit_count(self, stage, count):
@@ -122,12 +160,17 @@ class RunEstimator:
     def phase_started(self, phase, timestamp):
         now = self._active_time(timestamp)
         self.phase_started_at[phase] = now
+        self.current_phase = phase
         if phase == "sam":
             self._start_stage("sam", now)
         elif phase == "mirror":
             self._start_stage("mirror_masks", now)
         elif phase == "segmentation":
             self._start_stage("segmentation", now)
+        elif phase == "slam_scene":
+            self._start_stage("slam_scene", now)
+        elif phase == "slam_segmentation":
+            self._start_stage("slam_segmentation", now)
         elif phase in ("voting", "output"):
             if self.current_stage in STAGES:
                 self._finish_stage(self.current_stage, now)
@@ -142,6 +185,10 @@ class RunEstimator:
             self._finish_stage("mirror_evidence", now)
         elif phase == "segmentation":
             self._finish_stage("segmentation", now)
+        elif phase == "slam_scene":
+            self._finish_stage("slam_scene", now)
+        elif phase == "slam_segmentation":
+            self._finish_stage("slam_segmentation", now)
 
     def progress(self, phase, timestamp, **event):
         now = self._active_time(timestamp)
@@ -161,13 +208,17 @@ class RunEstimator:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
         if phase == "mirror_masks" and isinstance(event.get("image_count"), int):
             self.set_unit_count(phase, event["image_count"])
+        if phase == "slam_scene" and isinstance(event.get("image_count"), int):
+            self.set_unit_count(phase, event["image_count"])
         if phase == "mirror_evidence" and isinstance(event.get("scan_count"), int):
             self.set_unit_count(phase, event["scan_count"])
             if self.unit_indices[phase] is None:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
         self._start_stage(phase, now)
         unit = ((event["image"], event["view"]) if view_unit
-                else event.get("image") if phase == "mirror_masks" else event.get("scan"))
+                else event.get("image") if phase in ("mirror_masks", "slam_scene") else event.get("scan"))
+        if phase in ("slam_scene", "slam_segmentation") and unit is not None:
+            self.slam_seen_units.add((phase, unit))
         if phase == "mirror_evidence":
             self._complete_current(now)
             if isinstance(unit, int):
@@ -221,6 +272,11 @@ class RunEstimator:
     def per_unit(self, stage):
         prior = self.prior_profile[stage]
         values = self.measurements[stage]
+        if (stage in ("slam_scene", "slam_segmentation") and not values
+                and not self._profile_is_learned(stage) and self._slam_measurement_count() >= 2):
+            measured = self.measurements["slam_scene"]+self.measurements["slam_segmentation"]
+            average = sum(measured)/len(measured)
+            return average, max(measured)
         if not values:
             return float(prior["avg_seconds"]), float(prior["max_seconds"])
         average = (float(prior["avg_seconds"])*PRIOR_WEIGHT+sum(values))/(PRIOR_WEIGHT+len(values))
@@ -262,6 +318,11 @@ class RunEstimator:
         """Return ``(total_estimate, total_max, stage_estimate, stage_max)``."""
         if not self.counts_known:
             return None
+        # Built-in SLAM values are progress weights only.  Do not display an
+        # invented ETA until this run has measured a cadence or a prior run did.
+        if (self.is_slam and self._slam_seen_count() < 2
+                and not any(self._profile_is_learned(stage) for stage in ("slam_scene", "slam_segmentation"))):
+            return None
         now = self._active_time(timestamp)
         stage_estimate = stage_maximum = 0.0
         total_estimate = total_maximum = 0.0
@@ -276,15 +337,30 @@ class RunEstimator:
             if stage == self.current_stage:
                 stage_estimate, stage_maximum = estimate, upper
 
-        segmentation_count = self.unit_counts["segmentation"] if self.applies["segmentation"] else 0
+        segmentation_count = (self.unit_counts["segmentation"] if self.applies["segmentation"]
+                              else self.unit_counts["slam_segmentation"] if self.applies["slam_segmentation"] else 0)
         if self.current_stage in ("voting", "output"):
             fraction = self.phase_fraction.get(self.current_stage, 0.0)
             started = self.phase_started_at.get(self.current_stage)
             if started is not None and 0.0 < fraction < 1.0:
                 phase_remaining = max(0.0, (now-started)*(1.0-fraction)/fraction)
-                return phase_remaining, max(phase_remaining, 0.0), phase_remaining, max(phase_remaining, 0.0)
+                output_remaining = SLAM_FIXED_PHASE_SECONDS["output"] if self.is_slam and self.current_stage == "voting" else 0.0
+                return (phase_remaining+output_remaining, max(phase_remaining, 0.0)+output_remaining,
+                        phase_remaining, max(phase_remaining, 0.0))
+        if self.is_slam:
+            # Indexing, voting and writing have no per-view unit.  Their
+            # bounded estimates still belong to the total SLAM remainder.
+            tail = (SLAM_FIXED_PHASE_SECONDS["voting"]+SLAM_FIXED_PHASE_SECONDS["output"]
+                    if self.current_phase in ("slam_scene", "slam_segmentation")
+                    else sum(SLAM_FIXED_PHASE_SECONDS.values()))
+            total_estimate += tail
+            total_maximum += 2.0*tail
+            if self.current_stage not in STAGES:
+                stage_estimate, stage_maximum = tail, 2.0*tail
+            return total_estimate, total_maximum, stage_estimate, stage_maximum
         if segmentation_count:
-            predicted = segmentation_count*self.per_unit("segmentation")[0]
+            stage = "segmentation" if self.applies["segmentation"] else "slam_segmentation"
+            predicted = segmentation_count*self.per_unit(stage)[0]
             tail = min(900.0, max(120.0, .12*predicted))
         else:
             tail = 60.0
@@ -294,6 +370,28 @@ class RunEstimator:
             stage_estimate, stage_maximum = tail, 2.0*tail
         return total_estimate, total_maximum, stage_estimate, stage_maximum
 
+    def slam_overall_fraction(self, phase, fraction):
+        """Return duration-weighted SLAM progress for the global progress bar."""
+        if not self.is_slam or not self.slam_plan_received:
+            return None
+        scene_count = self.unit_counts["slam_scene"]
+        views_count = self.unit_counts["slam_segmentation"]
+        if not isinstance(scene_count, int) or not isinstance(views_count, int):
+            return None
+        durations = {
+            "slam_index": SLAM_FIXED_PHASE_SECONDS["slam_index"],
+            "slam_scene": scene_count*self.per_unit("slam_scene")[0],
+            "slam_segmentation": views_count*self.per_unit("slam_segmentation")[0],
+            "voting": SLAM_FIXED_PHASE_SECONDS["voting"],
+            "output": SLAM_FIXED_PHASE_SECONDS["output"],
+        }
+        order = ("slam_index", "slam_scene", "slam_segmentation", "voting", "output")
+        if phase not in order:
+            return None
+        total = sum(durations.values())
+        complete = sum(durations[item] for item in order[:order.index(phase)])
+        return max(0.0, min(1.0, (complete+durations[phase]*max(0.0, min(1.0, fraction)))/max(1.0, total)))
+
 
 def save_profile(path, estimator):
     """Persist completed-run measurements, retaining prior values with little data."""
@@ -302,7 +400,7 @@ def save_profile(path, estimator):
     for stage in STAGES:
         values = estimator.measurements[stage]
         prior = estimator.prior_profile[stage]
-        if len(values) >= 3:
+        if len(values) >= (1 if stage in ("slam_scene", "slam_segmentation") else 3):
             average, maximum, units = sum(values)/len(values), max(values), len(values)
         else:
             average = float(prior["avg_seconds"])

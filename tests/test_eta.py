@@ -74,13 +74,17 @@ def test_skipped_stages_for_mirror_off_and_filter_only():
 
 def test_profile_save_and_load_round_trip(tmp_path):
     path = tmp_path/'timing_profile.json'
-    value = RunEstimator(applies={'segmentation': True}, unit_counts={'segmentation': 3})
+    value = RunEstimator(applies={'segmentation': True, 'slam_scene': True, 'slam_segmentation': True}, unit_counts={'segmentation': 3})
     value.measurements['segmentation'] = [120.0, 180.0, 240.0]
+    value.measurements['slam_scene'] = [5.0, 7.0]
+    value.measurements['slam_segmentation'] = [8.0, 10.0]
     save_profile(path, value)
     profile = load_profile(path)
     assert profile['segmentation']['avg_seconds'] == 180.0
     assert profile['segmentation']['max_seconds'] == 240.0
     assert profile['segmentation']['units'] == 3
+    assert profile['slam_scene']['avg_seconds'] == 6.0
+    assert profile['slam_segmentation']['avg_seconds'] == 9.0
     assert profile['mirror_masks'] == DEFAULT_PROFILE['mirror_masks']
 
 
@@ -88,3 +92,24 @@ def test_corrupt_profile_is_ignored(tmp_path):
     path = tmp_path/'timing_profile.json'
     path.write_text('{broken', encoding='utf-8')
     assert load_profile(path) == DEFAULT_PROFILE
+
+
+def test_slam_eta_waits_for_two_views_and_uses_a_learned_profile():
+    value = RunEstimator(applies={'slam_scene': True, 'slam_segmentation': True})
+    value.set_slam_plan(cameras=71, views_total=1207, stations=19)
+    value.phase_started('slam_scene', 0)
+    value.progress('slam_scene', 10, image=1, image_count=71)
+    assert value.remaining(10) is None
+    value.progress('slam_scene', 20, image=2, image_count=71)
+    first = value.remaining(20)
+    value.progress('slam_scene', 30, image=3, image_count=71)
+    second = value.remaining(30)
+    assert first is not None and second is not None
+    assert second[0] <= first[0]
+
+    learned = RunEstimator(applies={'slam_scene': True, 'slam_segmentation': True}, profile={
+        'slam_scene': {'avg_seconds': 5., 'max_seconds': 7., 'units': 71},
+        'slam_segmentation': {'avg_seconds': 6., 'max_seconds': 8., 'units': 1207},
+    })
+    learned.set_slam_plan(cameras=71, views_total=1207, stations=19)
+    assert learned.remaining(0) is not None

@@ -45,8 +45,11 @@ def _dimensions(projector, resolution):
     return source_width, source_height, max(1, round(source_width*scale)), max(1, round(source_height*scale))
 
 
-def _project(world, pose, projector):
-    camera_xyz = pose.from_world(world)
+def _project(world, pose, projector, camera_xyz=None):
+    if camera_xyz is None:
+        camera_xyz = pose.from_world(world)
+    else:
+        camera_xyz = np.asarray(camera_xyz, np.float64)
     return projector.project(camera_xyz), camera_xyz
 
 
@@ -131,7 +134,8 @@ def _footprint_focal(projector, source_width):
 def visibility_for_points(world, point_indices, pose: Pose, projector: View | Camera, *, spacing=None,
                           normals=None, max_range=20., depth_resolution=1024, splat_max_px=6,
                           tolerance_abs=.02, tolerance_rel=.01, device="cuda:0", checkpoint=lambda: None,
-                          splat_batch_entries=8_000_000, close_depth_gaps=True) -> ViewVisibility:
+                          splat_batch_entries=8_000_000, close_depth_gaps=True,
+                          camera_xyz=None) -> ViewVisibility:
     """Calculate visible points with 1-to-``splat_max_px``-pixel square splats."""
     if (not 0 < max_range or not 64 <= int(depth_resolution) or not 1 <= int(splat_max_px) <= 64
             or int(splat_batch_entries) < 1):
@@ -149,7 +153,7 @@ def visibility_for_points(world, point_indices, pose: Pose, projector: View | Ca
     source_width, source_height, width, height = _dimensions(projector, depth_resolution)
     if not len(world):
         return ViewVisibility.empty(width, height)
-    (uv, depth, projected), camera_xyz = _project(world, pose, projector)
+    (uv, depth, projected), camera_xyz = _project(world, pose, projector, camera_xyz)
     valid = projected & (depth >= .3) & (depth <= max_range)
     spacing = np.asarray(spacing if spacing is not None else np.full(len(world), .05), np.float64)
     if spacing.shape != (len(world),):
@@ -180,19 +184,61 @@ def visibility_for_points(world, point_indices, pose: Pose, projector: View | Ca
                           incidence[accepted], radial[accepted], depth_map, width, height)
 
 
-def visibility_for_view(index, pose: Pose, projector: View | Camera, config: dict, checkpoint=lambda: None) -> ViewVisibility:
-    """Load only range candidates from a spatial index, then render one view."""
+def _view_candidate_mask(camera_xyz, projector: View | Camera, splat_max_px):
+    """Return a conservative view frustum mask without changing renderer inputs.
+
+    The renderer still performs its established projection and bounds checks.
+    This only avoids projecting points which cannot enter a view.  A splat and
+    one depth-comparison pixel are retained outside every finite image edge.
+    """
+    values = np.asarray(camera_xyz, np.float64)
+    if isinstance(projector, View):
+        local = values @ projector.basis
+        margin = (int(splat_max_px)+1)/projector.focal
+        limit = math.tan(math.radians(projector.fov_degrees)/2)+margin
+        return (local[:, 2] > 0) & (np.abs(local[:, 0]) <= local[:, 2]*limit) \
+               & (np.abs(local[:, 1]) <= local[:, 2]*limit)
+    if projector.kind == "pinholeRepresentation":
+        x, y, z = values.T
+        depth = -z
+        margin = int(splat_max_px)+1
+        low_x = (projector.params["principalPointX"]+margin)*projector.params["pixelWidth"]/projector.params["focalLength"]
+        high_x = (projector.width-projector.params["principalPointX"]+margin)*projector.params["pixelWidth"]/projector.params["focalLength"]
+        low_y = (projector.params["principalPointY"]+margin)*projector.params["pixelHeight"]/projector.params["focalLength"]
+        high_y = (projector.height-projector.params["principalPointY"]+margin)*projector.params["pixelHeight"]/projector.params["focalLength"]
+        return (depth > 0) & (x >= -depth*low_x) & (x <= depth*high_x) \
+               & (y >= -depth*low_y) & (y <= depth*high_y)
+    # Spherical and cylindrical images wrap horizontally.  Retaining their
+    # candidates is intentionally conservative and preserves edge semantics.
+    return np.ones(len(values), bool)
+
+
+def visibility_for_candidates(candidates, pose: Pose, projector: View | Camera, config: dict,
+                              checkpoint=lambda: None, camera_xyz=None) -> ViewVisibility:
+    """Render one view from an already-loaded camera candidate set."""
     maximum = float(config.get("slam_max_range") or config.get("slam_max_range_indoor", 20.))
-    candidates = index.query_range(pose.translation, maximum, checkpoint)
+    if camera_xyz is None:
+        camera_xyz = pose.from_world(candidates["xyz"])
+    selected = _view_candidate_mask(camera_xyz, projector, config.get("slam_splat_max_px", 6))
     checkpoint()
-    return visibility_for_points(candidates["xyz"], candidates["point_id"], pose, projector,
-                                 spacing=candidates["spacing"], normals=candidates["normal"], max_range=maximum,
+    return visibility_for_points(candidates["xyz"][selected], candidates["point_id"][selected], pose, projector,
+                                 spacing=candidates["spacing"][selected], normals=candidates["normal"][selected], max_range=maximum,
                                  depth_resolution=config.get("slam_depth_resolution", 1024),
                                  splat_max_px=config.get("slam_splat_max_px", 6),
                                  tolerance_abs=config.get("slam_depth_tol_abs", .02),
                                  tolerance_rel=config.get("slam_depth_tol_rel", .01),
                                  device=config.get("gpu_device", "cuda:0"), checkpoint=checkpoint,
-                                 splat_batch_entries=config.get("slam_splat_batch_entries", 8_000_000))
+                                 splat_batch_entries=config.get("slam_splat_batch_entries", 8_000_000),
+                                 camera_xyz=camera_xyz[selected])
+
+
+def visibility_for_view(index, pose: Pose, projector: View | Camera, config: dict, checkpoint=lambda: None,
+                        candidates=None, camera_xyz=None) -> ViewVisibility:
+    """Load range candidates if needed, then render one view."""
+    maximum = float(config.get("slam_max_range") or config.get("slam_max_range_indoor", 20.))
+    if candidates is None:
+        candidates = index.query_range(pose.translation, maximum, checkpoint)
+    return visibility_for_candidates(candidates, pose, projector, config, checkpoint, camera_xyz)
 
 
 class _SphericalProjector:

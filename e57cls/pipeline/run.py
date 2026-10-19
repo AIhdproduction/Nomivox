@@ -621,14 +621,22 @@ def _slam_scene(config, preset, cameras, image_by_index, reader, index, stores, 
     provisional = {**config, 'slam_max_range': config.get('slam_max_range') or
                    max(config['slam_max_range_indoor'], config['slam_max_range_outdoor'])}
     sky_pixels = sky_total = overhead_views = evaluated = 0
+    image_count = len(cameras)
     for camera in cameras:
         control.checkpoint()
         view = camera.views(config['profile'], config['view_size'], config['view_fov'])[-1]
         item = image_by_index[camera.image_index]
         rendered, valid, image_hash, _, info = _slam_view_image(reader, item, camera.camera, view, image_cache)
+        candidates = _slam_candidate_loader(index, camera.pose, provisional, control.checkpoint)
+        # The scene pass has one view per camera.  Pass the loader separately
+        # so cache hits keep its large candidate set entirely unloaded.
         visibility, _ = visibility_cache.visibility_for_view(index, camera.pose, view, provisional,
-            intrinsics=camera.camera.params, view=info, checkpoint=control.checkpoint)
+            intrinsics=camera.camera.params, view=info, checkpoint=control.checkpoint,
+            candidates_loader=candidates)
         evaluated += 1
+        if hasattr(control, 'event'):
+            control.event('progress', phase='slam_scene', fraction=evaluated/max(1, image_count),
+                          image=camera.image_index, image_count=image_count)
         if sky is not None:
             scores, _ = segment_view(rendered, valid, [PromptClass('sky', tuple(sky['prompts']))], factory,
                 mask_cache, image_hash, {**info, 'slam_scene': True}, model_hash, config['image_scale'],
@@ -651,6 +659,20 @@ def _slam_scene(config, preset, cameras, image_by_index, reader, index, stores, 
     return scene, {'decision': 'automatic', 'scope': 'dataset', 'sky_fraction': float(sky_fraction),
                    'overhead_view_fraction': float(overhead_fraction), 'views_evaluated': evaluated,
                    'method': 'sky masks plus visible points above cameras; no upper-hemisphere return rule'}
+
+
+def _slam_candidate_loader(index, pose, config, checkpoint):
+    """Load one camera's range candidates only when a visibility cache misses."""
+    loaded = None
+    maximum = float(config.get('slam_max_range') or config.get('slam_max_range_indoor', 20.))
+
+    def load():
+        nonlocal loaded
+        if loaded is None:
+            values = index.query_range(pose.translation, maximum, checkpoint)
+            loaded = values, pose.from_world(values['xyz'])
+        return loaded
+    return load
 
 
 def _slam_voxel_origin(cameras, stores):
@@ -680,6 +702,9 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     if not cameras:
         raise InputNotClassifiable('No decodable SLAM camera with a valid pose and camera model')
     stations, membership, ordering = cluster_stations(cameras, config['slam_station_spacing'])
+    planned_views = sum(len(camera.views(config['profile'], config['view_size'], config['view_fov']))
+                        for camera in cameras)
+    control.event('slam_plan', cameras=len(cameras), views_total=planned_views, stations=len(stations))
     reflection_masks_requested = bool(config['mirror_analysis'] or config['glass_analysis'])
     config = {**config, 'voxel_origin': _slam_voxel_origin(cameras, stores),
               '_slam': True, '_shared_sam': False, 'mirror_analysis': False}
@@ -701,7 +726,10 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     work.mkdir(parents=True, exist_ok=True)
     votes = VoteStore(work/'votes.sqlite', station_tracking=True)
     mask_cache, image_cache = MaskCache(cache/'seg'), cache/'geometry'/input_hash/'images'
+    control.event('phase_started', phase='slam_index')
     index = build_spatial_index(stores, cache/'slam_index'/input_hash, input_hash, checkpoint=control.checkpoint)
+    control.event('progress', phase='slam_index', fraction=1.)
+    control.event('phase_finished', phase='slam_index')
     visibility_cache = VisibilityCache(cache, input_hash)
     code_map = preset.get('code_map', {})
     codes = [int(code_map.get(str(item['code']), item['code'])) for item in all_classes]
@@ -729,15 +757,17 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         observed[store.meta['scan_index']] = np.lib.format.open_memmap(
             cache/'slam_visibility'/input_hash/f'observed_{store.meta["scan_index"]}.npy', mode='w+',
             dtype=bool, shape=(store.meta['record_count'],))
-    control.event('phase_started', phase='slam_index')
-    control.event('phase_finished', phase='slam_index')
-    control.event('phase_started', phase='slam_segmentation')
     with E57Reader(source) as reader:
+        control.event('phase_started', phase='slam_scene')
         scene, scene_info = _slam_scene(config, preset, cameras, image_by_index, reader, index, stores,
             visibility_cache, mask_cache, image_cache, model_hash, factory, control)
+        control.event('progress', phase='slam_scene', fraction=1., image_count=len(cameras))
+        control.event('phase_finished', phase='slam_scene')
         effective_range = config['slam_max_range'] or config[f'slam_max_range_{scene}']
         config = {**config, 'slam_max_range': effective_range}
         scene_info['range_m'] = effective_range
+        control.event('slam_plan', cameras=len(cameras), views_total=planned_views,
+                      stations=len(stations), scene=scene)
         selected = select_classes(preset, scene, config['building_enclosure'])
         selected_ids = {item['id'] for item in selected}
         active_columns = {index for index, item in enumerate(all_classes) if item['id'] in selected_ids}
@@ -746,16 +776,23 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         reflection_prompts = []
         if reflection_masks_requested:
             _, reflection_prompts, _ = reflection_prompt_classes({**config, 'glass_analysis': config['glass_analysis']}, preset)
+        view_counts = {camera_index: len(camera.views(config['profile'], config['view_size'], config['view_fov']))
+                       for camera_index, camera in enumerate(cameras)}
+        total_views = sum(view_counts[camera_index] for station in stations for camera_index in station.camera_indices)
+        completed_views = 0
+        control.event('phase_started', phase='slam_segmentation')
         for station in stations:
             control.checkpoint()
             if votes.completed(station.id, identity):
                 station_results.append({'station': station.id, 'resumed': True, 'views': len(station.camera_indices)})
+                completed_views += sum(view_counts[camera_index] for camera_index in station.camera_indices)
                 continue
             station_values = {}
             usable_views = 0
             for camera_index in station.camera_indices:
                 camera = cameras[camera_index]
                 item = image_by_index[camera.image_index]
+                candidates = _slam_candidate_loader(index, camera.pose, config, control.checkpoint)
                 for view_number, (_, view) in enumerate(iter_camera_views([camera], config['profile'], config['view_size'], config['view_fov']), 1):
                     control.checkpoint()
                     rendered, valid_image, image_hash, mask_hash, view_info = _slam_view_image(reader, item, camera.camera, view, image_cache)
@@ -768,10 +805,18 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                     visibility, visibility_hit = visibility_cache.visibility_for_view(index, camera.pose, view, config,
                         intrinsics=camera.camera.params, view=view_info, checkpoint=control.checkpoint,
                         progress=lambda phase, hit: control.event('progress', phase=phase, station=station.id, image=camera.image_index, cache=hit),
-                        image=rendered, diagnostics_directory=output/'slam_diagnostics')
+                        image=rendered, diagnostics_directory=output/'slam_diagnostics', candidates_loader=candidates)
                     if not len(visibility.point_indices):
                         view_results.append({'image': camera.image_index, 'station': station.id, 'used': False,
                                              'reason': 'no_visible_points'})
+                        completed_views += 1
+                        control.event('progress', phase='slam_label_transfer', fraction=completed_views/max(1, total_views),
+                                      station=station.id, station_count=len(stations), image=camera.image_index,
+                                      image_count=len(cameras), view=view_number, view_count=view_counts[camera_index],
+                                      cache=cache_stats, visible_points=0)
+                        control.event('progress', phase='slam_segmentation', fraction=completed_views/max(1, total_views),
+                                      station=station.id, station_count=len(stations), image=camera.image_index,
+                                      image_count=len(cameras), view=view_number, view_count=view_counts[camera_index])
                         continue
                     for point in visibility.point_indices:
                         scan, row = unpack_point_id(point)
@@ -802,8 +847,15 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                     view_results.append({'image': camera.image_index, 'station': station.id, 'used': True,
                                          'visible_points': int(len(visibility.point_indices)),
                                          'visibility_cache': bool(visibility_hit)})
-                    control.event('progress', phase='slam_label_transfer', station=station.id, image=camera.image_index,
-                                  view=view_number, cache=cache_stats, visible_points=len(visibility.point_indices))
+                    completed_views += 1
+                    control.event('progress', phase='slam_label_transfer', fraction=completed_views/max(1, total_views),
+                                  station=station.id, station_count=len(stations), image=camera.image_index,
+                                  image_count=len(cameras), view=view_number, view_count=view_counts[camera_index],
+                                  cache=cache_stats, visible_points=len(visibility.point_indices))
+                    control.event('progress', phase='slam_segmentation', fraction=completed_views/max(1, total_views),
+                                  station=station.id, station_count=len(stations), image=camera.image_index,
+                                  image_count=len(cameras), view=view_number, view_count=view_counts[camera_index])
+                del candidates
             votes.add_scan(station.id, identity, _slam_batches(station_values, len(all_classes)), codes, station_id=station.id)
             station_results.append({'station': station.id, 'views': usable_views, 'camera_count': len(station.camera_indices),
                                     'voxel_class_observations': len(station_values)})

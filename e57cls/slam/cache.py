@@ -70,12 +70,21 @@ class VisibilityCache:
         return result, False
 
     def visibility_for_view(self, index, pose, projector, config, *, intrinsics, view, checkpoint=lambda: None,
-                            progress=None, image=None, diagnostics_directory=None):
+                            progress=None, image=None, diagnostics_directory=None, candidates_loader=None):
         """Fetch or render one view and optionally produce its diagnostic pair."""
         key = visibility_key(self.source_hash, pose, intrinsics, view, config)
         from .visibility import visibility_for_view
+        candidates = None
+
+        def build():
+            nonlocal candidates
+            if candidates_loader is not None:
+                candidates = candidates_loader()
+                return visibility_for_view(index, pose, projector, config, checkpoint,
+                                           candidates=candidates[0], camera_xyz=candidates[1])
+            return visibility_for_view(index, pose, projector, config, checkpoint)
         result, cached = self.get_or_compute(
-            key, lambda: visibility_for_view(index, pose, projector, config, checkpoint))
+            key, build)
         checkpoint()
         if progress is not None:
             progress("slam_visibility", cached)

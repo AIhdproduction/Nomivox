@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,6 +38,7 @@ class SpatialIndex:
 
     directory: Path
     meta: dict
+    tile_fragments: dict[str, tuple[Path, ...]]
 
     @property
     def tile_size(self) -> float:
@@ -59,10 +61,7 @@ class SpatialIndex:
         groups = []
         for root in self._roots_for_bounds(low, high):
             checkpoint()
-            tile = self.directory / "tiles" / _tile_key(root)
-            if not tile.is_dir():
-                continue
-            for path in sorted(tile.glob("*.npy")):
+            for path in self.tile_fragments.get(_tile_key(root), ()):
                 checkpoint()
                 values = np.load(path, mmap_mode="r", allow_pickle=False)
                 try:
@@ -81,6 +80,26 @@ class SpatialIndex:
         return values
 
 
+def _tile_fragments(directory: Path) -> dict[str, tuple[Path, ...]]:
+    """Read the immutable tile layout once, without probing missing roots."""
+    tiles = Path(directory) / "tiles"
+    result = {}
+    try:
+        with os.scandir(tiles) as entries:
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                with os.scandir(entry.path) as fragments:
+                    paths = tuple(sorted((Path(fragment.path) for fragment in fragments
+                                          if fragment.is_file() and fragment.name.endswith(".npy")),
+                                         key=lambda path: path.name))
+                if paths:
+                    result[entry.name] = paths
+    except FileNotFoundError:
+        pass
+    return result
+
+
 def load_spatial_index(directory: Path, source_hash: str | None = None) -> SpatialIndex:
     """Open a complete index without loading any point tile."""
     directory = Path(directory)
@@ -89,7 +108,7 @@ def load_spatial_index(directory: Path, source_hash: str | None = None) -> Spati
         raise ValueError("Unsupported or incomplete SLAM spatial index")
     if source_hash is not None and meta.get("source_sha256") != source_hash:
         raise ValueError("SLAM spatial index belongs to another input")
-    return SpatialIndex(directory, meta)
+    return SpatialIndex(directory, meta, _tile_fragments(directory))
 
 
 def _spacing_and_normals(xyz: np.ndarray, voxel_size: float, checkpoint=lambda: None) -> tuple[np.ndarray, np.ndarray]:
@@ -174,7 +193,7 @@ def _build(directory: Path, batches, source_hash="arrays", tile_size=2.0, voxel_
             "fragments": fragments, "ram_budget_bytes": ram_budget_bytes,
             "maximum_batch_bytes": maximum_batch_bytes, "record_dtype": _RECORD.descr}
     atomic_json(directory/"meta.json", meta)
-    return SpatialIndex(directory, meta)
+    return SpatialIndex(directory, meta, _tile_fragments(directory))
 
 
 def build_spatial_index(stores, directory: Path, source_hash: str, tile_size=2.0, voxel_size=.10,

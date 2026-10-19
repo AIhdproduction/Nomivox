@@ -4,8 +4,9 @@ import pytest
 from e57cls.geometry.cameras import Camera, Pose, View
 from e57cls.slam.cache import VisibilityCache, visibility_key
 from e57cls.slam.index import build_spatial_index_from_arrays
+from e57cls.pipeline.run import _slam_candidate_loader
 from e57cls.slam.visibility import (_torch_depth, origin_depth_width, visibility_for_points,
-                                    visibility_for_view, visibility_from_origin)
+                                    visibility_for_candidates, visibility_for_view, visibility_from_origin)
 
 
 def _config(**changes):
@@ -164,12 +165,68 @@ def test_visibility_cache_ignores_prompts_but_invalidates_geometry(tmp_path):
     assert not hit and len(result.point_indices) == 1
     prompt_only = _config(prompts=["ceiling"], min_winning_share=.9)
     assert visibility_key("source", pose, {"kind": "perspective"}, {"id": view.id}, prompt_only) == key
+    assert key == "ff1a4b4a53c958f844f336b85aed602ad5b7793d06de3effd8d8c2e2f8ed8554"
     _, hit = cache.get_or_compute(key, lambda: (calls.append(1) or result))
     assert hit and calls == [1] and cache.recomputations == 1
     changed_pose = Pose(np.eye(3), np.array((.1, 0., 0.)))
     assert visibility_key("source", changed_pose, {"kind": "perspective"}, {"id": view.id}, config) != key
     changed_tolerance = _config(slam_depth_tol_abs=.03)
     assert visibility_key("source", pose, {"kind": "perspective"}, {"id": view.id}, changed_tolerance) != key
+
+
+@pytest.mark.parametrize("splat_max_px", [1, 6])
+def test_frustum_candidates_are_bit_identical_for_perspective_and_spherical_views(splat_max_px):
+    rng = np.random.default_rng(91)
+    world = rng.uniform(-12., 12., (2_000, 3))
+    point_ids = np.arange(len(world), dtype=np.int64)
+    candidates = np.empty(len(world), [("xyz", "<f8", (3,)), ("point_id", "<i8"),
+                                       ("spacing", "<f4"), ("normal", "<f4", (3,))])
+    candidates["xyz"], candidates["point_id"] = world, point_ids
+    candidates["spacing"] = rng.uniform(.01, .3, len(world))
+    candidates["normal"] = rng.normal(size=(len(world), 3))
+    pose = Pose(np.eye(3), np.array((.3, -.2, .1)))
+    projectors = [View("front", 25, -10, 95, 192),
+                  Camera("sphericalRepresentation", {"imageWidth": 192, "imageHeight": 96,
+                         "pixelWidth": 2*np.pi/192, "pixelHeight": np.pi/96}),
+                  Camera("pinholeRepresentation", {"imageWidth": 192, "imageHeight": 96,
+                         "pixelWidth": 1., "pixelHeight": 1., "focalLength": 120.,
+                         "principalPointX": 96., "principalPointY": 48.})]
+    config = _config(slam_splat_max_px=splat_max_px, slam_depth_resolution=192)
+    for projector in projectors:
+        old = visibility_for_points(world, point_ids, pose, projector, spacing=candidates["spacing"],
+                                    normals=candidates["normal"], max_range=20., depth_resolution=192,
+                                    splat_max_px=splat_max_px, tolerance_abs=.02, tolerance_rel=.01, device="cpu")
+        new = visibility_for_candidates(candidates, pose, projector, config,
+                                        camera_xyz=pose.from_world(world))
+        for field in ("point_indices", "pixels", "distance", "incidence_angle", "radial_position", "depth_map"):
+            assert np.array_equal(getattr(new, field), getattr(old, field))
+
+
+def test_camera_candidates_are_loaded_once_and_not_for_full_visibility_cache_hits(tmp_path):
+    points, _ = _occluder_scene()
+    values = np.empty(len(points), [("xyz", "<f8", (3,)), ("point_id", "<i8"),
+                                    ("spacing", "<f4"), ("normal", "<f4", (3,))])
+    values["xyz"], values["point_id"], values["spacing"] = points, np.arange(len(points)), .1
+    values["normal"] = np.array((1., 0., 0.), np.float32)
+    pose = Pose(np.eye(3), np.zeros(3))
+    cache = VisibilityCache(tmp_path, "source")
+    calls = []
+
+    class FakeIndex:
+        def query_range(self, origin, maximum, checkpoint):
+            calls.append(1)
+            return values
+
+    load = _slam_candidate_loader(FakeIndex(), pose, _config(slam_depth_resolution=128), lambda: None)
+
+    for view in (View("first", 0, 0, 90, 128), View("second", 35, 0, 90, 128)):
+        cache.visibility_for_view(None, pose, view, _config(slam_depth_resolution=128),
+                                  intrinsics={"kind": "perspective"}, view={"id": view.id}, candidates_loader=load)
+    assert calls == [1]
+    for view in (View("first", 0, 0, 90, 128), View("second", 35, 0, 90, 128)):
+        cache.visibility_for_view(None, pose, view, _config(slam_depth_resolution=128),
+                                  intrinsics={"kind": "perspective"}, view={"id": view.id},
+                                  candidates_loader=lambda: pytest.fail("cache hit must not load candidates"))
 
 
 def test_index_respects_small_budget_and_uses_disk_tiles(tmp_path):

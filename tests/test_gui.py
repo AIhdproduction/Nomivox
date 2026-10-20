@@ -233,8 +233,8 @@ def test_reflection_eta_uses_parent_phase_and_measured_segmentation_rate(qt_appl
         window.handle_event(dict(event='progress',phase='segmentation',fraction=.5,scan=1,scan_count=4,elapsed_seconds=600))
         window.update_clock()
         assert window.estimate_phase == 'segmentation'
-        assert tr('remaining',duration='15 min',max_duration='28 min') in window.bottom.text()
-        assert tr('total_remaining',duration='17 min',max_duration='32 min') in window.bottom.text()
+        assert tr('remaining',duration='0 min',max_duration='2 min') in window.bottom.text()
+        assert tr('total_remaining',duration='2 min',max_duration='6 min') in window.bottom.text()
     finally:
         window.close()
         window.deleteLater()

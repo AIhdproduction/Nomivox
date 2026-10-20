@@ -1,4 +1,4 @@
-"""Scan-based runtime estimates for the GUI.
+"""Runtime estimates for the GUI.
 
 The estimator deliberately has no Qt dependency so its event accounting can be
 tested independently from the window.
@@ -14,13 +14,28 @@ from e57cls.files import atomic_json
 
 
 STAGES = ("sam", "mirror_masks", "mirror_evidence", "segmentation", "slam_scene", "slam_segmentation")
+# Progress events define the persisted timing unit for every stage.  Changing a
+# stage from scan/image timing to view timing must invalidate older profiles.
+PROFILE_UNITS = {
+    "sam": "view",
+    "mirror_masks": "view",
+    "mirror_evidence": "scan",
+    "segmentation": "view",
+    "slam_scene": "image",
+    "slam_segmentation": "view",
+}
+# These stages changed from scan/image timing to per-view timing.  Legacy
+# profiles without a unit are incompatible only for these changed stages.
+VIEW_PROFILE_STAGES = frozenset(("sam", "mirror_masks", "segmentation", "slam_segmentation"))
 DEFAULT_PROFILE = {
-    "sam": {"avg_seconds": 275.0, "max_seconds": 472.0},
-    "mirror_masks": {"avg_seconds": 40.0, "max_seconds": 70.0},
-    "mirror_evidence": {"avg_seconds": 103.0, "max_seconds": 511.0},
-    "segmentation": {"avg_seconds": 275.0, "max_seconds": 472.0},
-    "slam_scene": {"avg_seconds": 45.0, "max_seconds": 120.0},
-    "slam_segmentation": {"avg_seconds": 275.0, "max_seconds": 472.0},
+    # Per-view values draw on HSLU static, Test_PW_2 accelerated and Test_PW
+    # SLAM runs measured on 2026-10-17 through 2026-10-19.
+    "sam": {"avg_seconds": 18.0, "max_seconds": 45.0, "unit": "view"},
+    "mirror_masks": {"avg_seconds": 5.0, "max_seconds": 15.0, "unit": "view"},
+    "mirror_evidence": {"avg_seconds": 10.0, "max_seconds": 80.0, "unit": "scan"},
+    "segmentation": {"avg_seconds": 15.0, "max_seconds": 45.0, "unit": "view"},
+    "slam_scene": {"avg_seconds": 2.0, "max_seconds": 10.0, "unit": "image"},
+    "slam_segmentation": {"avg_seconds": 30.0, "max_seconds": 60.0, "unit": "view"},
 }
 PRIOR_WEIGHT = 3
 SLAM_FIXED_PHASE_SECONDS = {"slam_index": 20.0, "voting": 90.0, "output": 90.0}
@@ -44,12 +59,22 @@ def load_profile(path):
         if not isinstance(value, dict):
             continue
         units = value.get("units")
+        unit = value.get("unit")
         average = value.get("avg_seconds")
         maximum = value.get("max_seconds")
         minimum_units = 1 if stage in ("slam_scene", "slam_segmentation") else 3
         if (isinstance(units, int) and units >= minimum_units and _number(average) and _number(maximum)
-                and maximum >= average):
-            profile[stage] = {"avg_seconds": float(average), "max_seconds": float(maximum), "units": units}
+                and maximum >= average
+                # Profiles before unit versioning remain valid for stages
+                # whose event unit never changed.  Explicit mismatches fail.
+                and (unit == PROFILE_UNITS[stage]
+                     or ("unit" not in value and stage not in VIEW_PROFILE_STAGES))
+                # Reject stale per-view timings and extreme outliers.  This
+                # prevents a former per-scan value from dominating a new run.
+                and (unit != "view" or (average <= 10*DEFAULT_PROFILE[stage]["avg_seconds"]
+                                         and maximum <= 10*DEFAULT_PROFILE[stage]["max_seconds"]))):
+            profile[stage] = {"avg_seconds": float(average), "max_seconds": float(maximum),
+                              "units": units, "unit": PROFILE_UNITS[stage]}
     return profile
 
 
@@ -206,7 +231,7 @@ class RunEstimator:
             self.set_unit_count(phase, event["scan_count"])
             if self.unit_indices[phase] is None:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
-        if phase == "mirror_masks" and isinstance(event.get("image_count"), int):
+        if phase == "mirror_masks" and not view_unit and isinstance(event.get("image_count"), int):
             self.set_unit_count(phase, event["image_count"])
         if phase == "slam_scene" and isinstance(event.get("image_count"), int):
             self.set_unit_count(phase, event["image_count"])
@@ -215,8 +240,7 @@ class RunEstimator:
             if self.unit_indices[phase] is None:
                 self.set_unit_indices(phase, range(1, event["scan_count"]+1))
         self._start_stage(phase, now)
-        unit = ((event["image"], event["view"]) if view_unit
-                else event.get("image") if phase in ("mirror_masks", "slam_scene") else event.get("scan"))
+        unit = self._event_unit(phase, event, view_unit)
         if phase in ("slam_scene", "slam_segmentation") and unit is not None:
             self.slam_seen_units.add((phase, unit))
         if phase == "mirror_evidence":
@@ -230,6 +254,18 @@ class RunEstimator:
                 self._complete_current(now)
             self.current_unit = unit
         self.last_progress_at[phase] = now
+
+    @staticmethod
+    def _event_unit(phase, event, view_unit):
+        if view_unit:
+            # A camera can contribute the same view to multiple SLAM stations.
+            # The station therefore belongs to the identity of a SLAM view.
+            if phase == "slam_segmentation" and isinstance(event.get("station"), int):
+                return event["station"], event["image"], event["view"]
+            return event["image"], event["view"]
+        if phase in ("mirror_masks", "slam_scene"):
+            return event.get("image")
+        return event.get("scan")
 
     def _start_stage(self, stage, now):
         if not self.applies.get(stage) or stage in self.stage_completed:
@@ -407,5 +443,5 @@ def save_profile(path, estimator):
             maximum = float(prior["max_seconds"])
             units = int(prior.get("units", 0))
         payload[stage] = {"avg_seconds": average, "max_seconds": maximum,
-                          "units": units, "saved_at": saved_at}
+                          "units": units, "unit": PROFILE_UNITS[stage], "saved_at": saved_at}
     atomic_json(Path(path), payload)

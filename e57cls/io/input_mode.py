@@ -91,25 +91,34 @@ def detect_input_mode(inspection, config, points_check=None):
                    ratio > 4, f"{valid_images} Bilder mit gültiger Pose für {scan_count} Datenblöcke (Verhältnis {ratio:.2f})")]
 
     grouped = {}
-    missing_association = 0
-    empty_association = 0
+    missing_association = []
+    empty_association = []
     scan_by_index = {item.get("index"): item for item in scans}
     for image, position in positioned:
         scan_index = image.get("scan_index")
         scan = scan_by_index.get(scan_index)
         if image.get("association_status") != "explicit_guid" or scan_index is None:
-            missing_association += 1
+            missing_association.append(image.get("index"))
         elif not scan or scan.get("record_count", 0) <= 0:
-            empty_association += 1
+            empty_association.append(image.get("index"))
         else:
             grouped.setdefault(scan_index, []).append(position)
     separated = {str(index): _spatially_separated_count(points) for index, points in grouped.items()}
     shared = {index: count for index, count in separated.items() if count > 4}
-    b_hit = bool(missing_association or empty_association or shared)
-    rules.append(_rule("b", {"without_association": missing_association, "without_points": empty_association,
-                              "separated_images_by_block": separated}, 4, b_hit,
-                       f"{missing_association} Bilder ohne Zuordnung, {empty_association} ohne zugehörige Punkte; "
-                       f"räumlich getrennte Bilder je Block: {separated or 'keine'}"))
+    affected_images = [*missing_association, *empty_association]
+    affected_image_share = len(affected_images)/max(1, valid_images)
+    blocks_with_images = sorted(grouped)
+    separated_blocks = [int(index) for index in shared]
+    separated_block_share = len(separated_blocks)/max(1, len(blocks_with_images))
+    b_hit = affected_image_share >= .50 or separated_block_share >= .50
+    rules.append(_rule("b", {"without_association": len(missing_association), "without_points": len(empty_association),
+                              "affected_images": affected_images, "affected_image_share": affected_image_share,
+                              "separated_images_by_block": separated, "separated_blocks": separated_blocks,
+                              "blocks_with_images": blocks_with_images, "separated_block_share": separated_block_share},
+                       {"affected_image_share": .50, "separated_block_share": .50}, b_hit,
+                       f"{len(missing_association)} Bilder ohne Zuordnung, {len(empty_association)} ohne zugehörige Punkte "
+                       f"({affected_image_share:.0%}); räumlich getrennte Bilder je Block: {separated or 'keine'} "
+                       f"({separated_block_share:.0%} der Blöcke mit Bildern)"))
 
     c_matches = []
     for scan in scans:
@@ -125,8 +134,10 @@ def detect_input_mode(inspection, config, points_check=None):
                        "Identity-Blockpose mit grosser Ausdehnung und Kameraposen innerhalb der Blockgrenzen"))
 
     without_origin = [scan.get("index") for scan in scans if scan.get("metadata", {}).get("pose") is None]
-    rules.append(_rule("e", without_origin, 1, bool(without_origin),
-                       "Datenblock ohne Scannerposition"))
+    without_origin_share = len(without_origin)/max(1, scan_count)
+    rules.append(_rule("e", {"without_scanner_pose": without_origin, "without_scanner_pose_share": without_origin_share,
+                              "scan_count": scan_count}, .50, without_origin_share >= .50,
+                       f"{len(without_origin)} von {scan_count} Datenblöcken ohne Scannerposition ({without_origin_share:.0%})"))
 
     if points_check is not None:
         checked = points_check(inspection)
@@ -135,12 +146,26 @@ def detect_input_mode(inspection, config, points_check=None):
         value = checked.get("value", checked)
         hit = bool(checked.get("hit", False))
         detail = checked.get("detail", "Tiefentest vom Block-Ursprung")
-        rules.append(_rule("d", value, .60, hit, detail))
+        rule = _rule("d", value, checked.get("threshold", .60), hit, detail)
+        rule.update({key: checked[key] for key in ("flagged", "flagged_share", "without_origin") if key in checked})
+        rules.append(rule)
 
     detected_slam = any(rule["hit"] for rule in rules)
     associated = sum(1 for image, _ in positioned if image.get("association_status") == "explicit_guid")
     mixed = detected_slam and associated > 0 and associated < valid_images
     warnings = []
+    rule_b = next(rule for rule in rules if rule["id"] == "b")
+    if rule_b["value"]["affected_images"] and not rule_b["hit"]:
+        warnings.append("Einzelne Bilder ohne sichere Zuordnung oder Punkte erkannt; statische Verarbeitung bleibt beibehalten.")
+    if rule_b["value"]["separated_blocks"] and not rule_b["hit"]:
+        warnings.append("Einzelne Datenblöcke enthalten mehr als vier räumlich getrennte Bilder; statische Verarbeitung bleibt beibehalten.")
+    rule_e = next(rule for rule in rules if rule["id"] == "e")
+    if rule_e["value"]["without_scanner_pose"] and not rule_e["hit"]:
+        scans_text = ", ".join(map(str, rule_e["value"]["without_scanner_pose"]))
+        warnings.append(f"Scan {scans_text}: Scannerposition fehlt; statische Verarbeitung bleibt beibehalten und der Block wird unklassifiziert ausgegeben.")
+    if points_check is not None and isinstance(checked, dict) and checked.get("flagged") and not checked.get("hit"):
+        for item in checked["flagged"]:
+            warnings.append(f"Scan {item['scan']}: Tiefentest auffällig ({item['visible_share']:.0%} sichtbar), vermutlich Teilscan – statische Verarbeitung bleibt beibehalten.")
     if mixed:
         warnings.append("Gemischte Hinweise auf statische und kinematische Aufnahme erkannt; kinematische Verarbeitung gewählt.")
     mode = requested if requested != "auto" else ("slam" if detected_slam else "static")
@@ -205,9 +230,13 @@ def pseudo_setup_points_check(stores, inspection=None, sample_limit=200_000, wid
         share = float(visible.mean())
         results.append({"scan": store.meta.get("scan_index"), "sampled_points": len(world),
                         "depth_width": depth_width, "visible_share": share})
-    if without_origin:
-        return {"value": "nicht anwendbar", "hit": False,
+    if without_origin and not results:
+        return {"value": "nicht anwendbar", "without_origin": without_origin, "hit": False,
                 "detail": "Nicht anwendbar: Datenblock ohne Scannerposition."}
-    hit = any(item["visible_share"] < .60 for item in results)
-    return {"value": results, "hit": hit,
-            "detail": "Tiefentest vom Block-Ursprung: auf Stichprobengrösse skalierte Tiefenkarte (7 Pixel je Punkt), 1-Pixel-Footprint; sichtbarer Anteil eigener Punkte unter 60 %"}
+    flagged = [item for item in results if item["visible_share"] < .60]
+    flagged_share = len(flagged)/max(1, len(results))
+    threshold = {"visible_share": .60, "flagged_share": .50}
+    hit = flagged_share >= threshold["flagged_share"]
+    return {"value": results, "without_origin": without_origin, "flagged": flagged, "flagged_share": flagged_share,
+            "threshold": threshold, "hit": hit,
+            "detail": "Tiefentest vom Block-Ursprung: winkelfensterbewusste Tiefenkarte mit ungefähr 7 Pixeln je Punkt und 1-Pixel-Footprint; auffällig bei unter 60 % sichtbaren Punkten in mindestens 50 % der Blöcke"}

@@ -108,6 +108,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     points.point_source_id[:] = scan
                     if station_ids:
                         station = votes.lookup_station_ids(voxel_keys(world, origin, voxel_size))
+                        if scan in skipped:
+                            station[:] = 0
                         if force_unclassified is not None:
                             station[force_unclassified(store, start, valid)] = 0
                         points.station_id = station

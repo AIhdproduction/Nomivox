@@ -216,6 +216,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
                         arrays["nomivox:mirrorState"][:out_count] = states[take]
                         if station_ids:
                             station = votes.lookup_station_ids(voxel_keys(world, origin, voxel_size))
+                            if store.meta["scan_index"] in skipped:
+                                station[:] = 0
                             if force_unclassified is not None:
                                 station[force_unclassified(store, start, valid)] = 0
                             arrays["nomivox:stationId"][:out_count] = station[take]

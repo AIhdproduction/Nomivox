@@ -1152,7 +1152,8 @@ def execute(config, backend_factory=None, listen=True):
         for scan in inspection['scans']:
             if scan.get('pose_status') == 'invalid':
                 scan_pose(scan['metadata'])
-        if input_mode['mode'] == 'static' and any(scan.get('pose_status') == 'missing' for scan in inspection['scans']):
+        missing_pose_scans = [scan for scan in inspection['scans'] if scan.get('pose_status') == 'missing']
+        if input_mode['mode'] == 'static' and missing_pose_scans and len(missing_pose_scans) == len(inspection['scans']):
             raise InputNotClassifiable('Datenblock ohne Scannerposition – bitte „Kinematisch (SLAM)“ wählen oder mit Pose exportieren.')
         eligible = (any(image.get('classification_eligible_slam') for image in inspection['images'])
                     if input_mode['mode'] == 'slam'
@@ -1193,11 +1194,20 @@ def execute(config, backend_factory=None, listen=True):
         if semantic_run and not all_classes:
             raise ValueError("No active classes")
         missing_origins = [store.meta['scan_index'] for store in stores if store.meta['metadata'].get('pose') is None]
-        if missing_origins:
+        if len(missing_origins) == len(stores):
             raise InputNotClassifiable('Datenblock ohne Scannerposition – bitte „Kinematisch (SLAM)“ wählen oder mit Pose exportieren.')
-        for store in stores:
+        classifiable_stores = [store for store in stores if store.meta['scan_index'] not in missing_origins]
+        if missing_origins:
+            skipped.extend(missing_origins)
+            warning = {'code': 'scan_missing_pose_unclassified', 'scans': missing_origins,
+                       'detail': 'Datenblöcke ohne Scannerposition wurden unverändert und unklassifiziert ausgegeben.'}
+            warnings.append(warning)
+            scan_results.extend({'scan': scan, 'unclassified': True, 'reason': 'missing_scanner_pose'}
+                                for scan in missing_origins)
+            LOG.warning('%s', warning['detail'])
+        for store in classifiable_stores:
             scan_pose(store.meta['metadata'])
-        config = {**config, "voxel_origin": scan_pose(stores[0].meta["metadata"]).translation.tolist()}
+        config = {**config, "voxel_origin": scan_pose(classifiable_stores[0].meta["metadata"]).translation.tolist()}
         model_hash = file_hash(Path(config["model"]))
         input_hash = store_report["source_sha256"]
         identity = identity_hash({"pipeline_revision": "shared-sam-v1", "source": input_hash, "model": model_hash, "preset": preset,
@@ -1308,7 +1318,7 @@ def execute(config, backend_factory=None, listen=True):
                 mirror_started = time.monotonic()
                 segmentation_started = time.monotonic()
                 mirrors = MirrorAnalysis(work/'mirrors', config)
-                prepared_images = [inspection['images'][index-1] for store in stores
+                prepared_images = [inspection['images'][index-1] for store in classifiable_stores
                                    for index in inspection['scans'][store.meta['scan_index']-1]['image_indices']
                                    if inspection['images'][index-1]['pose_status'] == 'valid'
                                    and any(kind != 'visualReferenceRepresentation' for kind in inspection['images'][index-1]['representations'])]
@@ -1344,13 +1354,13 @@ def execute(config, backend_factory=None, listen=True):
                     try:
                         control.event('phase_started', phase='sam')
                         with E57Reader(source) as producer_reader:
-                            for producer_store in stores:
+                            for producer_store in classifiable_stores:
                                 producer_control.checkpoint()
                                 scan = producer_store.meta['scan_index']
                                 record = prepare_shared_sam(
                                     producer_reader, [producer_store], inspection, config, work, image_cache, mask_cache,
                                     model_hash, factory, producer_control, preset, image_assets, camera_depth,
-                                    progress_stores=stores, image_numbers=image_numbers, total_images=len(prepared_images))[scan]
+                                    progress_stores=classifiable_stores, image_numbers=image_numbers, total_images=len(prepared_images))[scan]
                                 kind = 'scan' if record.get('status') == 'complete' else 'scan_failed'
                                 if not publish(SamProducerMessage(kind, scan, record)):
                                     return
@@ -1372,7 +1382,7 @@ def execute(config, backend_factory=None, listen=True):
                 producer = threading.Thread(target=produce_sam, name='sam-producer', daemon=True)
                 producer.start()
                 try:
-                    for expected_store in stores:
+                    for expected_store in classifiable_stores:
                         while True:
                             control.checkpoint()
                             try:
@@ -1409,20 +1419,20 @@ def execute(config, backend_factory=None, listen=True):
                     producer_stop.set()
                     producer.join()
                 timings['sam'] = producer_timing.get('seconds', time.monotonic()-sam_started)
-                finalize_states(mirrors, stores, inspection, config, control)
+                finalize_states(mirrors, classifiable_stores, inspection, config, control)
                 atomic_json(output/'mirror_registry.json',[p.serialize() for p in mirrors.registry.planes])
                 timings['mirror'] = time.monotonic()-mirror_started
                 append_mirror_warnings()
                 control.event('phase_finished', phase='mirror')
                 timings['segmentation'] = time.monotonic()-segmentation_started
-                if len(skipped) == len(stores):
+                if all(store.meta['scan_index'] in skipped for store in classifiable_stores):
                     raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
                 control.event("phase_finished", phase="segmentation")
             else:
                 if shared_sam:
                     control.event('phase_started', phase='sam')
                     sam_start = time.monotonic()
-                    sam_records = prepare_shared_sam(reader, stores, inspection, config, work, image_cache, mask_cache,
+                    sam_records = prepare_shared_sam(reader, classifiable_stores, inspection, config, work, image_cache, mask_cache,
                                                      model_hash, factory, control, preset, image_assets, camera_depth)
                     timings['sam'] = time.monotonic()-sam_start
                     control.event('phase_finished', phase='sam')
@@ -1431,7 +1441,7 @@ def execute(config, backend_factory=None, listen=True):
                     mirror_start = time.monotonic()
                     prepared_failures = {int(index): detail for record in sam_records.values()
                                          for index, detail in record.get('failed_images', {}).items()}
-                    mirrors = build_mirrors(reader,stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,image_assets,
+                    mirrors = build_mirrors(reader,classifiable_stores,inspection,config,work,image_cache,mask_cache,model_hash,factory,control,preset,image_assets,
                                             prepared_failures)
                     atomic_json(output/'mirror_registry.json',[p.serialize() for p in mirrors.registry.planes])
                     timings['mirror'] = time.monotonic()-mirror_start
@@ -1440,10 +1450,10 @@ def execute(config, backend_factory=None, listen=True):
                 if semantic_run:
                     control.event("phase_started", phase="segmentation")
                     seg_start = time.monotonic()
-                    for store in stores:
+                    for store in classifiable_stores:
                         classify_ready_scan(store, sam_records.get(store.meta['scan_index']))
                     timings["segmentation"] = time.monotonic()-seg_start
-                    if len(skipped) == len(stores):
+                    if all(store.meta['scan_index'] in skipped for store in classifiable_stores):
                         raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
                     control.event("phase_finished", phase="segmentation")
             if semantic_run:
@@ -1459,7 +1469,7 @@ def execute(config, backend_factory=None, listen=True):
                     surface_tie_report = votes.resolve_surface_ties(
                         by_id, np.array(config['voxel_origin']), config['voxel_size'], config['surface_tie_share'],
                         config['surface_normal_radius'], config['min_observations'],
-                        [scan_pose(store.meta['metadata']).translation[2] for store in stores], control.checkpoint)
+                        [scan_pose(store.meta['metadata']).translation[2] for store in classifiable_stores], control.checkpoint)
                     timings['surface_ties'] = time.monotonic()-tie_started
                 if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
                     barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]

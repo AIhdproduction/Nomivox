@@ -242,15 +242,25 @@ def visibility_for_view(index, pose: Pose, projector: View | Camera, config: dic
 
 
 class _SphericalProjector:
-    def __init__(self, width, height):
+    def __init__(self, width, height, azimuth=None, elevation=None):
         self.width, self.height = int(width), int(height)
-        self.focal = width/(2*math.pi)
+        self.azimuth = azimuth
+        self.elevation = elevation
+        self.focal = width/(2*math.pi) if azimuth is None else width/azimuth[1]
 
     def project(self, xyz):
         xyz = np.asarray(xyz, np.float64)
         depth = np.linalg.norm(xyz, axis=1)
-        uv = np.column_stack((self.width/2-np.arctan2(xyz[:, 1], xyz[:, 0])/(2*np.pi/self.width),
-                              self.height/2-np.arctan2(xyz[:, 2], np.hypot(xyz[:, 0], xyz[:, 1]))/(np.pi/self.height)))
+        azimuth = np.arctan2(xyz[:, 1], xyz[:, 0])
+        elevation = np.arctan2(xyz[:, 2], np.hypot(xyz[:, 0], xyz[:, 1]))
+        if self.azimuth is None:
+            uv = np.column_stack((self.width/2-azimuth/(2*np.pi/self.width),
+                                  self.height/2-elevation/(np.pi/self.height)))
+        else:
+            azimuth_start, azimuth_span = self.azimuth
+            elevation_low, elevation_span = self.elevation
+            uv = np.column_stack((((azimuth-azimuth_start) % (2*np.pi))/azimuth_span*self.width,
+                                  (elevation_low+elevation_span-elevation)/elevation_span*self.height))
         valid = np.isfinite(uv).all(axis=1) & np.isfinite(depth) & (depth > 0)
         valid &= (uv[:, 0] >= 0) & (uv[:, 0] < self.width) & (uv[:, 1] >= 0) & (uv[:, 1] < self.height)
         return uv, depth, valid
@@ -271,6 +281,43 @@ def origin_depth_width(point_count, maximum=1024, pixels_per_sample=7) -> int:
     return min(int(maximum), max(64, int(math.ceil(math.sqrt(2*target)))))
 
 
+def _origin_window(points, maximum, pixels_per_sample=7):
+    """Return a bounded angular crop with roughly seven pixels per sample."""
+    values = np.asarray(points, np.float64)
+    depth = np.linalg.norm(values, axis=1)
+    values = values[np.isfinite(values).all(axis=1) & (depth > 0)]
+    if not len(values):
+        width = origin_depth_width(0, maximum, pixels_per_sample)
+        return width, max(64, width//2), None, None
+    azimuth = np.mod(np.arctan2(values[:, 1], values[:, 0]), 2*np.pi)
+    ordered = np.sort(azimuth)
+    gaps = np.diff(np.r_[ordered, ordered[0]+2*np.pi])
+    gap = int(np.argmax(gaps))
+    azimuth_start = ordered[(gap+1) % len(ordered)]
+    azimuth_span = 2*np.pi-gaps[gap]
+    elevation = np.arctan2(values[:, 2], np.hypot(values[:, 0], values[:, 1]))
+    elevation_low, elevation_high = float(elevation.min()), float(elevation.max())
+    elevation_span = elevation_high-elevation_low
+    # Keep a small raster margin so points on the measured window boundary
+    # remain inside after floor-based pixel conversion.
+    margin = .01
+    azimuth_start = (azimuth_start-margin) % (2*np.pi)
+    azimuth_span = min(2*np.pi, azimuth_span+2*margin)
+    elevation_low = max(-np.pi/2, elevation_low-margin)
+    elevation_high = min(np.pi/2, elevation_high+margin)
+    elevation_span = max(.01, elevation_high-elevation_low)
+    if azimuth_span >= 2*np.pi-.02 and elevation_span >= np.pi-.02:
+        width = origin_depth_width(len(values), maximum, pixels_per_sample)
+        return width, max(64, width//2), None, None
+    aspect = azimuth_span/elevation_span
+    target = max(1, len(values)*int(pixels_per_sample))
+    width = max(64, int(math.ceil(math.sqrt(target*aspect))))
+    height = max(64, int(math.ceil(math.sqrt(target/aspect))))
+    scale = min(1., int(maximum)/max(width, height))
+    width, height = max(64, int(math.floor(width*scale))), max(64, int(math.floor(height*scale)))
+    return width, height, (azimuth_start, azimuth_span), (elevation_low, elevation_span)
+
+
 def _origin_spacing(values):
     """Estimate a bounded local sample spacing for the one-off origin test."""
     from scipy.spatial import cKDTree
@@ -287,15 +334,17 @@ def visibility_from_origin(points, *, origin=(0., 0., 0.), width=1024, tolerance
                            tolerance_rel=.01, splat_max_px=1, device="cuda:0") -> np.ndarray:
     """Return the visible-point mask for the rule-d spherical origin test.
 
-    ``width`` is an upper bound, not a fixed resolution: the depth map follows
-    the sample size with seven pixels per sample.  A locally estimated
-    nearest-neighbour spacing adds a matching absolute tolerance; its 25 cm
-    cap avoids accepting an unrelated background across sparse gaps.  The
-    independent one-pixel footprint does not inherit ``slam_splat_max_px``,
-    which remains exclusive to per-view visibility.
+    ``width`` bounds the longer depth-map side.  The map is cropped to the
+    occupied azimuth/elevation window and shaped for roughly seven pixels per
+    sample, so a dense partial scan does not collapse into a full-sphere map.
+    A locally estimated nearest-neighbour spacing adds a matching absolute
+    tolerance; its 25 cm cap avoids accepting an unrelated background across
+    sparse gaps.  The independent one-pixel footprint does not inherit
+    ``slam_splat_max_px``, which remains exclusive to per-view visibility.
     """
     values = np.asarray(points, np.float64)
-    depth_width = origin_depth_width(len(values), width)
+    local = values-np.asarray(origin, np.float64)
+    depth_width, depth_height, azimuth, elevation = _origin_window(local, width)
     finite = np.isfinite(values).all(axis=1)
     spacing = np.full(len(values), .005, np.float64)
     if np.any(finite):
@@ -303,7 +352,7 @@ def visibility_from_origin(points, *, origin=(0., 0., 0.), width=1024, tolerance
     absolute = np.asarray(tolerance_abs, np.float64)+spacing
     result = visibility_for_points(values, np.arange(len(values)),
                                    Pose(np.eye(3), np.asarray(origin, np.float64)),
-                                   _SphericalProjector(depth_width, max(1, depth_width//2)),
+                                   _SphericalProjector(depth_width, depth_height, azimuth, elevation),
                                    spacing=spacing, max_range=float("inf"), depth_resolution=depth_width,
                                    splat_max_px=splat_max_px, tolerance_abs=absolute,
                                    tolerance_rel=tolerance_rel, device=device, close_depth_gaps=False)

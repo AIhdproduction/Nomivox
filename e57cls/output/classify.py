@@ -20,12 +20,12 @@ from e57cls.vote.geometry_rules import TerrainIndex
 def classify_points(store, start, stop, xyz, valid, votes, origin, voxel_size,
                     skipped=(), mirror=None, world=None):
     """Classify the valid rows of one source block without transferring labels."""
+    skipped_scan = store.meta["scan_index"] in skipped
     if world is None:
         world = scan_pose(store.meta["metadata"]).to_world(xyz[valid])
+    if skipped_scan:
+        return world, np.ones(len(world), np.uint8), np.zeros(len(world), np.uint8), np.zeros(len(world), np.uint8)
     codes, confidence = votes.lookup(voxel_keys(world, origin, voxel_size))
-    if store.meta["scan_index"] in skipped:
-        codes[:] = 1
-        confidence[:] = 0
     states = np.zeros(len(world), np.uint8)
     if mirror:
         codes, states = mirror(store, start, stop, valid, world, codes)
@@ -493,7 +493,10 @@ class ClassifiedSource:
 
     def block(self, store, start, xyz, valid, density, world=None):
         stop = start+len(xyz)
-        if self.index is not None and density == 'reduced':
+        if store.meta['scan_index'] in self.skipped:
+            world, codes, confidence, states = classify_points(store, start, stop, xyz, valid, self.votes, self.origin,
+                                                                 self.voxel_size, self.skipped, self.mirror, world)
+        elif self.index is not None and density == 'reduced':
             maps = self.predictions[store.meta['scan_index']]
             world = scan_pose(store.meta['metadata']).to_world(xyz[valid]) if world is None else world
             codes, confidence, states = (np.array(mapping[start:stop][valid], copy=True) for mapping in maps)
@@ -501,7 +504,7 @@ class ClassifiedSource:
             started = time.perf_counter()
             world, codes, confidence, states = classify_points(store, start, stop, xyz, valid, self.votes, self.origin, self.voxel_size, self.skipped, self.mirror, world)
             self.timing_seconds['lookup_mirror'] += time.perf_counter()-started
-        if self.index is not None:
+        if self.index is not None and store.meta['scan_index'] not in self.skipped:
             started = time.perf_counter()
             unknown = codes == 1
             query_points = world[unknown]
@@ -514,7 +517,7 @@ class ClassifiedSource:
             ids = np.flatnonzero(unknown)[assigned]; codes[ids], confidence[ids] = inherited[assigned], np.maximum(confidence[ids], 128)
             self.class_transfer_count += len(ids)
             self.timing_seconds['transfer'] += time.perf_counter()-started
-        if self.geometry is not None:
+        if self.geometry is not None and store.meta['scan_index'] not in self.skipped:
             started = time.perf_counter()
             unknown = codes == 1
             filled = self.geometry.fill(world[unknown], self.geometry_fill_tolerance, self.checkpoint)
@@ -524,7 +527,7 @@ class ClassifiedSource:
             for code, number in zip(*np.unique(filled[assigned], return_counts=True)):
                 self.geometry_fill_counts[str(int(code))] = self.geometry_fill_counts.get(str(int(code)), 0)+int(number)
             self.timing_seconds['plane_fill'] += time.perf_counter()-started
-        if self.terrain is not None and self.terrain_fill and (self.terrain_outdoor_scans is None
+        if store.meta['scan_index'] not in self.skipped and self.terrain is not None and self.terrain_fill and (self.terrain_outdoor_scans is None
                                                                or store.meta['scan_index'] in self.terrain_outdoor_scans):
             started = time.perf_counter()
             unknown = codes == 1

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import sqlite3
+import shutil
 
 import laspy
 import numpy as np
@@ -275,3 +276,81 @@ def test_slam_e57_station_id_matches_las_and_static_output_has_no_station_field(
                      input_mode="static", format="las")
     execute(second, lambda: GeometryMaskBackend(), listen=False)
     assert next((tmp_path / "static-second").glob("*.las")).read_bytes() == next((tmp_path / "static").glob("*.las")).read_bytes()
+
+
+def _slam_output(path):
+    return laspy.read(next(path.glob("*.las")))
+
+
+def _assert_same_slam_output(expected, actual):
+    np.testing.assert_array_equal(actual.classification, expected.classification)
+    np.testing.assert_array_equal(actual.station_id, expected.station_id)
+
+
+def _assert_same_slam_statistics(expected, actual):
+    assert actual["views_used"] == expected["views_used"]
+    assert actual["never_visible_share"] == expected["never_visible_share"]
+    assert actual["slam"]["median_visible_points_per_view"] == expected["slam"]["median_visible_points_per_view"]
+
+
+def test_slam_resume_matches_uninterrupted_run(tmp_path, monkeypatch):
+    source = write_slam_e57(tmp_path / "room.e57", camera_count=6, labelled_images=True, pinhole=True)
+    full_config = _config(tmp_path, source, output=tmp_path / "full", cache=tmp_path / "full-cache")
+    full_report = execute(full_config, lambda: GeometryMaskBackend(), listen=False)
+    full_cloud = _slam_output(tmp_path / "full")
+
+    resume_config = _config(tmp_path, source, output=tmp_path / "resume", cache=tmp_path / "resume-cache")
+    original_add_scan = run_module.VoteStore.add_scan
+    completed = 0
+
+    def cancel_after_first_station(store, *args, **kwargs):
+        nonlocal completed
+        result = original_add_scan(store, *args, **kwargs)
+        completed += 1
+        if completed == 1:
+            raise run_module.Cancelled()
+        return result
+
+    monkeypatch.setattr(run_module.VoteStore, "add_scan", cancel_after_first_station)
+    assert execute(resume_config, lambda: GeometryMaskBackend(), listen=False) == {"cancelled": True}
+    monkeypatch.setattr(run_module.VoteStore, "add_scan", original_add_scan)
+
+    resumed_report = execute(resume_config, lambda: GeometryMaskBackend(), listen=False)
+    resumed_cloud = _slam_output(tmp_path / "resume")
+    _assert_same_slam_output(full_cloud, resumed_cloud)
+    _assert_same_slam_statistics(full_report, resumed_report)
+    assert resumed_report["class_1_share"] == full_report["class_1_share"]
+    assert full_report["class_1_share"] < 1.0
+    observed = np.asarray(resumed_cloud.station_id) >= 1
+    assert observed.any()
+    assert (np.asarray(resumed_cloud.classification)[observed] == 1).mean() <= .10
+
+
+def test_slam_resume_reconstructs_missing_observed_without_sam(tmp_path):
+    source = write_slam_e57(tmp_path / "room.e57", camera_count=6, labelled_images=True, pinhole=True)
+    config = _config(tmp_path, source, output=tmp_path / "first", cache=tmp_path / "cache")
+    baseline_report = execute(config, lambda: GeometryMaskBackend(), listen=False)
+    baseline_cloud = _slam_output(tmp_path / "first")
+    identity = json.loads((tmp_path / "first" / "run_config.json").read_text(encoding="utf-8"))["identity"]
+    shutil.rmtree(tmp_path / "cache" / "votes" / identity / "observed")
+
+    resumed_config = _config(tmp_path, source, output=tmp_path / "reconstructed", cache=tmp_path / "cache")
+    backend = GeometryMaskBackend()
+    reconstructed_report = execute(resumed_config, lambda: backend, listen=False)
+    _assert_same_slam_output(baseline_cloud, _slam_output(tmp_path / "reconstructed"))
+    _assert_same_slam_statistics(baseline_report, reconstructed_report)
+    assert backend.calls == 0
+
+
+def test_slam_completed_cache_reuses_observed_and_masks_without_sam(tmp_path):
+    source = write_slam_e57(tmp_path / "room.e57", camera_count=6, labelled_images=True, pinhole=True)
+    config = _config(tmp_path, source, output=tmp_path / "first", cache=tmp_path / "cache")
+    first_report = execute(config, lambda: GeometryMaskBackend(), listen=False)
+    first_cloud = _slam_output(tmp_path / "first")
+
+    repeated_config = _config(tmp_path, source, output=tmp_path / "repeat", cache=tmp_path / "cache")
+    backend = GeometryMaskBackend()
+    repeated_report = execute(repeated_config, lambda: backend, listen=False)
+    _assert_same_slam_output(first_cloud, _slam_output(tmp_path / "repeat"))
+    _assert_same_slam_statistics(first_report, repeated_report)
+    assert backend.calls == 0

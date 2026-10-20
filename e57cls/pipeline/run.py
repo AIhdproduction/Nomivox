@@ -669,6 +669,115 @@ def _slam_candidate_loader(index, pose, config, checkpoint):
     return load
 
 
+def _slam_observed_path(work, scan):
+    """Keep run-owned visibility masks separate from reusable geometry caches."""
+    return work/'observed'/f'observed_{int(scan)}.npy'
+
+
+def _open_slam_observed(work, stores):
+    """Open durable per-scan observed masks, creating only missing or invalid files."""
+    observed = {}
+    for store in stores:
+        scan = store.meta['scan_index']
+        shape = (store.meta['record_count'],)
+        path = _slam_observed_path(work, scan)
+        values = None
+        if path.exists():
+            try:
+                values = np.lib.format.open_memmap(path, mode='r+')
+                if values.dtype != np.dtype(bool) or values.shape != shape:
+                    values._mmap.close()
+                    values = None
+            except (OSError, ValueError):
+                values = None
+        if values is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.unlink(missing_ok=True)
+            values = np.lib.format.open_memmap(path, mode='w+', dtype=bool, shape=shape)
+            values[...] = False
+            values.flush()
+        observed[scan] = values
+    return observed
+
+
+def _slam_station_state_path(work, station_id):
+    return work/'stations'/f'station_{int(station_id):04d}.json'
+
+
+def _load_slam_station_state(work, station_id):
+    """Return a completed station's durable transfer metadata, if valid."""
+    try:
+        state = json.loads(_slam_station_state_path(work, station_id).read_text(encoding='utf-8'))
+        if (state.get('version') != 1 or int(state.get('station')) != int(station_id)
+                or not isinstance(state.get('views'), list)
+                or not isinstance(state.get('observed_counts'), dict)):
+            return None
+        return state
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _flush_slam_observed(observed):
+    """Make all visibility bits durable before a station is marked completed."""
+    counts = {}
+    for scan, values in observed.items():
+        values.flush()
+        counts[str(scan)] = int(np.count_nonzero(values))
+    return counts
+
+
+def _slam_observed_matches_state(observed, state):
+    """Detect deleted or truncated masks even when transfer metadata still exists."""
+    expected = state.get('observed_counts', {})
+    return all(str(scan) in expected and int(np.count_nonzero(values)) >= int(expected[str(scan)])
+               for scan, values in observed.items())
+
+
+def _save_slam_station_state(work, station, views, observed, *, camera_count, voxel_class_observations):
+    """Persist report values before VoteStore makes the station resumable."""
+    atomic_json(_slam_station_state_path(work, station.id), {
+        'version': 1,
+        'station': station.id,
+        'views': views,
+        'usable_views': sum(item['used'] for item in views),
+        'camera_count': camera_count,
+        'voxel_class_observations': voxel_class_observations,
+        'observed_counts': _flush_slam_observed(observed),
+    })
+
+
+def _mark_slam_observed(observed, point_indices):
+    for point in point_indices:
+        scan, row = unpack_point_id(point)
+        observed[scan][row] = True
+
+
+def _reconstruct_slam_station_visibility(station, cameras, image_by_index, reader, image_cache, index,
+                                         visibility_cache, config, control, observed):
+    """Restore legacy completed-station visibility without invoking SAM."""
+    views = []
+    for camera_index in station.camera_indices:
+        camera = cameras[camera_index]
+        item = image_by_index[camera.image_index]
+        candidates = _slam_candidate_loader(index, camera.pose, config, control.checkpoint)
+        for _, view in iter_camera_views([camera], config['profile'], config['view_size'], config['view_fov']):
+            control.checkpoint()
+            rendered, _, _, _, view_info = _slam_view_image(reader, item, camera.camera, view, image_cache)
+            visibility, visibility_hit = visibility_cache.visibility_for_view(
+                index, camera.pose, view, config, intrinsics=camera.camera.params, view=view_info,
+                checkpoint=control.checkpoint, image=rendered, diagnostics_directory=None,
+                candidates_loader=candidates)
+            if len(visibility.point_indices):
+                _mark_slam_observed(observed, visibility.point_indices)
+                views.append({'image': camera.image_index, 'station': station.id, 'used': True,
+                              'visible_points': int(len(visibility.point_indices)),
+                              'visibility_cache': bool(visibility_hit)})
+            else:
+                views.append({'image': camera.image_index, 'station': station.id, 'used': False,
+                              'reason': 'no_visible_points'})
+    return views
+
+
 def _slam_voxel_origin(cameras, stores):
     """Choose a nearby world-space origin without assuming a scanner origin."""
     if cameras:
@@ -746,11 +855,8 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         warnings.append({'code': 'slam_time_filter_unavailable', 'detail': 'Point and image timestamps are both required.'})
     image_by_index = {item['index']: item for item in inspection['images']}
     timings, station_results = {}, []
-    view_results, observed = [], {}
-    for store in stores:
-        observed[store.meta['scan_index']] = np.lib.format.open_memmap(
-            cache/'slam_visibility'/input_hash/f'observed_{store.meta["scan_index"]}.npy', mode='w+',
-            dtype=bool, shape=(store.meta['record_count'],))
+    view_results = []
+    observed = _open_slam_observed(work, stores)
     with E57Reader(source) as reader:
         control.event('phase_started', phase='slam_scene')
         scene, scene_info = _slam_scene(config, preset, cameras, image_by_index, reader, index, stores,
@@ -778,11 +884,22 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         for station in stations:
             control.checkpoint()
             if votes.completed(station.id, identity):
-                station_results.append({'station': station.id, 'resumed': True, 'views': len(station.camera_indices)})
+                state = _load_slam_station_state(work, station.id)
+                if state is None or not _slam_observed_matches_state(observed, state):
+                    restored_views = _reconstruct_slam_station_visibility(
+                        station, cameras, image_by_index, reader, image_cache, index, visibility_cache,
+                        config, control, observed)
+                    _save_slam_station_state(work, station, restored_views, observed,
+                                             camera_count=len(station.camera_indices), voxel_class_observations=0)
+                    state = _load_slam_station_state(work, station.id)
+                view_results.extend(state['views'])
+                station_results.append({'station': station.id, 'resumed': True, 'views': state['usable_views'],
+                                        'camera_count': state['camera_count'],
+                                        'voxel_class_observations': state['voxel_class_observations']})
                 completed_views += sum(view_counts[camera_index] for camera_index in station.camera_indices)
                 continue
             station_values = {}
-            usable_views = 0
+            station_views = []
             for camera_index in station.camera_indices:
                 camera = cameras[camera_index]
                 item = image_by_index[camera.image_index]
@@ -801,8 +918,8 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                         progress=lambda phase, hit: control.event('progress', phase=phase, station=station.id, image=camera.image_index, cache=hit),
                         image=rendered, diagnostics_directory=output/'slam_diagnostics', candidates_loader=candidates)
                     if not len(visibility.point_indices):
-                        view_results.append({'image': camera.image_index, 'station': station.id, 'used': False,
-                                             'reason': 'no_visible_points'})
+                        station_views.append({'image': camera.image_index, 'station': station.id, 'used': False,
+                                              'reason': 'no_visible_points'})
                         completed_views += 1
                         control.event('progress', phase='slam_label_transfer', fraction=completed_views/max(1, total_views),
                                       station=station.id, station_count=len(stations), image=camera.image_index,
@@ -812,9 +929,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                                       station=station.id, station_count=len(stations), image=camera.image_index,
                                       image_count=len(cameras), view=view_number, view_count=view_counts[camera_index])
                         continue
-                    for point in visibility.point_indices:
-                        scan, row = unpack_point_id(point)
-                        observed[scan][row] = True
+                    _mark_slam_observed(observed, visibility.point_indices)
                     # Point IDs retain original block/record provenance; load only the visible source rows.
                     world, point_times = _slam_point_values(stores, visibility.point_indices,
                                                             time_field_by_scan if time_possible else None)
@@ -837,10 +952,9 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                         for key, weight in zip(keys[take], weights[take]):
                             marker = (bytes(key), global_class)
                             station_values[marker] = max(station_values.get(marker, 0.), float(weight))
-                    usable_views += 1
-                    view_results.append({'image': camera.image_index, 'station': station.id, 'used': True,
-                                         'visible_points': int(len(visibility.point_indices)),
-                                         'visibility_cache': bool(visibility_hit)})
+                    station_views.append({'image': camera.image_index, 'station': station.id, 'used': True,
+                                          'visible_points': int(len(visibility.point_indices)),
+                                          'visibility_cache': bool(visibility_hit)})
                     completed_views += 1
                     control.event('progress', phase='slam_label_transfer', fraction=completed_views/max(1, total_views),
                                   station=station.id, station_count=len(stations), image=camera.image_index,
@@ -850,9 +964,12 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                                   station=station.id, station_count=len(stations), image=camera.image_index,
                                   image_count=len(cameras), view=view_number, view_count=view_counts[camera_index])
                 del candidates
+            _save_slam_station_state(work, station, station_views, observed,
+                                     camera_count=len(station.camera_indices), voxel_class_observations=len(station_values))
             votes.add_scan(station.id, identity, _slam_batches(station_values, len(all_classes)), codes, station_id=station.id)
-            station_results.append({'station': station.id, 'views': usable_views, 'camera_count': len(station.camera_indices),
-                                    'voxel_class_observations': len(station_values)})
+            view_results.extend(station_views)
+            station_results.append({'station': station.id, 'views': sum(item['used'] for item in station_views),
+                                    'camera_count': len(station.camera_indices), 'voxel_class_observations': len(station_values)})
     control.event('phase_finished', phase='slam_segmentation')
     control.event('phase_started', phase='voting')
     priority = {'code': by_id['stairs'], 'over': [by_id[key] for key in config['stairs_priority_over'] if key in by_id],

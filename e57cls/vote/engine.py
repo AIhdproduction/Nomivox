@@ -606,7 +606,7 @@ class VoteStore:
             if floor_tree is not None and len(levels):
                 distance, nearby = floor_tree.query(centres, distance_upper_bound=floor_ring_radius, workers=-1)
                 matching = np.zeros(len(levels), bool)
-                valid_floor = np.isfinite(distance)
+                valid_floor = np.isfinite(distance) & (nearby < len(floor_heights))
                 matching[valid_floor] = np.abs(floor_heights[nearby[valid_floor]]-levels[valid_floor]) <= floor_level_tolerance
                 if matching.any():
                     height_match = np.zeros(len(indices), bool)
@@ -670,7 +670,7 @@ class VoteStore:
             if floor_tree is not None and len(levels):
                 distance, nearby = floor_tree.query(centres, distance_upper_bound=floor_ring_radius, workers=-1)
                 matching = np.zeros(len(levels), bool)
-                valid_floor = np.isfinite(distance)
+                valid_floor = np.isfinite(distance) & (nearby < len(floor_heights))
                 matching[valid_floor] = np.abs(floor_heights[nearby[valid_floor]]-levels[valid_floor]) <= floor_level_tolerance
                 if matching.any():
                     height_match = np.zeros(len(indices), bool)

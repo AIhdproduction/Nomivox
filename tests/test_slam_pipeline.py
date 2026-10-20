@@ -149,6 +149,14 @@ def test_slam_pipeline_transfers_visible_labels_and_writes_station_id(tmp_path, 
     assert any(item["code"] == "slam_reflection_disabled" for item in report["warnings"])
 
 
+def test_slam_pipeline_handles_indoor_features_beyond_terrain_gap(tmp_path):
+    source = write_slam_e57(tmp_path / "terrain-gap.e57", camera_count=1, labelled_images=True, pinhole=True)
+    report, cloud = _classify(tmp_path, source, terrain_max_gap=.1)
+
+    assert report["output"]["record_count"] == len(cloud.x)
+    assert "station_id" in cloud.point_format.extra_dimension_names
+
+
 def test_slam_scene_counts_sky_in_score_coordinates(monkeypatch):
     rendered = np.zeros((5, 7, 3), np.uint8)
     valid = np.zeros((5, 7), bool)

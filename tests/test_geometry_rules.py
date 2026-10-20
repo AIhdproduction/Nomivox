@@ -159,6 +159,27 @@ def test_indoor_slope_is_covered_and_keeps_floor(tmp_path):
     assert set(codes.tolist()) == {102}
 
 
+def test_terrain_ignores_distant_indoor_features_without_a_neighbour(tmp_path):
+    votes = VoteStore(tmp_path/'terrain-gap.sqlite')
+    try:
+        xx, yy = np.meshgrid(np.arange(9)*.1, np.arange(9)*.1, indexing='ij')
+        ground = np.column_stack((xx.ravel(), yy.ravel(), np.zeros(xx.size)))
+        indoor = np.array([[.4, .4, 2.], [20., 0., 2.]])
+        ground_keys = voxel_keys(ground, np.zeros(3), .02)
+        indoor_keys = voxel_keys(indoor, np.zeros(3), .02)
+        votes.add_scan(1, 'outdoor-ground', [(ground_keys, np.ones((len(ground_keys), 1), np.float32))], [102])
+        votes.add_scan(2, 'indoor-ceiling', [(indoor_keys, np.ones((len(indoor_keys), 1), np.float32))], [101])
+        votes.decide(1, .5, [102, 101])
+        terrain = tmp_path/'terrain.npz'
+        apply_geometry_rules(votes, {'floor': 102, 'ceiling': 101}, np.zeros(3), .02, {**DEFAULTS}, terrain,
+                             scan_context={1: {'outdoor': True, 'allowed_codes': {102}},
+                                           2: {'outdoor': False, 'allowed_codes': {101}}})
+        with np.load(terrain, allow_pickle=False) as artifact:
+            assert artifact['covered'].any()
+    finally:
+        votes.close()
+
+
 def test_mixed_scan_context_applies_tree_rule_only_outdoors(tmp_path):
     votes = VoteStore(tmp_path/'mixed.sqlite')
     try:

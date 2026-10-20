@@ -30,7 +30,7 @@ class TerrainIndex:
             return result
         distance, ids = self.tree.query(np.asarray(points)[:, :2], k=1,
                                         distance_upper_bound=self.meta.get('max_gap', self.meta['cell_size']*.8), workers=-1)
-        valid = np.isfinite(distance)
+        valid = np.isfinite(distance) & (ids < len(self.xy))
         result[valid] = (~self.covered[ids[valid]]
                          & (np.abs(np.asarray(points)[valid, 2]-self.z[ids[valid]]) <= tolerance))
         return result
@@ -209,7 +209,7 @@ def _terrain(votes, origin, config, target, checkpoint, by_id):
             checkpoint()
             points = np.asarray([row[3:6] for row in batch], np.float64)
             distance, nearest = tree.query(points[:, :2], k=1, distance_upper_bound=config['terrain_max_gap'], workers=-1)
-            valid = np.isfinite(distance)
+            valid = np.isfinite(distance) & (nearest < len(heights))
             hag = np.full(len(batch), np.nan)
             hag[valid] = points[valid, 2]-heights[nearest[valid]]
             codes = np.asarray([row[8] for row in batch], np.int64)
@@ -221,7 +221,7 @@ def _terrain(votes, origin, config, target, checkpoint, by_id):
             cover = valid & in_height & (ceiling_cover | slope_cover)
             # A cell reached exclusively from indoor scans is covered even when
             # no horizontal ceiling is visible (for example below a roof slope).
-            cover |= indoor & ~outdoor
+            cover |= valid & indoor & ~outdoor
             covered[nearest[cover]] = True
             updates.extend((None if not np.isfinite(value) else float(value), 0, int(row[0]), int(row[1]), int(row[2]))
                            for row, value in zip(batch, hag))
@@ -238,7 +238,7 @@ def _terrain(votes, origin, config, target, checkpoint, by_id):
             points = np.asarray([row[3:5] for row in batch], np.float64)
             distance, nearest = tree.query(points, k=1, distance_upper_bound=config['terrain_max_gap'], workers=-1)
             values = np.zeros(len(batch), np.int64)
-            valid = np.isfinite(distance)
+            valid = np.isfinite(distance) & (nearest < len(covered))
             values[valid] = covered[nearest[valid]]
             updates.extend((int(value), int(row[0]), int(row[1]), int(row[2])) for row, value in zip(batch, values))
             if len(updates) >= 100_000:
@@ -376,8 +376,9 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
             checkpoint()
             points = np.asarray([(row[2]*voxel_size, row[3]*voxel_size) for row in rows], np.float64)
             distance, nearest = tree.query(points, distance_upper_bound=config['tree_crown_grow_radius'])
-            for row, d, seed in zip(rows, distance, nearest):
-                if not np.isfinite(d) or row[5] <= .25 or not row[7]:
+            valid = np.isfinite(distance) & (nearest < len(seed_top))
+            for row, d, seed, has_seed in zip(rows, distance, nearest, valid):
+                if not has_seed or row[5] <= .25 or not row[7]:
                     continue
                 relative_z = row[4]*voxel_size-seed_top[seed]
                 in_cylinder = d <= config['tree_crown_radius'] and -1. <= relative_z <= config['tree_crown_max_height']

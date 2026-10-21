@@ -9,6 +9,48 @@ from e57cls.seg.backend import PromptClass
 from e57cls.seg.cache import segment_view
 
 
+def horizontal_openness(points_rel, config):
+    """Measure low-elevation horizontal openings from scanner-relative points."""
+    points = np.asarray(points_rel, dtype=float)
+    sectors = config['scene_openness_sectors']
+    rows = 5
+    if len(points) == 0:
+        return {'horizontal_openness': 1., 'openness_max_arc_deg': 360., 'openness_samples': 0}
+    distance = np.linalg.norm(points, axis=1)
+    elevation = np.degrees(np.arcsin(np.divide(points[:, 2], distance, out=np.zeros_like(distance), where=distance > 0)))
+    minimum, maximum = config['scene_openness_elevation_min'], config['scene_openness_elevation_max']
+    selected = (distance > 0) & (elevation >= minimum) & (elevation <= maximum)
+    points, distance, elevation = points[selected], distance[selected], elevation[selected]
+    counts = np.zeros((rows, sectors), np.int32)
+    distant = np.zeros((rows, sectors), np.int32)
+    if len(points):
+        azimuth = np.mod(np.arctan2(points[:, 1], points[:, 0]), 2*np.pi)
+        sector = np.minimum(sectors - 1, (azimuth / (2*np.pi) * sectors).astype(int))
+        row = np.minimum(rows - 1, ((elevation-minimum) / max(maximum-minimum, np.finfo(float).eps) * rows).astype(int))
+        np.add.at(counts, (row, sector), 1)
+        np.add.at(distant, (row, sector), distance >= config['scene_openness_range'])
+    open_cells = np.zeros_like(counts, dtype=bool)
+    for row in range(rows):
+        nonempty = counts[row][counts[row] > 0]
+        median = np.median(nonempty) if len(nonempty) else 0.
+        sparse = counts[row] < .05 * median if median else counts[row] == 0
+        far_share = np.divide(distant[row], counts[row], out=np.zeros(sectors), where=counts[row] > 0)
+        open_cells[row] = sparse | (far_share >= config['scene_openness_cell_open_share'])
+    # Glass can expose distant exterior returns in the lower rows of a window band.
+    # A genuine outdoor opening also reaches the upper row below a roofline.
+    open_sectors = (open_cells[-1]
+                    & (open_cells.mean(axis=0) >= config['scene_openness_sector_cells']))
+    doubled = np.concatenate((open_sectors, open_sectors))
+    longest = run = 0
+    for value in doubled:
+        run = run + 1 if value else 0
+        longest = max(longest, run)
+    longest = min(longest, sectors)
+    return {'horizontal_openness': float(open_sectors.mean()),
+            'openness_max_arc_deg': float(longest * 360 / sectors),
+            'openness_samples': int(len(points))}
+
+
 def decide(metrics, config):
     sky, ceiling = metrics['sky_fraction'], metrics['ceiling_fraction']
     open_sky = metrics.get('open_sky_fraction', 0.)
@@ -17,8 +59,28 @@ def decide(metrics, config):
     indoor = ceiling >= config['scene_ceiling_indoor'] or supported_ceiling or metrics['overhead_plane']
     outdoor = (sky >= config['scene_sky_outdoor'] and open_sky >= config['scene_open_sky_outdoor']
                and ceiling < config['scene_ceiling_outdoor_max'] and not indoor)
-    if metrics['upper_coverage'] < .6:
+    openness = metrics.get('horizontal_openness')
+    if openness is None and metrics['upper_coverage'] < .6:
         return 'unsure'
+    if openness is not None:
+        if indoor and openness >= config['scene_openness_covered_outdoor']:
+            return 'covered_outdoor'
+        if indoor and open_sky <= config['scene_open_sky_indoor_max']:
+            return 'indoor'
+        previous = ('mixed' if open_sky >= config['scene_open_sky_outdoor']
+                    and ceiling >= config['scene_ceiling_outdoor_max']
+                    else 'outdoor' if outdoor else 'indoor' if indoor else 'unsure')
+        if previous == 'mixed':
+            if openness >= config['scene_openness_outdoor_min']:
+                return 'covered_outdoor' if ceiling >= config['scene_ceiling_outdoor_max'] else 'outdoor'
+            if openness <= config['scene_openness_indoor_max']:
+                return 'indoor'
+        if previous == 'unsure':
+            if openness <= config['scene_openness_indoor_max'] and metrics.get('upper_return_fraction', 0) >= config['scene_upper_returns_indoor']:
+                return 'indoor'
+            if openness >= config['scene_openness_outdoor_min'] and open_sky >= config['scene_open_sky_outdoor']:
+                return 'outdoor'
+        return previous
     if indoor and open_sky <= config['scene_open_sky_indoor_max']:
         return 'indoor'
     if open_sky >= config['scene_open_sky_outdoor'] and ceiling >= config['scene_ceiling_outdoor_max']:
@@ -79,13 +141,16 @@ def detect(reader, store, inspection, config, image_cache, mask_cache, model_has
                 merged[c, ids] = np.maximum(merged[c, ids], scores[c][pixels[ids,1],pixels[ids,0]])
         del image, mask, depth
     # Deterministic bounded reservoir spread over the entire original scan.
-    overhead = []
+    overhead, openness = [], []
     stride = max(1, store.meta['record_count']//20000)
+    openness_stride = max(1, store.meta['record_count']//config['scene_openness_samples'])
     for start, xyz, valid in store.chunks():
         control.checkpoint()
         selected = valid & ((np.arange(start, start+len(xyz)) % stride) == 0)
         world = scan_transform.to_world(xyz[selected])-scan_transform.translation
         overhead.append(world[(world[:,2] > .5) & (world[:,2] <= config['scene_overhead_range'])])
+        openness_selected = valid & ((np.arange(start, start+len(xyz)) % openness_stride) == 0)
+        openness.append(scan_transform.to_world(xyz[openness_selected])-scan_transform.translation)
     plane = fit_plane(np.concatenate(overhead) if overhead else np.empty((0,3)), config['scene_plane_tolerance'],
                       config['seed'], min_fraction=config['scene_plane_fraction'], horizontal=True)
     sky_pixels = (merged[0] >= thresholds[0]) & covered
@@ -95,5 +160,6 @@ def detect(reader, store, inspection, config, image_cache, mask_cache, model_has
                'upper_return_fraction': float(returns.mean()), 'upper_coverage': float(covered.mean()),
                'overhead_plane': plane is not None,
                'overhead_plane_inliers': plane['inlier_fraction'] if plane else 0.}
+    metrics.update(horizontal_openness(np.concatenate(openness) if openness else np.empty((0, 3)), config))
     return {'scene': decide(metrics, config), 'metrics': metrics,
             'thresholds': {k:v for k,v in config.items() if k.startswith('scene_') and k not in ('scene_mode','scene_overrides')}}

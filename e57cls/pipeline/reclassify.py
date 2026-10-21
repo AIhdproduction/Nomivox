@@ -14,12 +14,14 @@ from e57cls.files import atomic_json, new_output
 from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
+from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.store import load_scan, reduced_store
 from e57cls.output.e57 import write_e57
 from e57cls.output.las import write_cloud
 from e57cls.output.reports import legend_rows, write_legends, write_report
 from e57cls.pipeline.config import DEFAULTS, resolve_config
-from e57cls.pipeline.run import geometry_scan_context
+from e57cls.pipeline.run import geometry_scan_context, scene_audit, scene_resolution_report
+from e57cls.scene.resolve import resolve_scan_scene, resolve_neighbours
 from e57cls.slam.cameras import build_camera_list
 from e57cls.slam.stations import cluster_stations
 from e57cls.vote.engine import VoteStore
@@ -52,7 +54,8 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
 })
 RECLASSIFY_POST_VOTE_PREFIXES = ('stairs_', 'surface_tie_', 'component_', 'cable_', 'electrical_',
                                  'vegetation_', 'building_', 'geometry_fill', 'geometry_', 'terrain_', 'tree_',
-                                 'class_transfer_')
+                                 'class_transfer_', 'scene_context_', 'scene_consistency', 'scene_name_', 'scene_neighbour_',
+                                 'scene_openness_')
 INPUT_MODES = frozenset({'static', 'slam'})
 REQUESTED_INPUT_MODES = INPUT_MODES | {'auto'}
 
@@ -157,7 +160,8 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority, vote_families=families)
     result = {'surface_ties': None, 'building_enclosure': None, 'stairs_geometry': None,
-              'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_rules': None, 'geometry_fill': None}
+              'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_rules': None,
+              'scene_consistency': None, 'geometry_fill': None}
     origin = np.asarray(config['voxel_origin'])
     if config['surface_tie_break']:
         result['surface_ties'] = votes.resolve_surface_ties(by_id, origin, config['voxel_size'], config['surface_tie_share'],
@@ -182,6 +186,9 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
             underside_minimum_voxels=config['stairs_underside_min_voxels'],
             underside_cluster_size=config['stairs_underside_cluster_size'],
             underside_maximum_gap=config['stairs_underside_max_gap'])
+    result['scene_consistency'] = enforce_scene_consistency(
+        votes, config['_preset_classes'], by_id, scan_context, origin, config['voxel_size'], config,
+        active_codes, lambda: None)
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
@@ -241,19 +248,39 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         by_id = {item['id']: int(mapping.get(str(item['code']), item['code'])) for item in all_classes}
         config = {**config, 'voxel_origin': manifest['voxel_origin']}
         source_report = _load_json_object(source_run/'report.json', 'report.json')
-        scan_scenes = {int(item['scan']): item.get('scene') for item in source_report.get('scans', [])
-                       if isinstance(item, dict) and isinstance(item.get('scan'), int)}
+        source_scans = [item for item in source_report.get('scans', []) if isinstance(item, dict)
+                        and isinstance(item.get('scan'), int)]
+        scan_scenes = {int(item['scan']): item.get('scene') for item in source_scans}
         if input_mode['mode'] == 'static':
             representatives_by_scan = {store.meta['scan_index']: vote_directory/f"scan_{store.meta['scan_index']:04d}"/'representatives.npy'
                                        for store in stores}
             existing = {scan: path for scan, path in representatives_by_scan.items() if path.is_file()}
             votes.rebuild_scan_observations(existing)
         inspect = _load_json_object(source_run/'inspect_report.json', 'inspect_report.json')
-        scanner_heights = ([camera.pose.translation[2] for camera in build_camera_list(inspect)]
-                           if input_mode['mode'] == 'slam'
-                           else [scan_pose(store.meta['metadata']).translation[2] for store in stores])
-        scan_context = geometry_scan_context(preset, config, scan_scenes)
-        stages, planes, terrain = _postprocess(votes, config, by_id,
+        metadata = {store.meta['scan_index']: store.meta['metadata'] for store in stores}
+        scene_overrides = any(key.startswith(('scene_name_', 'scene_neighbour_', 'scene_openness_')) for key in overrides)
+        if scene_overrides and input_mode['mode'] == 'static':
+            refreshed = []
+            for item in source_scans:
+                detection = item.get('scene_detection') or item.get('scene_resolution')
+                refreshed.append(dict(resolve_scan_scene(detection, metadata.get(item['scan'], {}), config), scan=item['scan']))
+            refreshed, _ = resolve_neighbours(refreshed,
+                {scan: scan_pose(meta).translation.tolist() for scan, meta in metadata.items()}, config)
+            for item, resolution in zip(source_scans, refreshed):
+                item.update(scene=resolution['scene'], scene_resolution=resolution, scene_detection=resolution)
+            scan_scenes = {item['scan']: item['scene'] for item in source_scans}
+        if input_mode['mode'] == 'slam':
+            cameras = build_camera_list(inspect)
+            stations, _, _ = cluster_stations(cameras, config['slam_station_spacing'])
+            positions = {station.id: station.position for station in stations}
+            scan_scenes = {station.id: next(iter(scan_scenes.values()), 'indoor') for station in stations}
+            scanner_heights = [camera.pose.translation[2] for camera in cameras]
+        else:
+            positions = {scan: scan_pose(meta).translation.tolist() for scan, meta in metadata.items()}
+            scanner_heights = [scan_pose(store.meta['metadata']).translation[2] for store in stores]
+        scan_context = geometry_scan_context(preset, config, scan_scenes, positions=positions,
+                                             class_ids={item['scan']: item.get('class_ids', []) for item in source_scans})
+        stages, planes, terrain = _postprocess(votes, {**config, '_preset_classes': all_classes}, by_id,
             scanner_heights, copied_votes.parent,
             {row['code'] for row in rows}, scan_context)
         if station_tracking:
@@ -296,9 +323,12 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         atomic_json(target/'run_config.json', new_manifest)
         report = {'schema_version': 1, 'input': manifest.get('source', config['source']), 'input_sha256': manifest['input_sha256'],
                   'input_mode': input_mode, 'output': result,
-                  'scans': source_report.get('scans', []),
+                  'scans': source_scans,
                   'warnings': [],
                   'reclassified_from': str(source_run), 'reclassify_overrides': overrides, **stages,
+                  'scene_resolution': scene_resolution_report(source_scans),
+                  'scene_audit': scene_audit(source_scans, result.get('scan_class_counts', {}), preset, mapping),
+                  'scene_reclassification_note': ('Scene resolution was recalculated from retained detection data.' if scene_overrides else None),
                   'total_seconds': time.monotonic()-started, 'created_utc': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
         write_report(target, report, rows)
         return report

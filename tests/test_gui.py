@@ -73,6 +73,17 @@ def test_window_without_source_allows_presets_and_later_selection(tmp_path, qt_a
         QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 
+def test_scene_event_displays_covered_outdoor_detail(qt_application):
+    window = MainWindow(None, auto_start=False)
+    try:
+        window.scan_table.setRowCount(1)
+        window.handle_event({'event': 'scene', 'scan': 1, 'scene': 'outdoor', 'scene_detail': 'covered_outdoor'})
+        assert window.scan_table.item(0, 6).text() == 'Aussen (überdacht)'
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def write_preview_source(path, count):
     data = {"cartesianX": np.arange(count, dtype=np.float64),
             "cartesianY": np.ones(count), "cartesianZ": np.full(count, 2.)}

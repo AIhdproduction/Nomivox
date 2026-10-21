@@ -201,3 +201,30 @@ def test_mixed_scan_context_applies_tree_rule_only_outdoors(tmp_path):
         votes.close()
     assert (outside_codes == 5).any()
     assert set(inside_codes.tolist()) == {101}
+
+
+def test_covered_ground_floor_rule_respects_resolved_scene(tmp_path):
+    xx, yy = np.meshgrid(np.arange(9)*.1, np.arange(9)*.1, indexing='ij')
+    ground = np.column_stack((xx.ravel(), yy.ravel(), np.zeros(xx.size)))
+    canopy = np.column_stack((xx.ravel(), yy.ravel(), np.full(xx.size, 3.)))
+
+    def classify(path, scene, ground_code):
+        votes = VoteStore(path)
+        keys = voxel_keys(np.vstack((ground, canopy)), np.zeros(3), .02)
+        weights = np.zeros((len(keys), 3), np.float32)
+        weights[:len(ground), 0] = .9
+        weights[len(ground):, 2] = .9
+        codes = [ground_code, 102 if ground_code == 2 else 2, 100]
+        votes.add_scan(1, scene, [(keys, weights)], codes)
+        votes.decide(1, .5, codes)
+        apply_geometry_rules(votes, {'ground': 2, 'floor': 102, 'building': 100}, np.zeros(3), .02,
+                             {**DEFAULTS}, tmp_path/f'{scene}-{ground_code}.npz',
+                             scan_context={1: {'scene': scene, 'outdoor': scene == 'outdoor',
+                                               'position': [0., 0., 0.], 'allowed_codes': {2, 102, 100}}})
+        values = votes.lookup(keys[:len(ground)])[0]
+        votes.close()
+        return values
+
+    assert set(classify(tmp_path/'outdoor.sqlite', 'outdoor', 2).tolist()) == {2}
+    assert set(classify(tmp_path/'indoor.sqlite', 'indoor', 2).tolist()) == {102}
+    assert set(classify(tmp_path/'outdoor-floor.sqlite', 'outdoor', 102).tolist()) == {2}

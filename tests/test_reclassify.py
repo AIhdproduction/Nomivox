@@ -55,3 +55,25 @@ def test_reclassify_override_applies_and_segmenting_override_is_rejected(tmp_pat
     denied.write_text(json.dumps({'voxel_size': .1}), encoding='utf-8')
     with pytest.raises(ValueError, match='Nicht erlaubte'):
         reclassify(Path(config['output']), tmp_path / 'denied', denied)
+
+
+def test_reclassify_accepts_scene_postprocessing_overrides_and_old_scene_reports(tmp_path):
+    config = _classified_run(tmp_path)
+    allowed = tmp_path/'scene.json'
+    allowed.write_text(json.dumps({'scene_consistency': False, 'scene_name_hint_mode': 'tiebreak'}), encoding='utf-8')
+    report = reclassify(Path(config['output']), tmp_path/'scene', allowed)
+    assert not report['scene_consistency']['enabled']
+    assert report['reclassify_overrides']['scene_name_hint_mode'] == 'tiebreak'
+    denied = tmp_path/'scene-mode.json'
+    denied.write_text(json.dumps({'scene_mode': 'outdoor'}), encoding='utf-8')
+    with pytest.raises(ValueError, match='Nicht erlaubte'):
+        reclassify(Path(config['output']), tmp_path/'denied-scene', denied)
+
+    path = Path(config['output'])/'report.json'
+    old = json.loads(path.read_text(encoding='utf-8'))
+    for scan in old['scans']:
+        scan.pop('scene_resolution', None)
+        scan.pop('scene_detection', None)
+    path.write_text(json.dumps(old), encoding='utf-8')
+    replay = reclassify(Path(config['output']), tmp_path/'old-report')
+    assert replay['output']['record_count'] > 0

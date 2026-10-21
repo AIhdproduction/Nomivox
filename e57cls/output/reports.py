@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from e57cls.files import atomic_json, atomic_text
+from e57cls.scene.resolve import scan_display_name
 
 
 def legend_rows(preset):
@@ -41,7 +42,40 @@ def write_report(output: Path, report, rows):
     summary += '<p>'+strings['report_runtime'].format(minutes=report['total_seconds']/60)+' · '+strings['report_unclassified'].format(share=report['output']['unclassified_share']*100)+'</p>'
     error = max(report['output']['readback']['max_coordinate_error_m'])*1000
     summary += '<p>'+strings['report_preservation'].format(error=error)+'</p>'
-    scenes = ''.join(f'<tr><td>{s["scan"]}</td><td>{html.escape(strings.get("scene_"+s["scene"],s["scene"]))}</td></tr>' for s in report['scans'])
+    inspect = {}
+    try:
+        inspect = json.loads((output/'inspect_report.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        pass
+    metadata = {index+1: item.get('metadata', {}) for index, item in enumerate(inspect.get('scans', []))}
+    source_labels = {'manual': 'scene_source_manual', 'name': 'scene_source_name', 'name+data': 'scene_source_name',
+                     'data': 'scene_source_data', 'openness': 'scene_source_openness',
+                     'neighbour': 'scene_source_neighbour', 'pending': 'scene_source_pending'}
+    scene_rows = []
+    for s in report.get('scans', []):
+        resolution = s.get('scene_resolution') or s.get('scene_detection') or {}
+        detail = resolution.get('scene_detail', s.get('scene'))
+        scene = strings.get('scene_'+str(detail), strings.get('scene_'+str(s.get('scene')), str(s.get('scene', ''))))
+        meta = metadata.get(s.get('scan'), {})
+        name = scan_display_name(meta)
+        source = strings.get(source_labels.get(resolution.get('source'), ''), resolution.get('source', ''))
+        hint = strings.get('scene_name_conflict') if resolution.get('conflict') else ''
+        if s.get('scene') not in ('indoor', 'outdoor'):
+            hint = strings.get('scene_unresolved', hint)
+        scene_rows.append(f'<tr><td>{s.get("scan", "")}</td><td>{html.escape(str(name))}</td><td>{html.escape(scene)}</td>'
+                          f'<td>{html.escape(source)}</td><td>{html.escape(hint)}</td></tr>')
+    scenes = ''.join(scene_rows)
+    consistency = report.get('scene_consistency') or {}
+    audit = report.get('scene_audit') or {}
+    scene_summary = ''
+    if consistency:
+        changes = ', '.join(f'{html.escape(key)}: {value}' for key, value in consistency.get('changed', {}).items()) or '0'
+        scene_summary += f'<p>{html.escape(strings.get("report_scene_consistency", "Szenenkonsistenz"))}: {changes}</p>'
+    if audit.get('totals'):
+        totals = audit['totals']
+        scene_summary += '<p>'+html.escape(strings.get('report_scene_audit', 'Szenenaudit'))+': '+', '.join(
+            f'{html.escape(strings.get("scene_"+scene, scene))} {value.get("wrong_scene_share", 0.)*100:.2f}%'
+            for scene, value in totals.items())+'</p>'
     slam = ''
     if report.get('slam'):
         skipped = len(report.get('views_skipped', []))
@@ -59,4 +93,4 @@ def write_report(output: Path, report, rows):
         links += f'<li><a href="reflection_report.json">{strings["report_reflections"]}</a></li>'
         overlays = sorted((output/'diagnostics'/'reflections').glob('*_overlay.jpg'))
         links += ''.join(f'<li><a href="{p.relative_to(output).as_posix()}">{html.escape(p.stem)}</a></li>' for p in overlays)
-    atomic_text(output/"report.html", f'<!doctype html><html lang="de"><meta charset="utf-8"><title>{strings["report_title"]}</title><style>body{{font:16px system-ui;max-width:1000px;margin:40px auto;padding:20px}}td,th{{padding:8px;text-align:left;border-bottom:1px solid #ccc}}a{{color:#176a9b}}</style><h1>{strings["report_title"]}</h1><p>{strings["report_total"].format(count=total)}</p>{summary}{slam}<h2>{strings["report_links"]}</h2><ul>{links}</ul><table><tr><th>{strings["code"]}</th><th>{strings["class"]}</th><th>{strings["point_count"]}</th><th>{strings["share"]}</th></tr>{body}</table><h2>{strings["report_scans"]}</h2><table>{scenes}</table><h2>{strings["hints"]}</h2><ul>{hints}</ul><p>{strings["report_visual"]}</p><p>{strings["report_details"]}</p></html>')
+    atomic_text(output/"report.html", f'<!doctype html><html lang="de"><meta charset="utf-8"><title>{strings["report_title"]}</title><style>body{{font:16px system-ui;max-width:1000px;margin:40px auto;padding:20px}}td,th{{padding:8px;text-align:left;border-bottom:1px solid #ccc}}a{{color:#176a9b}}</style><h1>{strings["report_title"]}</h1><p>{strings["report_total"].format(count=total)}</p>{summary}{slam}<h2>{strings["report_links"]}</h2><ul>{links}</ul><table><tr><th>{strings["code"]}</th><th>{strings["class"]}</th><th>{strings["point_count"]}</th><th>{strings["share"]}</th></tr>{body}</table><h2>{strings["report_scans"]}</h2><table><tr><th>{strings["scan"]}</th><th>{strings["name"]}</th><th>{strings["scene"]}</th><th>{strings.get("source", "Quelle")}</th><th>{strings["hints"]}</th></tr>{scenes}</table>{scene_summary}<h2>{strings["hints"]}</h2><ul>{hints}</ul><p>{strings["report_visual"]}</p><p>{strings["report_details"]}</p></html>')

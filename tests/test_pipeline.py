@@ -19,6 +19,7 @@ from e57cls.pipeline import run as pipeline_run
 from e57cls.pipeline.run import execute, InputNotClassifiable
 from e57cls.pipeline.control import Cancelled, Control
 from e57cls.mirror import pipeline as mirror_pipeline
+from e57cls.output.reports import write_report
 
 
 def small_project(path, image_problem=None, scan_count=1, unique_images=False):
@@ -236,6 +237,52 @@ def test_shared_sam_batches_class_and_reflection_prompts_once_per_view(tmp_path,
     second = execute(resolve_config({**common, 'output': str(tmp_path/'out_again')}),
                      lambda: (_ for _ in ()).throw(AssertionError('shared masks must be cache hits')), listen=False)
     assert second['sam_calls'] == 0
+
+
+def test_scene_resume_and_name_hint_resolution(tmp_path, monkeypatch):
+    source = tmp_path/'scene.e57'; small_project(source)
+    preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    preset['classes'] = [item for item in preset['classes'] if item['id'] == 'wall']
+    preset['scene_resolved_pairs'] = []
+    preset_path = tmp_path/'preset.json'; preset_path.write_text(json.dumps(preset), encoding='utf-8')
+    model = tmp_path/'model.pt'; model.write_bytes(b'synthetic backend')
+    common = dict(source=str(source), cache=str(tmp_path/'cache'), preset=str(preset_path), model=str(model),
+                  profile='fast', scene_mode='both', view_size=128, boundary_margin=0, depth_width=256,
+                  mirror_analysis=False, component_cleanup=False, point_reduction=0, format='las',
+                  cache_cleanup='keep_all')
+    detect_calls = []
+    monkeypatch.setattr(pipeline_run, 'detect', lambda *args: (detect_calls.append(args[1].meta['scan_index'])
+                                                               or {'scene': 'indoor', 'metrics': {}}))
+    first = execute(resolve_config({**common, 'output': str(tmp_path/'first')}), lambda: Backend(), listen=False)
+    assert first['scans'][0]['scene'] == 'indoor'
+    resumed = execute(resolve_config({**common, 'output': str(tmp_path/'resumed')}),
+                      lambda: (_ for _ in ()).throw(AssertionError('completed scan must resume')), listen=False)
+    assert resumed['scans'][0]['resumed']
+    assert resumed['scans'][0]['scene'] == 'indoor'
+    assert detect_calls == [1]
+
+    original_load_scan = pipeline_run.load_scan
+    def load_with_scan_name(*args, **kwargs):
+        store = original_load_scan(*args, **kwargs)
+        store.meta['metadata']['rlms:scanposGuid'] = '/P/SCANS/01_Aussen 001'
+        return store
+    monkeypatch.setattr(pipeline_run, 'load_scan', load_with_scan_name)
+    named = execute(resolve_config({**common, 'cache': str(tmp_path/'named-cache'),
+                                    'output': str(tmp_path/'named')}), lambda: Backend(), listen=False)
+    assert named['scans'][0]['scene'] == 'outdoor'
+    assert named['scans'][0]['scene_resolution']['source'] == 'name'
+    assert {'scene_resolution', 'scene_consistency', 'scene_audit'} <= named.keys()
+    assert (tmp_path/'named'/'report.json').is_file()
+    assert (tmp_path/'named'/'report.html').is_file()
+    assert any(warning['code'] == 'scene_name_conflict' for warning in named['warnings'])
+
+
+def test_html_report_tolerates_scan_without_scene(tmp_path):
+    report = {'output': {'class_counts': {'1': 1}, 'record_count': 1, 'unclassified_share': 1.,
+                         'readback': {'max_coordinate_error_m': [0., 0., 0.]}, 'path': str(tmp_path/'cloud.las')},
+              'scans': [{'scan': 1}], 'warnings': [], 'total_seconds': 0.}
+    write_report(tmp_path, report, [{'code': 1, 'name_de': 'Unklassifiziert', 'color': '#000000'}])
+    assert (tmp_path/'report.html').is_file()
 
 
 def test_filter_only_uses_mirror_views_without_sam_and_writes_fixed_states(tmp_path, monkeypatch):

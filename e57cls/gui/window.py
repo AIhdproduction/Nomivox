@@ -20,6 +20,7 @@ from e57cls.io.inspector import INSPECTION_SCHEMA
 from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
 from e57cls.scene.presets import validate_preset
+from e57cls.scene.resolve import scan_display_name, name_hint
 
 STRINGS = json.loads((PROJECT/'e57cls/gui/strings_de.json').read_text(encoding='utf-8'))
 def tr(key, **values):
@@ -513,6 +514,11 @@ class MainWindow(QMainWindow):
             'scene_ceiling_supported':(0.,1.,.01),'scene_upper_returns_indoor':(0.,1.,.05),
             'scene_open_sky_outdoor':(0.,1.,.01),'scene_open_sky_indoor_max':(0.,1.,.01),
             'scene_sky_confidence':(.2,1.,.05),'scene_ceiling_confidence':(.2,1.,.05),
+            'scene_openness_range':(5.,50.,1.),'scene_openness_cell_open_share':(0.,1.,.01),
+            'scene_openness_sector_cells':(0.,1.,.01),'scene_openness_covered_outdoor':(0.,1.,.01),
+            'scene_openness_outdoor_min':(0.,1.,.01),'scene_openness_indoor_max':(0.,1.,.01),
+            'scene_neighbour_radius':(1.,100.,1.),'scene_neighbour_height':(.1,10.,.1),
+            'scene_context_margin':(.5,1.,.01),
             'stairs_min_confidence':(.2,1.,.05),'stairs_priority_min_share':(0.,1.,.05),
             'stairs_plane_tolerance':(.001,.2,.001),'stairs_planar_fraction':(.1,1.,.05),'stairs_min_rise':(.01,2.,.01),
             'stairs_min_voxels':(1,1000,1),'stairs_min_levels':(3,32,1),'stairs_level_tolerance':(.001,.10,.001),
@@ -536,7 +542,7 @@ class MainWindow(QMainWindow):
             'settings_group_segmentation': {'image_scale','tile_overlap','tile_size','view_size','view_fov','instance_confidence','mask_confidence','boundary_margin','gpu_memory_fraction'},
             'settings_group_tuning_geometry': {'min_observations','voxel_size','min_winning_share','surface_tie_share','door_depth_limit','door_max_width','door_max_height','visibility_abs','visibility_rel','depth_width','class_transfer_radius','class_transfer_range_factor','class_transfer_radius_max'},
             'settings_group_cleanup': {'component_min_voxels','component_min_cells','component_sparse_max_voxels_per_cell','cable_component_min_voxels','cable_component_min_span','electrical_component_min_voxels','electrical_component_min_span','vegetation_ground_cell_size','vegetation_ground_band','building_boundary_cell_size','building_boundary_min_height','geometry_fill_min_area','geometry_fill_max_gap','geometry_fill_tolerance','geometry_fill_max_planes','stairs_min_confidence','stairs_priority_min_share','stairs_plane_tolerance','stairs_planar_fraction','stairs_min_rise','stairs_min_voxels','stairs_min_levels','stairs_level_tolerance','stairs_step_rise_min','stairs_step_rise_max','stairs_step_tread_min','stairs_step_tread_max','stairs_floor_ring_radius','stairs_floor_level_tolerance','stairs_underside_min_voxels','stairs_underside_cluster_size','stairs_underside_max_gap'},
-            'settings_group_scene': {'scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor','scene_sky_indoor_max','scene_overhead_range','scene_plane_tolerance','scene_plane_fraction','scene_ceiling_supported','scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max','scene_sky_confidence','scene_ceiling_confidence'},
+            'settings_group_scene': {'scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor','scene_sky_indoor_max','scene_overhead_range','scene_plane_tolerance','scene_plane_fraction','scene_ceiling_supported','scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max','scene_sky_confidence','scene_ceiling_confidence','scene_openness_range','scene_openness_cell_open_share','scene_openness_sector_cells','scene_openness_covered_outdoor','scene_openness_outdoor_min','scene_openness_indoor_max','scene_neighbour_radius','scene_neighbour_height','scene_context_margin'},
             'settings_group_slam': {'slam_max_range_indoor','slam_max_range_outdoor','slam_max_range','slam_depth_resolution','slam_splat_max_px','slam_depth_tol_abs','slam_depth_tol_rel','slam_station_spacing','slam_time_window','slam_weight_distance_scale','slam_weight_incidence_power','slam_weight_radial_power'},
             'settings_group_mirror_glass': {'mirror_mask_confidence','mirror_fit_tolerance','mirror_plane_tolerance','reflection_prompt_agreement','mirror_merge_angle','mirror_merge_distance','mirror_image_scale','mirror_view_size','mirror_max_range','mirror_min_pixels','mirror_mask_width','mirror_frame_band','mirror_frame_band_max','reflection_neighbor_radius','mirror_shape_min_iou','mirror_shape_max_growth','mirror_edge_search'},
         }
@@ -623,6 +629,20 @@ class MainWindow(QMainWindow):
         self.slam_diagnostics = QCheckBox(tr('slam_diagnostics'))
         self.slam_diagnostics.setChecked(DEFAULTS['slam_diagnostics'])
         sections['settings_group_slam'].addRow(self.slam_diagnostics)
+        self.scene_name_hints = QCheckBox(tr('scene_name_hints'))
+        self.scene_name_hints.setChecked(DEFAULTS['scene_name_hints'])
+        sections['settings_group_scene'].addRow(self.scene_name_hints)
+        self.scene_neighbour_consensus = QCheckBox(tr('scene_neighbour_consensus'))
+        self.scene_neighbour_consensus.setChecked(DEFAULTS['scene_neighbour_consensus'])
+        sections['settings_group_scene'].addRow(self.scene_neighbour_consensus)
+        self.scene_consistency = QCheckBox(tr('scene_consistency'))
+        self.scene_consistency.setChecked(DEFAULTS['scene_consistency'])
+        sections['settings_group_scene'].addRow(self.scene_consistency)
+        self.scene_name_hint_mode = QComboBox()
+        for key in ('prefer', 'tiebreak', 'off'):
+            self.scene_name_hint_mode.addItem(tr('scene_name_hint_mode_'+key), key)
+        self.scene_name_hint_mode.setCurrentIndex(self.scene_name_hint_mode.findData(DEFAULTS['scene_name_hint_mode']))
+        self.settings_row(sections['settings_group_scene'], tr('scene_name_hint_mode'), self.scene_name_hint_mode)
         forms.addStretch()
         self.input_mode.currentIndexChanged.connect(self.update_slam_ui)
         self.update_slam_ui()
@@ -938,6 +958,8 @@ class MainWindow(QMainWindow):
                 vegetation_base_to_ground=self.vegetation_base_to_ground.isChecked(),
                 building_enclosure=self.building_enclosure.isChecked(),
                 mirror_shape_regularize=self.mirror_shape_regularize.isChecked(),
+                scene_name_hints=self.scene_name_hints.isChecked(), scene_neighbour_consensus=self.scene_neighbour_consensus.isChecked(),
+                scene_consistency=self.scene_consistency.isChecked(), scene_name_hint_mode=self.scene_name_hint_mode.currentData(),
                 slam_time_filter=self.slam_time_filter.isChecked(),slam_diagnostics=self.slam_diagnostics.isChecked(),
                 extra_no_reflection=self.extra.isChecked(),format=self.output_format.currentData(),
                 point_reduction=self.point_reduction.value()/100,output_density=self.output_density.currentData(),
@@ -1127,7 +1149,8 @@ class MainWindow(QMainWindow):
             if event.get('phase') == 'inspection':
                 self.read_inspection()
         elif kind == 'scene':
-            self.scan_table.setItem(event['scan']-1,6,QTableWidgetItem(tr('scene_'+event['scene'])))
+            detail = event.get('scene_detail', event.get('scene', 'both'))
+            self.scan_table.setItem(event['scan']-1,6,QTableWidgetItem(tr('scene_'+detail)))
         elif kind == 'state':
             self.estimator.state(event['state'],timestamp)
             self.phase.setText(STRINGS.get('state_'+event['state'],tr('state_running')))
@@ -1196,8 +1219,10 @@ class MainWindow(QMainWindow):
                 meta = scan['metadata']
                 images = [report['images'][i-1] for i in scan['image_indices']]
                 kinds = sorted({r for image in images for r in image['representations']})
-                values = [row+1,meta.get('name',''),scan['record_count'],len(images),', '.join(kinds),
-                          tr('pose_'+scan['pose_status']),tr('scene_both'),tr('available') if scan['classification_eligible_metadata'] else tr('not_classifiable')]
+                hint = name_hint(meta, DEFAULTS)
+                preview = tr('scene_both')+(f" · Name: {tr('scene_'+hint['scene'])}" if hint and hint.get('scene') else '')
+                values = [row+1,scan_display_name(meta),scan['record_count'],len(images),', '.join(kinds),
+                          tr('pose_'+scan['pose_status']),preview,tr('available') if scan['classification_eligible_metadata'] else tr('not_classifiable')]
                 for col,value in enumerate(values):
                     self.scan_table.setItem(row,col,QTableWidgetItem(str(value)))
             self.scan_table.resizeColumnsToContents()

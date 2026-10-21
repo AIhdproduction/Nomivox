@@ -40,3 +40,8 @@ def test_las_preserves_points_rgb_extended_codes_and_scan_ids(source, tmp_path):
     assert np.all(cloud.class_conf == 200)
     assert len(laspy.read(tmp_path/'test_no_reflection.las')) == 5
     assert result['readback']['all_classes_valid']
+    per_scan = np.zeros(256, np.int64)
+    for counts in result['scan_class_counts'].values():
+        for code, count in counts.items():
+            per_scan[int(code)] += count
+    assert {str(code): int(count) for code, count in enumerate(per_scan) if count} == result['class_counts']

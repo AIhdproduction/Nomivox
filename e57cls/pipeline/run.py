@@ -22,6 +22,7 @@ from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
+from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.inspector import inspect_file, markdown
 from e57cls.io.input_mode import detect_input_mode, pseudo_setup_points_check
 from e57cls.io.reader import E57Reader
@@ -41,6 +42,7 @@ from e57cls.slam.index import build_spatial_index, unpack_point_id
 from e57cls.slam.stations import cluster_stations
 from e57cls.scene.presets import validate_preset
 from e57cls.scene.detect import detect
+from e57cls.scene.resolve import resolve_scan_scene, resolve_neighbours
 from e57cls.mirror.pipeline import (MirrorAnalysis, build as build_mirrors, finalize_states,
                                     fit_scan_surfaces, reflection_prompt_classes)
 
@@ -125,17 +127,131 @@ def select_classes(preset, mode, building_enclosure=False):
     return selected
 
 
-def geometry_scan_context(preset, config, scan_scenes):
+def geometry_scan_context(preset, config, scan_scenes, positions=None, class_ids=None):
     """Return conservative scene and selected-class evidence for geometry rules."""
     mapping = preset.get('code_map', {})
     result = {}
     for scan, scene in scan_scenes.items():
         # Only an explicit outdoor decision enables exterior plausibility rules.
         mode = scene if scene in ('indoor', 'outdoor') else 'indoor'
-        selected = select_classes(preset, mode, config['building_enclosure'])
+        ids = (class_ids or {}).get(scan) if isinstance(class_ids, dict) else None
+        selected = ([item for item in preset['classes'] if item['id'] in ids] if ids is not None
+                    else select_classes(preset, mode, config['building_enclosure']))
         result[int(scan)] = {'outdoor': mode == 'outdoor',
+                             'scene': scene if scene in ('indoor', 'outdoor') else None,
+                             'position': (np.asarray((positions or {}).get(scan), dtype=float).tolist()
+                                          if isinstance(positions, dict) and (positions or {}).get(scan) is not None else None),
                              'allowed_codes': {int(mapping.get(str(item['code']), item['code'])) for item in selected}}
     return result
+
+
+def _scene_record(scan, resolution, classes):
+    """Return the durable scene record shared by normal and shared-SAM paths."""
+    return {'scan': scan, 'mode': resolution['scene'], 'scene': resolution,
+            'class_ids': [item['id'] for item in classes]}
+
+
+def _load_scene_record(work, scan):
+    """Load both current shared-SAM and legacy detector scene records."""
+    data = json.loads((work/f'scene_{scan:04d}.json').read_text(encoding='utf-8'))
+    if 'mode' in data and isinstance(data.get('scene'), dict):
+        return data
+    if isinstance(data, dict) and 'scene' in data:
+        resolution = resolve_scan_scene(data, {}, {**{'scene_unresolved_classes': 'all', 'scene_name_hints': False},
+                                                    **data.get('thresholds', {})})
+        return _scene_record(scan, resolution, [])
+    raise ValueError('Invalid scene record')
+
+
+def finalize_scene_resolution(scan_results, stores, config, warnings, control):
+    """Resolve pending scan scenes once all static scan decisions are available."""
+    by_scan = {item['scan']: item for item in scan_results if 'scan' in item}
+    metadata = {store.meta['scan_index']: store.meta['metadata'] for store in stores}
+    for result in scan_results:
+        if result.get('scan') in metadata and not result.get('scene_resolution'):
+            result['scene_resolution'] = resolve_scan_scene(None, metadata[result['scan']], config)
+            result['scene_detection'] = result['scene_resolution']
+    records = [dict(record, scan=item['scan']) if 'scan' not in record else record for item, record in
+               ((item, item.get('scene_resolution') or item.get('scene_detection')) for item in scan_results)
+               if record]
+    positions = {store.meta['scan_index']: scan_pose(store.meta['metadata']).translation.tolist() for store in stores}
+    resolved, neighbour_warnings = resolve_neighbours(records, positions, config)
+    for resolution in resolved:
+        result = by_scan.get(resolution.get('scan'))
+        if result is not None:
+            changed = result.get('scene') != resolution['scene']
+            result['scene'] = resolution['scene']
+            result['scene_resolution'] = resolution
+            result['scene_detection'] = resolution
+            if changed:
+                control.event('scene', scan=resolution['scan'], **resolution)
+    for result in scan_results:
+        resolution = result.get('scene_resolution')
+        if not resolution:
+            continue
+        hint = resolution.get('name_hint')
+        if hint and hint.get('ambiguous'):
+            warnings.append({'code': 'scene_name_ambiguous', 'scan': result['scan'], 'detail': hint})
+        if resolution.get('conflict'):
+            warnings.append({'code': 'scene_name_conflict', 'scan': result['scan'],
+                             'detail': {'name': hint, 'data': resolution.get('data_scene')}})
+    warnings.extend(neighbour_warnings)
+    for result in scan_results:
+        if result.get('scene') == 'unsure':
+            warnings.append({'code': 'scene_unsure', 'scan': result['scan']})
+    work = config.get('_scene_work')
+    if work:
+        atomic_json(Path(work)/'scene_resolution.json', {str(item['scan']): item.get('scene_resolution')
+                                                          for item in scan_results if 'scene_resolution' in item})
+    return scan_results
+
+
+def scene_resolution_report(scan_results):
+    """Summarize final scan decisions without duplicating per-scan records."""
+    counts = {'scene': {}, 'scene_detail': {}, 'source': {}}
+    conflicts, unresolved = [], []
+    for item in scan_results:
+        resolution = item.get('scene_resolution') or item.get('scene_detection') or {}
+        for key in counts:
+            value = resolution.get(key) if key != 'scene' else item.get('scene', resolution.get('scene'))
+            if value:
+                counts[key][value] = counts[key].get(value, 0)+1
+        if resolution.get('conflict'):
+            conflicts.append({'scan': item.get('scan'), 'name_hint': resolution.get('name_hint'),
+                              'data_scene': resolution.get('data_scene')})
+        if item.get('scene', resolution.get('scene')) not in ('indoor', 'outdoor'):
+            unresolved.append(item.get('scan'))
+    return {**counts, 'conflicts': conflicts, 'unresolved': unresolved}
+
+
+def scene_audit(scan_results, scan_class_counts, preset, mapping):
+    """Measure output classes that disagree with a resolved scan scene."""
+    code_scenes = {}
+    for item in preset.get('classes', []):
+        code = int(mapping.get(str(item['code']), item['code']))
+        code_scenes.setdefault(code, set()).add(item.get('scene', 'both'))
+    scans, totals = [], {'outdoor': {'points': 0, 'wrong': 0}, 'indoor': {'points': 0, 'wrong': 0}}
+    for item in scan_results:
+        scene = item.get('scene')
+        if scene not in totals:
+            continue
+        values = (scan_class_counts or {}).get(str(item.get('scan')), (scan_class_counts or {}).get(item.get('scan'), {}))
+        total = wrong = 0
+        for code, count in (values or {}).items():
+            code, count = int(code), int(count)
+            if code in (1, 68) or 'both' in code_scenes.get(code, {'both'}):
+                continue
+            total += count
+            if ((scene == 'outdoor' and 'indoor' in code_scenes.get(code, set())) or
+                    (scene == 'indoor' and 'outdoor' in code_scenes.get(code, set()))):
+                wrong += count
+        totals[scene]['points'] += total
+        totals[scene]['wrong'] += wrong
+        scans.append({'scan': item.get('scan'), 'scene': scene, 'points': total, 'wrong': wrong,
+                      'wrong_scene_share': wrong/max(1, total)})
+    for value in totals.values():
+        value['wrong_scene_share'] = value['wrong']/max(1, value['points'])
+    return {'scans': scans, 'totals': totals}
 
 
 def prompt_classes(classes, config):
@@ -168,23 +284,24 @@ def prepare_shared_sam(reader, stores, inspection, config, work, image_cache, ma
         control.checkpoint()
         scan = store.meta['scan_index']
         path = work/f'scene_{scan:04d}.json'
-        mode = config['scene_overrides'].get(str(scan), config['scene_mode'])
-        record = {'scan': scan, 'mode': mode, 'status': 'failed', 'failed_images': {}}
+        manual = config['scene_overrides'].get(str(scan), config['scene_mode'])
+        record = {'scan': scan, 'mode': manual, 'status': 'failed', 'failed_images': {}}
         try:
-            scene = {'scene': mode, 'manual': True}
-            if mode == 'both':
+            detection = {'scene': manual, 'manual': True}
+            if manual == 'both':
                 control.event('phase_started', phase='scene', scan=scan)
                 try:
-                    scene = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
-                                   factory, control, preset, assets, depth_builder)
+                    detection = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
+                                       factory, control, preset, assets, depth_builder)
                 finally:
                     control.event('phase_finished', phase='scene', scan=scan)
-                mode = scene['scene']
-                control.event('scene', scan=scan, **scene)
-            classes = select_classes(preset, mode, config['building_enclosure'])
+            resolution = resolve_scan_scene(detection, store.meta['metadata'], config,
+                                            None if manual == 'both' else manual)
+            classes = select_classes(preset, resolution['class_mode'], config['building_enclosure'])
             if not classes:
                 raise ValueError('No enabled classes for this scene')
-            record.update(mode=mode, scene=scene, class_ids=[item['id'] for item in classes])
+            record.update(_scene_record(scan, resolution, classes))
+            control.event('scene', scan=scan, **resolution)
             prompts = prompt_classes(classes, config)+mirror_phrases
             scan_images = [item for candidate, item in images if candidate is store]
             for item in scan_images:
@@ -976,7 +1093,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                 'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority, families)
-    surface_ties = building = stairs = components = vegetation = geometry_rules = None
+    surface_ties = building = stairs = components = vegetation = geometry_rules = scene_consistency = None
     terrain = None
     if config['surface_tie_break']:
         surface_ties = votes.resolve_surface_ties(by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
@@ -987,9 +1104,11 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'],
             config['building_boundary_max_cells'], control.checkpoint)
+    rule_context = geometry_scan_context(
+        preset, config, {station.id: scene for station in stations},
+        positions={station.id: station.position for station in stations})
     if config['geometry_rules']:
         terrain = work/'terrain.npz'
-        rule_context = geometry_scan_context(preset, config, {station.id: scene for station in stations})
         geometry_rules = apply_geometry_rules(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
                                               config, terrain, control.checkpoint,
                                               active_codes={row['code'] for row in rows}, scan_context=rule_context)
@@ -1005,6 +1124,13 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             underside_minimum_voxels=config['stairs_underside_min_voxels'],
             underside_cluster_size=config['stairs_underside_cluster_size'],
             underside_maximum_gap=config['stairs_underside_max_gap'])
+    scene_started = time.monotonic()
+    scene_consistency = enforce_scene_consistency(votes, all_classes, by_id, rule_context,
+                                                  np.asarray(config['voxel_origin']), config['voxel_size'], config,
+                                                  {row['code'] for row in rows}, control.checkpoint)
+    timings['scene_context'] = ((geometry_rules or {}).get('scan_context', {}).get('duration_s', 0.)
+                                if geometry_rules else scene_consistency['duration_s'])
+    timings['scene_consistency'] = time.monotonic()-scene_started
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
@@ -1084,6 +1210,12 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
               'stairs_priority_overrides': votes.priority_overrides, 'created_utc': datetime.now(timezone.utc).isoformat(),
               'surface_ties': surface_ties, 'building_enclosure': building, 'stairs_geometry': stairs,
               'component_cleanup': components, 'vegetation_base_to_ground': vegetation, 'geometry_rules': geometry_rules,
+              'scene_consistency': scene_consistency,
+              'scene_resolution': {'scene': {scene: len(station_results)},
+                                   'scene_detail': {scene: len(station_results)}, 'source': {'data': len(station_results)},
+                                   'conflicts': [], 'unresolved': []},
+              'scene_audit': scene_audit([{'scan': store.meta['scan_index'], 'scene': scene} for store in stores],
+                                         result.get('scan_class_counts', {}), preset, code_map),
               'total_seconds': time.monotonic()-started}
     write_report(output, report, rows)
     votes.close()
@@ -1128,6 +1260,7 @@ def execute(config, backend_factory=None, listen=True):
     geometry_fill_report = None
     geometry_planes = None
     geometry_rules_report = None
+    scene_consistency_report = None
     terrain = None
     def factory():
         nonlocal backend
@@ -1225,6 +1358,7 @@ def execute(config, backend_factory=None, listen=True):
         control.event("phase_finished", phase="inspection")
         work = cache/"votes"/identity
         work.mkdir(parents=True, exist_ok=True)
+        config = {**config, '_scene_work': str(work)}
         votes = VoteStore(work/"votes.sqlite")
         mask_cache = MaskCache(cache/"seg")
         image_cache = cache/"geometry"/input_hash/"images"
@@ -1247,39 +1381,53 @@ def execute(config, backend_factory=None, listen=True):
                 nonlocal skipped
                 control.checkpoint()
                 scan = store.meta["scan_index"]
-                mode = config["scene_overrides"].get(str(scan), config["scene_mode"])
-                classes = select_classes(preset, mode, config['building_enclosure'])
+                manual = config["scene_overrides"].get(str(scan), config["scene_mode"])
+                if record is None and (shared_sam or votes.completed(scan, identity)):
+                    try:
+                        record = _load_scene_record(work, scan)
+                    except (OSError, ValueError) as error:
+                        if shared_sam:
+                            raise RuntimeError('Shared SAM preparation record is missing') from error
+                resolution = record.get('scene') if record else None
+                mode = resolution['scene'] if resolution else manual
+                classes = (select_classes(preset, resolution['class_mode'], config['building_enclosure'])
+                           if resolution else select_classes(preset, mode, config['building_enclosure']))
                 if votes.completed(scan, identity):
-                    scan_results.append({"scan": scan, "scene": mode, "resumed": True})
+                    if record is None:
+                        resolution = resolve_scan_scene({'scene': manual, 'metrics': {}}, store.meta['metadata'], config,
+                                                        None if manual == 'both' else manual)
+                        mode = resolution['scene']
+                        classes = select_classes(preset, resolution['class_mode'], config['building_enclosure'])
+                        record = _scene_record(scan, resolution, classes)
+                    class_ids = record.get('class_ids') or [item['id'] for item in classes]
+                    scan_results.append({"scan": scan, "scene": mode, "scene_detection": resolution,
+                                         "scene_resolution": resolution, "class_ids": class_ids,
+                                         "resumed": True})
                     return
                 try:
                     if shared_sam:
-                        if record is None:
-                            try:
-                                record = json.loads((work/f'scene_{scan:04d}.json').read_text(encoding='utf-8'))
-                            except (OSError, ValueError) as error:
-                                raise RuntimeError('Shared SAM preparation record is missing') from error
                         if record.get('status') != 'complete':
                             raise RuntimeError(record.get('error', 'Shared SAM preparation failed'))
-                        scene = record['scene']
-                        mode = record['mode']
+                        resolution = record['scene']
+                        mode = resolution['scene']
                         wanted = set(record['class_ids'])
                         classes = [item for item in all_classes if item['id'] in wanted]
-                        if mode in ('unsure', 'mixed'):
-                            warnings.append({'code': 'scene_unsure', 'scan': scan})
                     else:
-                        scene = {'scene': mode, 'manual': True}
-                        if mode == 'both':
+                        detection = {'scene': manual, 'manual': True}
+                        if manual == 'both':
                             control.event('phase_started', phase='scene', scan=scan)
-                            scene = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
-                                           factory, control, preset, image_assets, camera_depth)
-                            mode = scene['scene']
-                            classes = select_classes(preset, mode, config['building_enclosure'])
-                            atomic_json(work/f'scene_{scan:04d}.json', scene)
-                            control.event('scene', scan=scan, **scene)
-                            control.event('phase_finished', phase='scene', scan=scan)
-                            if mode in ('unsure', 'mixed'):
-                                warnings.append({'code': 'scene_unsure', 'scan': scan})
+                            try:
+                                detection = detect(reader, store, inspection, config, image_cache, mask_cache, model_hash,
+                                                   factory, control, preset, image_assets, camera_depth)
+                            finally:
+                                control.event('phase_finished', phase='scene', scan=scan)
+                        resolution = resolve_scan_scene(detection, store.meta['metadata'], config,
+                                                        None if manual == 'both' else manual)
+                        mode = resolution['scene']
+                        classes = select_classes(preset, resolution['class_mode'], config['building_enclosure'])
+                        record = _scene_record(scan, resolution, classes)
+                        atomic_json(work/f'scene_{scan:04d}.json', record)
+                        control.event('scene', scan=scan, **resolution)
                     if not classes:
                         raise ValueError('No enabled classes for this scene')
                     rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,
@@ -1297,7 +1445,8 @@ def execute(config, backend_factory=None, listen=True):
                     votes.add_scan(scan, identity, batches(), codes)
                     weights_path.unlink(missing_ok=True)
                     (work/f"scan_{scan:04d}"/"mirror_rep.npy").unlink(missing_ok=True)
-                    scan_results.append({"scan": scan, "scene": mode, "scene_detection": scene, **stats})
+                    scan_results.append({"scan": scan, "scene": mode, "scene_detection": resolution,
+                                         "scene_resolution": resolution, "class_ids": record['class_ids'], **stats})
                 except Cancelled:
                     raise
                 except Exception as error:
@@ -1457,6 +1606,7 @@ def execute(config, backend_factory=None, listen=True):
                         raise RuntimeError("No scan could be classified; see per-scan errors in log.txt")
                     control.event("phase_finished", phase="segmentation")
             if semantic_run:
+                finalize_scene_resolution(scan_results, classifiable_stores, config, warnings, control)
                 control.event("phase_started", phase="voting")
                 vote_start = time.monotonic()
                 by_id = {c['id']: codes[i] for i,c in enumerate(all_classes)}
@@ -1477,11 +1627,14 @@ def execute(config, backend_factory=None, listen=True):
                         by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
                         config['building_boundary_max_cells'], control.checkpoint)
+                rule_context = geometry_scan_context(
+                    preset, config, {item['scan']: item.get('scene') for item in scan_results if 'scan' in item},
+                    positions={store.meta['scan_index']: scan_pose(store.meta['metadata']).translation.tolist()
+                               for store in classifiable_stores},
+                    class_ids={item['scan']: item.get('class_ids', []) for item in scan_results if 'scan' in item})
                 if config['geometry_rules']:
                     geometry_started = time.monotonic()
                     terrain = work/'terrain.npz'
-                    rule_context = geometry_scan_context(preset, config,
-                                                         {item['scan']: item.get('scene') for item in scan_results if 'scan' in item})
                     geometry_rules_report = apply_geometry_rules(votes, by_id, np.array(config['voxel_origin']),
                         config['voxel_size'], config, terrain, control.checkpoint,
                         active_codes={row['code'] for row in rows}, scan_context=rule_context)
@@ -1499,6 +1652,13 @@ def execute(config, backend_factory=None, listen=True):
                         underside_minimum_voxels=config['stairs_underside_min_voxels'],
                         underside_cluster_size=config['stairs_underside_cluster_size'],
                         underside_maximum_gap=config['stairs_underside_max_gap'])
+                scene_started = time.monotonic()
+                scene_consistency_report = enforce_scene_consistency(
+                    votes, all_classes, by_id, rule_context, np.array(config['voxel_origin']), config['voxel_size'], config,
+                    {row['code'] for row in rows}, control.checkpoint)
+                timings['scene_context'] = ((geometry_rules_report or {}).get('scan_context', {}).get('duration_s', 0.)
+                                            if geometry_rules_report else scene_consistency_report['duration_s'])
+                timings['scene_consistency'] = time.monotonic()-scene_started
                 if config['component_cleanup']:
                     cleanup_rules = []
                     if 'cable' in by_id:
@@ -1580,6 +1740,9 @@ def execute(config, backend_factory=None, listen=True):
                                     'filled_points': result.get('geometry_fill_counts', {}),
                                     'confidence': 96},
                   "geometry_rules": geometry_rules_report,
+                  "scene_consistency": scene_consistency_report,
+                  "scene_resolution": scene_resolution_report(scan_results),
+                  "scene_audit": scene_audit(scan_results, result.get('scan_class_counts', {}), preset, mapping),
                   "mask_cache_behavior": "Mask identities include the prompts of one class. Removing doorway invalidates only door masks; other class masks remain reusable.",
                   "reflection_analysis": mirrors.report if mirrors else None,
                   "time_policy": "GPS time is zero when time base is not verified",

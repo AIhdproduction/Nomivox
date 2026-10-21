@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
+from e57cls.vote.scene_context import ensure_scene_context
+
 
 def _cell_key(indices, voxel_size, cell_size):
     return np.floor(np.asarray(indices, np.float64)*voxel_size/cell_size).astype(np.int64)
@@ -108,42 +110,6 @@ def _prepare_tables(votes, voxel_size, cell_size, tile_size, checkpoint):
     db.commit()
 
 
-def _prepare_scan_context(votes, by_id, scan_context, checkpoint):
-    """Materialize bounded per-voxel scene and class-selection evidence."""
-    db = votes.db
-    tracked = ('ground', 'floor', 'tree', 'low_vegetation')
-    codes = {name: int(by_id.get(name, -1)) for name in tracked}
-    db.executescript("""
-        DROP TABLE IF EXISTS temp.geometry_scan_context;
-        DROP TABLE IF EXISTS temp.geometry_scan_allowed;
-        DROP TABLE IF EXISTS temp.geometry_context;
-        CREATE TEMP TABLE geometry_scan_context(scan INTEGER PRIMARY KEY, outdoor INTEGER NOT NULL) WITHOUT ROWID;
-        CREATE TEMP TABLE geometry_scan_allowed(scan INTEGER, code INTEGER, PRIMARY KEY(scan,code)) WITHOUT ROWID;
-        CREATE TEMP TABLE geometry_context(
-            key BLOB PRIMARY KEY, outdoor INTEGER NOT NULL, indoor INTEGER NOT NULL,
-            allow_ground INTEGER NOT NULL, allow_floor INTEGER NOT NULL,
-            allow_tree INTEGER NOT NULL, allow_low_vegetation INTEGER NOT NULL
-        ) WITHOUT ROWID;
-    """)
-    if not scan_context:
-        return False
-    contexts = [(int(scan), int(bool(item.get('outdoor')))) for scan, item in scan_context.items()]
-    db.executemany('INSERT INTO geometry_scan_context VALUES (?,?)', contexts)
-    allowed = [(int(scan), int(code)) for scan, item in scan_context.items()
-               for code in item.get('allowed_codes', ())]
-    db.executemany('INSERT OR IGNORE INTO geometry_scan_allowed VALUES (?,?)', allowed)
-    columns = ','.join(f'MAX(CASE WHEN a.code={codes[name]} THEN 1 ELSE 0 END)' for name in tracked)
-    cursor = db.execute(f'''SELECT o.key,MAX(c.outdoor),MAX(1-c.outdoor),{columns}
-                            FROM scan_observations o JOIN geometry_scan_context c USING(scan)
-                            LEFT JOIN geometry_scan_allowed a USING(scan)
-                            GROUP BY o.key''')
-    while rows := cursor.fetchmany(100_000):
-        checkpoint()
-        db.executemany('INSERT INTO geometry_context VALUES (?,?,?,?,?,?,?)', rows)
-    db.commit()
-    return True
-
-
 def _make_features(votes, origin, voxel_size, config, checkpoint):
     db = votes.db
     cell_size, tile_size, halo = config['geometry_cell_size'], config['geometry_tile_size'], config['geometry_halo']
@@ -200,7 +166,7 @@ def _terrain(votes, origin, config, target, checkpoint, by_id):
         tree = cKDTree(xy)
         covered = np.zeros(len(xy), bool)
         feature_rows = db.execute('''SELECT f.cx,f.cy,f.cz,f.x,f.y,f.z,f.planarity,f.verticality,
-                                    v.code,COALESCE(c.outdoor,0),COALESCE(c.indoor,0)
+                                    v.code,COALESCE(c.outdoor,0),COALESCE(c.indoor,0),COALESCE(c.scene_context,-1)
                                     FROM geometry_features f JOIN geometry_voxels v USING(cx,cy,cz)
                                     LEFT JOIN geometry_context c USING(key)''')
         updates = []
@@ -214,14 +180,14 @@ def _terrain(votes, origin, config, target, checkpoint, by_id):
             hag[valid] = points[valid, 2]-heights[nearest[valid]]
             codes = np.asarray([row[8] for row in batch], np.int64)
             outdoor = np.asarray([row[9] for row in batch], bool)
-            indoor = np.asarray([row[10] for row in batch], bool)
+            scene_context = np.asarray([row[11] for row in batch], np.int8)
             in_height = (hag >= config['terrain_cover_min_height']) & (hag <= config['terrain_cover_max_height'])
             ceiling_cover = codes == ceiling if ceiling is not None else np.zeros(len(batch), bool)
             slope_cover = np.isin(codes, [item for item in (building, wall) if item is not None]) & (np.asarray([row[6] for row in batch]) >= .35) & (np.asarray([row[7] for row in batch]) >= .5)
             cover = valid & in_height & (ceiling_cover | slope_cover)
-            # A cell reached exclusively from indoor scans is covered even when
+            # Indoor-context cells are covered even when
             # no horizontal ceiling is visible (for example below a roof slope).
-            cover |= valid & indoor & ~outdoor
+            cover |= valid & (scene_context == 0)
             covered[nearest[cover]] = True
             updates.extend((None if not np.isfinite(value) else float(value), 0, int(row[0]), int(row[1]), int(row[2]))
                            for row, value in zip(batch, hag))
@@ -273,7 +239,7 @@ def _tree_seeds(votes, by_id, config):
         return []
     rows = votes.db.execute('''SELECT v.ix,v.iy,v.iz,f.linearity FROM geometry_voxels v
         JOIN geometry_features f USING(cx,cy,cz) LEFT JOIN geometry_context c USING(key)
-        WHERE v.code=? AND COALESCE(c.outdoor,0)=1''', (by_id['tree_trunk'],)).fetchall()
+        WHERE v.code=? AND COALESCE(c.scene_context,-1)=1''', (by_id['tree_trunk'],)).fetchall()
     if len(rows) < 4:
         return []
     coordinates = np.asarray([row[:3] for row in rows], np.int64)
@@ -312,7 +278,7 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
     _prepare_tables(votes, voxel_size, config['geometry_cell_size'], config['geometry_tile_size'], checkpoint)
     _make_features(votes, origin, voxel_size, config, checkpoint)
     active_codes = {int(value) for value in (by_id.values() if active_codes is None else active_codes)}
-    context_available = _prepare_scan_context(votes, by_id, scan_context, checkpoint)
+    scene_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint)
     result['terrain'] = _terrain(votes, origin, config, Path(terrain_target), checkpoint, by_id)
     _alternatives(votes, active_codes)
     db = votes.db
@@ -344,27 +310,29 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
                            f.linearity,f.verticality,f.hag,f.covered,a.code,a.confidence,
                            COALESCE(c.outdoor,0),COALESCE(c.indoor,1),COALESCE(c.allow_ground,0),
                            COALESCE(c.allow_floor,0),COALESCE(c.allow_tree,0),COALESCE(c.allow_low_vegetation,0)
+                           ,COALESCE(c.scene_context,-1)
                            FROM geometry_voxels v JOIN geometry_features f USING(cx,cy,cz)
                            LEFT JOIN geometry_alternatives a USING(key) LEFT JOIN geometry_context c USING(key)''')
     while rows := cursor.fetchmany(100_000):
         checkpoint()
         for row in rows:
-            key, current, _, _, _, _, x, y, z, scatter, planarity, _, _, hag, covered, alternative, alt_conf, outdoor, _, allow_ground, allow_floor, allow_tree, allow_low_vegetation = row
+            key, current, _, _, _, _, x, y, z, scatter, planarity, _, _, hag, covered, alternative, alt_conf, outdoor, _, allow_ground, allow_floor, allow_tree, allow_low_vegetation, scene_context = row
+            so, si = scene_context == 1, scene_context == 0
             wanted = None
             confidence = 0
-            if config['geometry_rules_outdoor_vegetation'] and outdoor and current in building_wall and scatter > .25 and planarity < .4:
+            if config['geometry_rules_outdoor_vegetation'] and so and current in building_wall and scatter > .25 and planarity < .4:
                 wanted = (alternative_or_unclassified(alternative) if covered else
                           target_or_fallback('tree' if hag is not None and hag >= 1.5 else 'low_vegetation', alternative,
                                              allow_tree if hag is not None and hag >= 1.5 else allow_low_vegetation))
-            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current == code('ceiling') and scatter > .25 and not covered:
+            elif config['geometry_rules_outdoor_vegetation'] and so and current == code('ceiling') and scatter > .25 and not covered:
                 wanted = target_or_fallback('tree', alternative, allow_tree)
-            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current in ground_like and hag is not None and hag > .4:
+            elif config['geometry_rules_outdoor_vegetation'] and so and current in ground_like and hag is not None and hag > .4:
                 wanted, confidence = alternative_or_unclassified(alternative), int(alt_conf or 0)
-            elif config['geometry_rules_outdoor_vegetation'] and outdoor and current == code('low_vegetation') and hag is not None and hag > 2.5 and scatter > .25:
+            elif config['geometry_rules_outdoor_vegetation'] and so and current == code('low_vegetation') and hag is not None and hag > 2.5 and scatter > .25:
                 wanted = target_or_fallback('tree', alternative, allow_tree)
-            elif config['geometry_rules_ground_floor'] and current == code('ground') and covered:
+            elif config['geometry_rules_ground_floor'] and si and current == code('ground') and covered:
                 wanted = target_or_fallback('floor', alternative, allow_floor)
-            elif config['geometry_rules_ground_floor'] and outdoor and current == code('floor') and not covered and hag is not None and abs(hag) <= .4:
+            elif config['geometry_rules_ground_floor'] and so and current == code('floor') and hag is not None and abs(hag) <= .4:
                 wanted = target_or_fallback('ground', alternative, allow_ground)
             if wanted is not None and wanted != current:
                 changes[bytes(key)] = (int(wanted), confidence)
@@ -375,7 +343,7 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
         seed_top = np.asarray([item[2] for item in seeds], np.float64)*voxel_size
         tree = cKDTree(seed_xy)
         cursor = db.execute('''SELECT v.key,v.code,v.ix,v.iy,v.iz,f.scatter,f.hag,
-                             COALESCE(c.outdoor,0),COALESCE(c.allow_tree,0) FROM geometry_voxels v
+                              COALESCE(c.scene_context,-1),COALESCE(c.allow_tree,0) FROM geometry_voxels v
                              JOIN geometry_features f USING(cx,cy,cz) LEFT JOIN geometry_context c USING(key)''')
         for rows in iter(lambda: cursor.fetchmany(100_000), []):
             checkpoint()
@@ -383,13 +351,13 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
             distance, nearest = tree.query(points, distance_upper_bound=config['tree_crown_grow_radius'])
             valid = np.isfinite(distance) & (nearest < len(seed_top))
             for row, d, seed, has_seed in zip(rows, distance, nearest, valid):
-                if not has_seed or row[5] <= .25 or not row[7]:
+                if not has_seed or row[5] <= .25 or row[7] != 1:
                     continue
                 relative_z = row[4]*voxel_size-seed_top[seed]
                 in_cylinder = d <= config['tree_crown_radius'] and -1. <= relative_z <= config['tree_crown_max_height']
                 growing = row[1] == 1 and row[6] is not None and row[6] > 2. and d <= config['tree_crown_grow_radius']
-                if ((in_cylinder and row[1] in crown_sources) or growing) and config['geometry_rules_outdoor_vegetation'] and row[6]:
-                    changes[bytes(row[0])] = (target_or_fallback('tree', None, row[7]), 0)
+                if ((in_cylinder and row[1] in crown_sources) or growing) and config['geometry_rules_outdoor_vegetation'] and row[7] == 1:
+                    changes[bytes(row[0])] = (target_or_fallback('tree', None, row[8]), 0)
     updates = [(new_code, new_conf, key) for key, (new_code, new_conf) in changes.items()]
     for start in range(0, len(updates), 50_000):
         checkpoint()
@@ -400,5 +368,5 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
         values = np.asarray([value[0] for value in changes.values()], np.int64)
         result['changed'] = {str(int(item)): int(number) for item, number in zip(*np.unique(values, return_counts=True))}
     result['fallbacks'] = fallbacks
-    result['scan_context'] = {'available': context_available}
+    result['scan_context'] = scene_report
     return result

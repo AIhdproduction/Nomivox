@@ -2,6 +2,7 @@
 
 from datetime import datetime
 import json
+import re
 from pathlib import Path
 
 from e57cls.seg.cache import SCORE_FLOOR
@@ -41,6 +42,11 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "geometry_fill_ransac_trials": 256, "geometry_fill_ransac_max_trials": 1024,
             "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
             "geometry_rules_outdoor_vegetation": True, "geometry_rules_ground_floor": True,
+            "scene_context_margin": .8, "scene_consistency": True,
+            "scene_consistency_fallbacks": {"floor": ["ground", "sidewalk", "road"], "ceiling": ["building"],
+                "wall": ["building"], "door": ["building"], "railing": ["fence"], "ground": ["floor"],
+                "road": ["floor"], "sidewalk": ["floor"], "curb": ["floor"], "manhole": ["floor"],
+                "building": ["wall"], "fence": ["railing"]},
             "geometry_halo": 1.5, "geometry_knn": 24, "geometry_knn_radius": 1.,
             "terrain_cell_size": .5, "terrain_max_gap": 5., "terrain_max_slope": .75,
             "terrain_ground_tolerance": .15, "terrain_fill": True,
@@ -56,6 +62,16 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "scene_plane_fraction": .5, "scene_ceiling_supported": .15, "scene_upper_returns_indoor": .75,
             "scene_open_sky_outdoor": .10, "scene_open_sky_indoor_max": .05,
             "scene_sky_confidence": .65, "scene_ceiling_confidence": .5,
+            "scene_openness_elevation_min": 0., "scene_openness_elevation_max": 25., "scene_openness_sectors": 72,
+            "scene_openness_samples": 2_000_000, "scene_openness_range": 15., "scene_openness_cell_open_share": .5,
+            "scene_openness_sector_cells": .8, "scene_openness_covered_outdoor": .5,
+            "scene_openness_outdoor_min": .35, "scene_openness_indoor_max": .15,
+            "scene_name_hints": True, "scene_name_hint_mode": "prefer", "scene_unresolved_classes": "all",
+            "scene_name_fields": ["rlms:scanposGuid", "guid", "name", "description"],
+            "scene_name_outdoor_patterns": ["au(?:ss|ß)en", "outdoor", "outside", "exterior", "fassade", "facade", "innenhof", "umgebung"],
+            "scene_name_indoor_patterns": ["innen(?!hof)", "indoor", "inside", "interior", "keller", "geschoss", "etage", "treppenhaus", "(?<![a-z])\\d{0,2}\\.?\\s?(?:ug|kg|eg|og|dg|zg|sg)\\s?\\d{0,3}(?![a-z])"],
+            "scene_neighbour_consensus": True, "scene_neighbour_radius": 15., "scene_neighbour_height": 1.5,
+            "scene_neighbour_min": 1,
             "stairs_priority": True, "stairs_min_confidence": .65, "stairs_priority_min_share": .25,
             "stairs_priority_over": ["floor", "ground"], "stairs_geometry_check": True,
             "stairs_plane_tolerance": .03, "stairs_planar_fraction": .85, "stairs_min_rise": .25,
@@ -176,11 +192,37 @@ def resolve_config(config: dict, base: Path = PROJECT):
         raise ValueError('Invalid projection resolution or field of view')
     if not isinstance(value['scene_overrides'],dict) or any(v not in ('both','indoor','outdoor') for v in value['scene_overrides'].values()):
         raise ValueError('Invalid scene override')
+    if value['scene_name_hint_mode'] not in ('prefer', 'tiebreak', 'off') or value['scene_unresolved_classes'] not in ('all', 'indoor'):
+        raise ValueError('Invalid scene resolution mode')
+    if not isinstance(value['scene_name_hints'], bool) or not isinstance(value['scene_neighbour_consensus'], bool):
+        raise ValueError('Invalid scene resolution setting')
+    if (not isinstance(value['scene_name_fields'], list) or not all(isinstance(item, str) for item in value['scene_name_fields'])
+            or any(not isinstance(value[key], list) or not all(isinstance(item, str) for item in value[key])
+                   for key in ('scene_name_outdoor_patterns', 'scene_name_indoor_patterns'))):
+        raise ValueError('Invalid scene name patterns')
+    try:
+        for key in ('scene_name_outdoor_patterns', 'scene_name_indoor_patterns'):
+            for pattern in value[key]:
+                re.compile(pattern)
+    except re.error as error:
+        raise ValueError('Invalid scene name pattern') from error
     for key in ('scene_sky_outdoor','scene_ceiling_outdoor_max','scene_ceiling_indoor',
                 'scene_sky_indoor_max','scene_plane_fraction','mirror_mask_confidence','scene_ceiling_supported',
                 'scene_upper_returns_indoor','scene_open_sky_outdoor','scene_open_sky_indoor_max',
                 'scene_sky_confidence','scene_ceiling_confidence','stairs_min_confidence', 'stairs_priority_min_share'):
         if not 0 <= value[key] <= 1:
+            raise ValueError(f'Invalid {key}')
+    for key in ('scene_openness_cell_open_share', 'scene_openness_sector_cells', 'scene_openness_covered_outdoor',
+                'scene_openness_outdoor_min', 'scene_openness_indoor_max'):
+        if not isinstance(value[key], (int, float)) or isinstance(value[key], bool) or not 0 <= value[key] <= 1:
+            raise ValueError(f'Invalid {key}')
+    if (not 0 <= value['scene_openness_elevation_min'] < value['scene_openness_elevation_max'] <= 90
+            or not isinstance(value['scene_openness_sectors'], int) or value['scene_openness_sectors'] < 1
+            or not isinstance(value['scene_openness_samples'], int) or value['scene_openness_samples'] < 1
+            or not isinstance(value['scene_neighbour_min'], int) or value['scene_neighbour_min'] < 1):
+        raise ValueError('Invalid scene sampling setting')
+    for key in ('scene_openness_range', 'scene_neighbour_radius', 'scene_neighbour_height'):
+        if not isinstance(value[key], (int, float)) or isinstance(value[key], bool) or not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
     for key in ('mirror_mask_confidence', 'scene_sky_confidence', 'scene_ceiling_confidence', 'stairs_min_confidence'):
         if value[key] < SCORE_FLOOR:
@@ -220,7 +262,8 @@ def resolve_config(config: dict, base: Path = PROJECT):
             or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
             or not isinstance(value['mirror_shape_regularize'], bool) or not isinstance(value['geometry_rules'], bool)
             or not isinstance(value['geometry_rules_outdoor_vegetation'], bool)
-            or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)):
+            or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)
+            or not isinstance(value['scene_consistency'], bool)):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels', 'component_min_cells', 'component_sparse_max_voxels_per_cell', 'cable_component_min_voxels',
                 'electrical_component_min_voxels', 'geometry_fill_max_planes', 'geometry_fill_min_component_voxels',
@@ -235,6 +278,14 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'tree_crown_radius', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['scene_context_margin'], (int, float)) or isinstance(value['scene_context_margin'], bool)
+            or not 0 < value['scene_context_margin'] <= 1):
+        raise ValueError('Invalid scene context margin')
+    if (not isinstance(value['scene_consistency_fallbacks'], dict)
+            or any(not isinstance(name, str) or not isinstance(items, list)
+                   or not all(isinstance(item, str) for item in items)
+                   for name, items in value['scene_consistency_fallbacks'].items())):
+        raise ValueError('Invalid scene consistency fallbacks')
     if (not isinstance(value['class_transfer_range_factor'], (int, float))
             or isinstance(value['class_transfer_range_factor'], bool)
             or not 0 <= value['class_transfer_range_factor'] < float('inf')):

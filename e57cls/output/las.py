@@ -68,6 +68,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
     extra_temp = extra.with_name(extra.stem+".partial"+extra.suffix)
     counts, written, discarded, inherited_count = np.zeros(256, np.int64), 0, 0, 0
+    scan_counts = {}
     mirrors = np.zeros(5, np.int64)
     warnings = []
     timing = {'write': 0., 'readback': 0.}
@@ -156,6 +157,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                     sample_scan.extend([scan]*len(ids))
                     written += n
                     counts += np.bincount(codes, minlength=256)
+                    values = scan_counts.setdefault(int(scan), np.zeros(256, np.int64))
+                    values += np.bincount(codes, minlength=256)
                     mirrors += np.bincount(states, minlength=5)
                     progress("output", written/max(1,total), scan)
         inherited_count = classified.class_transfer_count
@@ -180,8 +183,12 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
         output_counts = counts.copy()
         if primary_without_reflections:
             output_counts[68] = 0
+            for values in scan_counts.values():
+                values[68] = 0
         return {"path": str(path), "record_count": expected_output_count,
                 "class_counts": {str(i): int(n) for i,n in enumerate(output_counts) if n},
+                "scan_class_counts": {str(scan): {str(code): int(count) for code, count in enumerate(values) if count}
+                                      for scan, values in scan_counts.items()},
                 "unclassified_share": int(output_counts[1])/max(1,expected_output_count), "mirror_counts": mirrors.tolist(),
                 "extra_output": str(extra) if no_reflection else None, "extra_removed_count": discarded,
                 "class_transfer_count": inherited_count,

@@ -158,6 +158,7 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
     total = sum(selected_count(store, density) for store in stores)
     written = discarded = transferred = 0
     counts, mirrors = np.zeros(256, np.int64), np.zeros(5, np.int64)
+    scan_counts = {}
     samples = {}
     write_seconds = 0.
     try:
@@ -227,6 +228,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
                         if store.meta["scan_index"] not in samples:
                             samples[store.meta["scan_index"]] = local[:32].copy()
                     counts += np.bincount(codes[take], minlength=256)
+                    values = scan_counts.setdefault(int(store.meta["scan_index"]), np.zeros(256, np.int64))
+                    values += np.bincount(codes[take], minlength=256)
                     mirrors += np.bincount(states[take], minlength=5)
                     written += out_count
                     discarded += n-out_count
@@ -238,6 +241,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
         image.close()
         source_file.close()
     return {"record_count": written, "class_counts": {str(i): int(n) for i, n in enumerate(counts) if n},
+            "scan_class_counts": {str(scan): {str(code): int(count) for code, count in enumerate(values) if count}
+                                  for scan, values in scan_counts.items()},
             "unclassified_share": int(counts[1])/max(1, written), "mirror_counts": mirrors.tolist(),
             "extra_removed_count": discarded, "class_transfer_count": transferred,
             "geometry_fill_counts": classified.geometry_fill_counts, "_samples": samples,

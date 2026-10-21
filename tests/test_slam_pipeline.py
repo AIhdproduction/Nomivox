@@ -158,6 +158,22 @@ def test_slam_pipeline_handles_indoor_features_beyond_terrain_gap(tmp_path):
     assert "station_id" in cloud.point_format.extra_dimension_names
 
 
+def test_slam_scene_context_uses_virtual_station_positions(tmp_path, monkeypatch):
+    source = write_slam_e57(tmp_path/'stations.e57', camera_count=3, labelled_images=True, pinhole=True)
+    captured = []
+    original = run_module.geometry_scan_context
+    def record(preset, config, scenes, positions=None, class_ids=None):
+        captured.append((dict(scenes), dict(positions or {})))
+        return original(preset, config, scenes, positions, class_ids)
+    monkeypatch.setattr(run_module, 'geometry_scan_context', record)
+    report, _ = _classify(tmp_path, source, name='station-context', slam_station_spacing=.1)
+    assert captured
+    scenes, positions = captured[-1]
+    assert set(scenes) == set(positions)
+    assert all(len(position) == 3 for position in positions.values())
+    assert report['scene_consistency'] is not None
+
+
 def test_slam_scene_counts_sky_in_score_coordinates(monkeypatch):
     rendered = np.zeros((5, 7, 3), np.uint8)
     valid = np.zeros((5, 7), bool)

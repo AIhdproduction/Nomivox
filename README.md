@@ -100,15 +100,18 @@ cancelled, change settings and select **Neuen Lauf starten** (Start new run).
 interface after updating the software or default preset.
 
 The remaining-time estimate applies to the current phase and uses measured
-progress across all its images or scans. Until enough information is available,
-the interface displays **Restzeit wird berechnet …** (Calculating remaining time).
-Cache hits, different image contents, and GPU load can affect the estimate.
+progress per view where a phase processes views. The saved profile
+(`.cache/timing_profile.json`) records a `unit` for each stage; profiles with a
+different unit, and implausible values above ten times the built-in default, are
+ignored. The defaults are based on measured runs. Until enough information is
+available, the interface displays **Restzeit wird berechnet …** (Calculating
+remaining time). Cache hits, different image contents, and GPU load can affect
+the estimate.
 
 The status line also shows **Gesamtrestzeit**: a rough estimate for the entire
-remaining run, including the current and subsequent phases. It extrapolates
-elapsed time from the weighted overall progress and updates continuously.
-Because phase weights are fixed and actual phase durations vary, this estimate
-can change substantially. Until enough progress is available, it displays
+remaining run, including the current and subsequent phases. It combines the
+per-view estimates with bounded fixed estimates for remaining phases and updates
+continuously. Until enough progress is available, it displays
 **Gesamtrestzeit wird berechnet …**. Hover over the status line for details.
 
 ## How classification works
@@ -123,10 +126,23 @@ can change substantially. Until enough progress is available, it displays
    approximately 45% and does not affect the fast or balanced profiles.
 3. **Analyze mirrors and glass.** Text prompts produce masks. Planes are estimated
    from their outer edges and neighboring walls; the depth rule determines class 68.
-4. **Determine the scene.** Sky, ceiling, and upper-hemisphere laser returns provide
-   indoor/outdoor evidence. Outdoor classes require positive open-sky evidence
-   without returns. Uncertain automatic decisions use indoor classes; supported
-   mixed scenes can use both class sets. Manual settings take precedence.
+4. **Determine the scene.** For each scan, SAM sky/ceiling evidence, laser
+   returns, and horizontal openness from geometry alone are combined. Canopies
+   and arcades resolve as **Aussen (überdacht)** (covered outdoor) and use
+   outdoor classes. Scan names
+   can provide a hint, for example Riegl folders such as `01_Aussen` or floor
+   names such as `UG1` and `1OG`; `scene_name_hint_mode` selects `prefer`,
+   `tiebreak`, or `off`, and conflicts with the data are reported as warnings.
+   Unresolved scans use nearby scans at a similar height when available;
+   otherwise all scene classes are requested for them. Independently of the
+   scan decision, each voxel takes the scene of its closest observing scanner
+   when that scanner is clearly closer (`scene_context_margin`). Door and window zones remain
+   ambiguous and retain their vote result. A consistency pass, enabled by
+   `scene_consistency`, remaps scene-specific classes to their counterpart
+   (floor to ground/sidewalk/road; ceiling/wall/door to building; building to
+   wall; ground/road/sidewalk to floor), then the best suitable alternative, or
+   class 1. Classes marked `both` remain unchanged. Manual settings take
+   precedence.
 5. **Segment objects.** SAM processes the English prompts for each class. Ordinary
    class segmentation combines prompt confidence maps by taking their maximum.
    Overlapping image tiles, confidence thresholds, and a mask-boundary margin
@@ -147,6 +163,9 @@ stepped stair components, retains sparse semantic surfaces when their connected
 10 cm cell component is large enough, and expands direct class transfer from
 3 mm per metre of scanner distance up to 5 cm. A zero transfer range factor
 keeps the previous fixed-radius behaviour.
+
+Vote post-processing for small-island removal and the stair, tree, and surface
+steps is vectorized. `log.txt` records the work performed for each class.
 
 Raw masks are cached. Changing prompts recomputes the affected classes. Changes
 to voting thresholds can reuse existing raw masks. If GPU memory runs out, the
@@ -233,7 +252,7 @@ above. Neither is an ordinary text-searched object class.
 | 102 | Floors | Indoor |
 | 103 | Doors | Indoor |
 | 104 | Windows | Indoor and outdoor |
-| 105 | Stairs | Indoor |
+| 105 | Stairs | Indoor and outdoor |
 | 107 | Railings | Indoor |
 | 108 | Columns and supports | Indoor and outdoor |
 | 109 | Beams and girders | Indoor and outdoor |
@@ -285,6 +304,10 @@ Invalid points, failed scans, and attributes not transferred are logged. Not all
 E57-specific attributes are carried into LAS. Coordinates use 1 mm LAS scaling
 by default. GPS times and return information without a verified basis are not
 invented. Export to a classified E57 is not currently implemented.
+
+`report.json` additionally contains `scene_resolution`, `scene_consistency`,
+and `scene_audit`. `report.html` lists each scan's name, resolved scene
+(including **Aussen (überdacht)**), source, and any hint or resolution notice.
 
 The application folder contains:
 
@@ -360,6 +383,19 @@ The retained post-processing controls include `geometry_rules`, `vote_families`,
 and the `terrain_*`/`tree_*` thresholds. Geometry rules create a compact terrain
 artifact for the run. Its optional output-only terrain fill assigns class 2 to an
 otherwise unclassified point only when uncovered DTM evidence supports it.
+Reclassify overrides also include `scene_consistency`, `scene_context_*`,
+`scene_name_*`, `scene_neighbour_*`, and `scene_openness_*`.
+
+Das folgende Prüfwerkzeug vergleicht die Szenen pro Scan mit den Scan-Namen,
+getrennt für Endergebnis und reine Datenerkennung, und zeigt Kennzahlen pro
+Scan. `scene_audit` zeigt den Anteil falscher Szenenklassen pro Scan. Mit
+`--grid` werden Offenheits-Schwellen auf den gespeicherten Kennzahlen erprobt.
+Für Nachjustieren ohne SAM muss der Ursprungslauf `cache_cleanup: "keep_all"`
+verwenden.
+
+```powershell
+.cache\venv\Scripts\python.exe -m e57cls.tools.scene_eval "D:\Data\Project\klassifiziert\run_..." [--grid]
+```
 
 Without an explicit `output` value, the CLI creates a new run folder beside the
 E57. `scene_mode: "both"` enables automatic scene detection. Use `indoor` or
@@ -376,6 +412,12 @@ Reichweite beträgt standardmässig 20 m innen und 40 m aussen; `slam_max_range`
 überschreibt beide Werte. SLAM ist bisher nur synthetisch verifiziert, nicht mit
 realen NavVis- oder XGRIDS-Exporten.
 
+Die automatische Erkennung entscheidet anhand des Anteils betroffener
+Datenblöcke oder Bilder (mindestens 50 %). Einzelne Ausreisser, etwa ein
+Teilscan, erzeugen nur eine Warnung. Der Tiefentest berücksichtigt das belegte
+Winkelfenster eines Blocks. Bei statischen Läufen werden einzelne Blöcke ohne
+Scannerposition unklassifiziert ausgegeben, statt den Lauf abzubrechen.
+
 Die Verarbeitung nutzt einen gemeinsamen SAM-Durchgang, Parallelisierung,
 kachelweisen Transfer, kompakte Datenspeicher, einen Score-Floor und bereinigt
 den Cache nach erfolgreichem Lauf gemäss Einstellung.
@@ -387,11 +429,18 @@ Processing has been checked with a real file containing **10 scans and around
 selection, stair priority, mirror masks, edge/wall plane fitting, and the interface.
 All ten scan positions in the verified indoor dataset are recognized as indoor.
 
+An additional real static dataset with **157 scans** (indoor and outdoor,
+around **773 million points**) has been processed. Before the indoor/outdoor
+package, 140 of its 157 scans were assigned correctly. The improvement from the
+indoor/outdoor package has so far been verified only with synthetic tests; an
+evaluation run on this dataset is still pending.
+
 SAM can miss objects, produce overly broad masks, or confuse classes. The latest
 prompt additions have been checked for consistency; improved recognition accuracy
-has not yet been demonstrated. Real outdoor scenes and very large projects have
-been tested less extensively than the available indoor dataset. Review results
-in a point-cloud viewer and inspect the diagnostic images.
+has not yet been demonstrated. Real outdoor scenes are represented by the
+157-scan dataset, but the current indoor/outdoor resolution has not yet been
+evaluated on it. Review results in a point-cloud viewer and inspect the
+diagnostic images.
 
 Technical details: [Status](docs/STATUS.md), [verification ledger](docs/verification.md),
 [worker protocol](docs/protocol.md), [decisions](DECISIONS.md), and

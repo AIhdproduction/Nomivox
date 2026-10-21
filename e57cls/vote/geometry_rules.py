@@ -277,15 +277,20 @@ def _tree_seeds(votes, by_id, config):
     if len(rows) < 4:
         return []
     coordinates = np.asarray([row[:3] for row in rows], np.int64)
+    linearities = np.asarray([row[3] for row in rows], np.float64)
     count, labels = votes._sparse_components(coordinates)
+    order = np.argsort(labels, kind='stable')
+    offsets = np.r_[0, np.cumsum(np.bincount(labels, minlength=count))]
+    grouped_coordinates = coordinates[order]
+    grouped_linearities = linearities[order]
     seeds = []
     for component in range(count):
-        points = coordinates[labels == component]
+        points = grouped_coordinates[offsets[component]:offsets[component+1]]
         if (points[:, 2].ptp()*config['geometry_cell_size']) < .8:
             continue
         centered = points-points.mean(axis=0)
         _, _, vectors = np.linalg.svd(centered, full_matrices=False)
-        linearity = np.median(np.asarray([row[3] for row in np.asarray(rows, object)[labels == component]], np.float64))
+        linearity = np.median(grouped_linearities[offsets[component]:offsets[component+1]])
         if abs(vectors[0, 2]) < .7 or linearity < .35:
             continue
         seeds.append((float(points[:, 0].mean()), float(points[:, 1].mean()), int(points[:, 2].max())))

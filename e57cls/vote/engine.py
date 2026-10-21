@@ -1,8 +1,10 @@
 """SQLite-backed spatial grouping with one observation per scan position."""
 
 import json
+import logging
 from pathlib import Path
 import sqlite3
+import time
 
 import numpy as np
 import psutil
@@ -13,6 +15,9 @@ from scipy.spatial import cKDTree
 
 from e57cls.files import atomic_json, file_hash
 from e57cls.geometry.cameras import scan_pose
+
+
+LOG = logging.getLogger(__name__)
 
 
 def connect(path):
@@ -35,6 +40,67 @@ def voxel_keys(world, origin, size):
     if not np.isfinite(values).all() or (np.abs(values) >= 2**62).any():
         raise ValueError("Voxel indices exceed the supported range")
     return np.ascontiguousarray(values, dtype="<i8").view("V24").reshape(-1)
+
+
+def _coarse_component_spares(labels, sizes, cells, contexts, component_min_cells,
+                             sparse_maximum_voxels_per_cell, sparse_components):
+    """Return components exempt from the small-island threshold.
+
+    All component reductions are done once over the complete voxel array. In
+    particular, occupancies are sorted within each component before selecting
+    their middle value(s), which is equivalent to ``np.median`` per component.
+    """
+    unique_cells, cell_inverse = np.unique(cells, axis=0, return_inverse=True)
+    cell_inverse = np.asarray(cell_inverse).reshape(-1)
+    cell_count, cell_labels = VoteStore._sparse_components(unique_cells)
+    feature_sizes = np.bincount(cell_labels, minlength=cell_count)
+
+    pairs, inverse = np.unique(np.column_stack((labels, cells)), axis=0, return_inverse=True)
+    occupancies = np.bincount(inverse)
+    pair_components = pairs[:, 0]
+    occupancy_order = np.lexsort((occupancies, pair_components))
+    sorted_components = pair_components[occupancy_order]
+    starts = np.flatnonzero(np.r_[True, sorted_components[1:] != sorted_components[:-1]])
+    lengths = np.diff(np.r_[starts, len(occupancy_order)])
+    lower = occupancies[occupancy_order[starts+(lengths-1)//2]]
+    upper = occupancies[occupancy_order[starts+lengths//2]]
+    sparse = np.zeros(len(sizes), bool)
+    sparse[sorted_components[starts]] = (lower.astype(np.float64)+upper) / 2 <= sparse_maximum_voxels_per_cell
+
+    connected_cells = feature_sizes[cell_labels] >= component_min_cells
+    connected = np.bincount(labels, weights=connected_cells[cell_inverse], minlength=len(sizes)) > 0
+    outdoor_observed = np.zeros(len(sizes), bool)
+    if contexts is not None:
+        outdoor_observed = np.bincount(labels, weights=contexts[:, 0] != 0, minlength=len(sizes)) > 0
+    return sparse_components & sparse & connected & outdoor_observed
+
+
+def _touching_box_labels(low, high, maximum_gap):
+    """Return connected labels for boxes meeting within ``maximum_gap``.
+
+    Boxes are swept along x.  The remaining dimensions are compared in NumPy
+    batches, preserving the inclusive boundary condition of ``_boxes_touch``.
+    """
+    count = len(low)
+    if count < 2:
+        return np.arange(count, dtype=np.int64)
+    order = np.argsort(low[:, 0], kind='stable')
+    active = np.empty(0, np.int64)
+    source, target = [], []
+    for first in order:
+        active = active[high[active, 0] >= low[first, 0]-maximum_gap]
+        if len(active):
+            touching = np.maximum(low[first]-high[active], low[active]-high[first]).max(axis=1) <= maximum_gap
+            second = active[touching]
+            if len(second):
+                source.append(np.full(len(second), first, np.int64))
+                target.append(second)
+        active = np.append(active, first)
+    if not source:
+        return np.arange(count, dtype=np.int64)
+    graph = coo_matrix((np.ones(sum(map(len, source)), np.uint8),
+                       (np.concatenate(source), np.concatenate(target))), shape=(count, count))
+    return connected_components(graph, directed=False, return_labels=True)[1]
 
 
 def representatives(store, directory: Path, origin, size, checkpoint=lambda: None):
@@ -629,27 +695,13 @@ class VoteStore:
                                    'box': np.stack((component_coordinates.min(axis=0)*voxel_size,
                                                     component_coordinates.max(axis=0)*voxel_size))})
 
-        parents = np.arange(count, dtype=np.int64)
-
-        def find(value):
-            while parents[value] != value:
-                parents[value] = parents[parents[value]]
-                value = parents[value]
-            return value
-
-        for first in range(count):
-            if not (component_data[first]['stepped'] or component_data[first]['underside']):
-                continue
-            for second in range(first):
-                if not (component_data[second]['stepped'] or component_data[second]['underside']):
-                    continue
-                if self._boxes_touch(component_data[first]['box'], component_data[second]['box'], underside_maximum_gap):
-                    parents[find(first)] = find(second)
-
+        eligible = np.fromiter((data['stepped'] or data['underside'] for data in component_data), bool, count)
+        eligible_components = np.flatnonzero(eligible)
+        boxes = np.asarray([component_data[index]['box'] for index in eligible_components]).reshape(-1, 2, 3)
+        group_labels = _touching_box_labels(boxes[:, 0], boxes[:, 1], underside_maximum_gap)
         groups = {}
-        for component, data in enumerate(component_data):
-            if data['stepped'] or data['underside']:
-                groups.setdefault(find(component), []).append(component)
+        for component, group in zip(eligible_components, group_labels):
+            groups.setdefault(int(group), []).append(int(component))
         accepted = set()
         for members in groups.values():
             has_steps = any(component_data[item]['stepped'] for item in members)
@@ -700,6 +752,7 @@ class VoteStore:
         feature_cells_available = self.db.execute(
             "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='geometry_voxels'").fetchone() is not None
         for code in codes:
+            class_started = time.perf_counter()
             if feature_cells_available and code not in rules:
                 rows = list(self.db.execute('''SELECT d.key,g.cx,g.cy,g.cz,COALESCE(c.outdoor,0),COALESCE(c.indoor,0)
                                              FROM decisions d JOIN geometry_voxels g USING(key)
@@ -735,19 +788,9 @@ class VoteStore:
                 # Keep that shared connectivity, but measure density per voxel
                 # component so dense interior islands cannot borrow a remote
                 # sparse grid as an exemption.
-                unique_cells, cell_inverse = np.unique(cells, axis=0, return_inverse=True)
-                cell_count, cell_labels = self._sparse_components(unique_cells)
-                feature_sizes = np.bincount(cell_labels, minlength=cell_count)
-                pairs, inverse = np.unique(np.column_stack((labels, cells)), axis=0, return_inverse=True)
-                occupancies = np.bincount(inverse)
-                spare = np.zeros(count, bool)
-                for component in np.flatnonzero(sizes < minimum):
-                    local = occupancies[pairs[:, 0] == component]
-                    sparse = np.median(local) <= sparse_maximum_voxels_per_cell
-                    local_feature_labels = np.unique(cell_labels[cell_inverse[labels == component]])
-                    connected = np.any(feature_sizes[local_feature_labels] >= component_min_cells)
-                    outdoor_observed = contexts is not None and np.any(contexts[labels == component, 0])
-                    spare[component] = connected and sparse and outdoor_observed
+                spare = _coarse_component_spares(
+                    labels, sizes, cells, contexts, component_min_cells,
+                    sparse_maximum_voxels_per_cell, sizes < minimum)
                 too_small &= ~spare[labels]
             rejected = np.flatnonzero(too_small)
             components += count
@@ -756,6 +799,8 @@ class VoteStore:
                 self.db.executemany('UPDATE decisions SET code=1,confidence=0 WHERE key=?',
                                     ((keys[index],) for index in rejected[start:start+50000]))
             removed += len(rejected)
+            LOG.info('Small-component cleanup: class=%s voxels=%d components=%d removed_voxels=%d duration_seconds=%.3f',
+                     code, len(keys), count, len(rejected), time.perf_counter()-class_started)
         self.db.commit()
         self._invalidate_lookup()
         return {'components': components, 'removed_voxels': removed}

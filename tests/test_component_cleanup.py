@@ -1,6 +1,6 @@
 import numpy as np
 
-from e57cls.vote.engine import VoteStore, voxel_keys
+from e57cls.vote.engine import VoteStore, _coarse_component_spares, voxel_keys
 
 
 def _feature_context(votes, keys, outdoor):
@@ -13,6 +13,73 @@ def _feature_context(votes, keys, outdoor):
     votes.db.executemany('INSERT INTO geometry_context VALUES (?,?,?)',
                          ((bytes(key), int(outdoor), int(not outdoor)) for key in keys))
     votes.db.commit()
+
+
+def _reference_coarse_component_spares(labels, sizes, cells, contexts, component_min_cells,
+                                       sparse_maximum_voxels_per_cell, sparse_components):
+    """Literal reference for the former per-component implementation."""
+    unique_cells, cell_inverse = np.unique(cells, axis=0, return_inverse=True)
+    cell_inverse = np.asarray(cell_inverse).reshape(-1)
+    cell_count, cell_labels = VoteStore._sparse_components(unique_cells)
+    feature_sizes = np.bincount(cell_labels, minlength=cell_count)
+    pairs, inverse = np.unique(np.column_stack((labels, cells)), axis=0, return_inverse=True)
+    occupancies = np.bincount(inverse)
+    spare = np.zeros(len(sizes), bool)
+    for component in np.flatnonzero(sparse_components):
+        local = occupancies[pairs[:, 0] == component]
+        sparse = np.median(local) <= sparse_maximum_voxels_per_cell
+        local_feature_labels = np.unique(cell_labels[cell_inverse[labels == component]])
+        connected = np.any(feature_sizes[local_feature_labels] >= component_min_cells)
+        outdoor_observed = contexts is not None and np.any(contexts[labels == component, 0])
+        spare[component] = connected and sparse and outdoor_observed
+    return spare
+
+
+def test_vectorized_coarse_component_spares_match_reference_for_random_data():
+    rng = np.random.default_rng(20261021)
+    component_sizes = rng.integers(1, 9, size=900)
+    labels = np.repeat(np.arange(len(component_sizes)), component_sizes)
+    cells = rng.integers(-18, 19, size=(len(labels), 3), dtype=np.int64)
+    contexts = rng.integers(0, 2, size=(len(labels), 2), dtype=np.int64)
+    sizes = np.bincount(labels)
+    sparse_components = sizes < 6
+    pairs = np.unique(np.column_stack((labels, cells)), axis=0)
+    pair_counts = np.bincount(pairs[:, 0], minlength=len(sizes))
+    assert np.any(pair_counts % 2 == 0)
+    assert np.any(pair_counts % 2 == 1)
+
+    expected = _reference_coarse_component_spares(
+        labels, sizes, cells, contexts, 4, 2, sparse_components)
+    actual = _coarse_component_spares(
+        labels, sizes, cells, contexts, 4, 2, sparse_components)
+    np.testing.assert_array_equal(actual, expected)
+
+    expected_without_context = _reference_coarse_component_spares(
+        labels, sizes, cells, None, 4, 2, sparse_components)
+    actual_without_context = _coarse_component_spares(
+        labels, sizes, cells, None, 4, 2, sparse_components)
+    np.testing.assert_array_equal(actual_without_context, expected_without_context)
+
+
+def test_remove_small_components_uses_vectorized_coarse_cell_exception(tmp_path):
+    votes = VoteStore(tmp_path/'vectorized-coarse-cells.sqlite')
+    keys = voxel_keys([[0, 0, 0], [.12, 0, 0], [.24, 0, 0], [1, 0, 0]], np.zeros(3), .02)
+    votes.add_scan(1, 'run', [(keys, np.ones((len(keys), 1), np.float32))], [6])
+    votes.decide(1, .1, [6])
+    votes.db.execute('CREATE TEMP TABLE geometry_voxels(key BLOB PRIMARY KEY,cx INTEGER,cy INTEGER,cz INTEGER) WITHOUT ROWID')
+    votes.db.execute('CREATE TEMP TABLE geometry_context(key BLOB PRIMARY KEY,outdoor INTEGER,indoor INTEGER) WITHOUT ROWID')
+    coordinates = np.frombuffer(b''.join(bytes(key) for key in keys), dtype='<i8').reshape(-1, 3)
+    cells = np.floor(coordinates*.02/.10).astype(np.int64)
+    votes.db.executemany('INSERT INTO geometry_voxels VALUES (?,?,?,?)',
+                         ((bytes(key), *map(int, cell)) for key, cell in zip(keys, cells)))
+    votes.db.executemany('INSERT INTO geometry_context VALUES (?,?,?)',
+                         ((bytes(key), int(index < 3), int(index == 3)) for index, key in enumerate(keys)))
+    votes.db.commit()
+
+    result = votes.remove_small_components(.02, 4, component_min_cells=3, feature_cell_size=.10)
+    assert result == {'components': 4, 'removed_voxels': 1}
+    assert votes.lookup(keys)[0].tolist() == [6, 6, 6, 1]
+    votes.close()
 
 
 def test_small_components_are_removed_but_cable_span_is_kept(tmp_path):

@@ -74,7 +74,9 @@ def _split_cells(cells):
     graph = coo_matrix((np.ones(sum(map(len, source)), np.uint8),
                        (np.concatenate(source), np.concatenate(target))), shape=(len(cells), len(cells)))
     count, labels = connected_components(graph, directed=False, return_labels=True)
-    return [cells[labels == index] for index in range(count)]
+    order = np.argsort(labels, kind='stable')
+    offsets = np.cumsum(np.bincount(labels, minlength=count))[:-1]
+    return list(np.split(cells[order], offsets))
 
 
 def _piece_bounds(cells, center, normal, basis, tolerance):
@@ -156,10 +158,27 @@ def _without_small_islands(points, origin, voxel_size, minimum_voxels):
 
 def _merge_coplanar_pieces(pieces, tolerance):
     """Join adjacent occupancy patches when their supporting planes agree."""
+    pieces = list(pieces)
     merged = []
+    normals = np.empty((len(pieces), 3), np.float64)
+    centers = np.empty((len(pieces), 3), np.float64)
+    lows = np.empty((len(pieces), 2), np.int32)
+    highs = np.empty((len(pieces), 2), np.int32)
     cosine = np.cos(np.deg2rad(3.))
     for piece in pieces:
-        for current in merged:
+        if merged:
+            size = len(merged)
+            current_normals = normals[:size]
+            normal_values = np.abs(current_normals@piece['normal'])
+            normal_matches = ~(normal_values < cosine-1e-12)
+            deltas = piece['center']-centers[:size]
+            offsets = np.abs(np.einsum('ij,ij->i', deltas, current_normals))
+            rounding_margin = np.maximum(1e-10, np.finfo(np.float64).eps*64*np.sum(np.abs(deltas*current_normals), axis=1))
+            candidate_indices = np.flatnonzero(normal_matches & ~(offsets >= tolerance+rounding_margin))
+        else:
+            candidate_indices = ()
+        for index in candidate_indices:
+            current = merged[index]
             if abs(float(np.dot(piece['normal'], current['normal']))) < cosine:
                 continue
             if abs(float(np.dot(piece['center']-current['center'], current['normal']))) >= tolerance:
@@ -167,13 +186,23 @@ def _merge_coplanar_pieces(pieces, tolerance):
             uv = piece['cells'].astype(np.float64)*CELL_SIZE
             world = uv@piece['basis'] + piece['normal']*np.dot(piece['center'], piece['normal'])
             projected = _cells_from_uv(world@current['basis'].T)
+            projected_low, projected_high = projected.min(axis=0), projected.max(axis=0)
+            if np.maximum(projected_low-highs[index], lows[index]-projected_high).max() > 1:
+                continue
             combined = np.unique(np.vstack((current['cells'], projected)), axis=0)
             if len(_split_cells(combined)) == 1:
                 current['cells'] = combined
                 current['area'] += piece['area']
+                lows[index] = np.minimum(lows[index], projected_low)
+                highs[index] = np.maximum(highs[index], projected_high)
                 break
         else:
+            index = len(merged)
             merged.append(piece)
+            lows[index] = piece['cells'].min(axis=0)
+            highs[index] = piece['cells'].max(axis=0)
+            normals[index] = piece['normal']
+            centers[index] = piece['center']
     return merged
 
 

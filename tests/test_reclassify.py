@@ -48,7 +48,7 @@ def test_reclassify_reproduces_output_and_keeps_original_votes(tmp_path):
 def test_reclassify_override_applies_and_segmenting_override_is_rejected(tmp_path):
     config = _classified_run(tmp_path)
     allowed = tmp_path / 'allowed.json'
-    allowed.write_text(json.dumps({'min_observations': 2}), encoding='utf-8')
+    allowed.write_text(json.dumps({'min_observations': 2, 'segment_vote': False}), encoding='utf-8')
     report = reclassify(Path(config['output']), tmp_path / 'changed', allowed)
     assert report['output']['class_counts'] == {'1': 121}
     denied = tmp_path / 'denied.json'

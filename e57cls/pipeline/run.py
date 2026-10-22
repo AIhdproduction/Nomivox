@@ -22,6 +22,7 @@ from e57cls.geometry.images import extract_blob, open_image, render_view
 from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
+from e57cls.vote.segments import apply_segment_vote
 from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.inspector import inspect_file, markdown
 from e57cls.io.input_mode import detect_input_mode, pseudo_setup_points_check
@@ -1093,7 +1094,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                 'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority, families)
-    surface_ties = building = stairs = components = vegetation = geometry_rules = scene_consistency = None
+    surface_ties = building = stairs = components = vegetation = geometry_rules = segment_vote = scene_consistency = None
     terrain = None
     if config['surface_tie_break']:
         surface_ties = votes.resolve_surface_ties(by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
@@ -1104,6 +1105,10 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'],
             config['building_boundary_max_cells'], control.checkpoint)
+    segment_started = time.monotonic()
+    segment_vote = apply_segment_vote(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'], config,
+                                      control.checkpoint, active_codes={row['code'] for row in rows})
+    timings['segment_vote'] = time.monotonic()-segment_started
     rule_context = geometry_scan_context(
         preset, config, {station.id: scene for station in stations},
         positions={station.id: station.position for station in stations})
@@ -1210,6 +1215,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
               'stairs_priority_overrides': votes.priority_overrides, 'created_utc': datetime.now(timezone.utc).isoformat(),
               'surface_ties': surface_ties, 'building_enclosure': building, 'stairs_geometry': stairs,
               'component_cleanup': components, 'vegetation_base_to_ground': vegetation, 'geometry_rules': geometry_rules,
+              'segment_vote': segment_vote,
               'scene_consistency': scene_consistency,
               'scene_resolution': {'scene': {scene: len(station_results)},
                                    'scene_detail': {scene: len(station_results)}, 'source': {'data': len(station_results)},
@@ -1260,6 +1266,7 @@ def execute(config, backend_factory=None, listen=True):
     geometry_fill_report = None
     geometry_planes = None
     geometry_rules_report = None
+    segment_vote_report = None
     scene_consistency_report = None
     terrain = None
     def factory():
@@ -1627,6 +1634,11 @@ def execute(config, backend_factory=None, listen=True):
                         by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
                         config['building_boundary_max_cells'], control.checkpoint)
+                segment_started = time.monotonic()
+                segment_vote_report = apply_segment_vote(
+                    votes, by_id, np.array(config['voxel_origin']), config['voxel_size'], config, control.checkpoint,
+                    active_codes={row['code'] for row in rows})
+                timings['segment_vote'] = time.monotonic()-segment_started
                 rule_context = geometry_scan_context(
                     preset, config, {item['scan']: item.get('scene') for item in scan_results if 'scan' in item},
                     positions={store.meta['scan_index']: scan_pose(store.meta['metadata']).translation.tolist()
@@ -1733,6 +1745,7 @@ def execute(config, backend_factory=None, listen=True):
                   "stairs_priority_overrides": votes.priority_overrides,
                   "stairs_geometry": stairs_geometry_report,
                   "surface_ties": surface_tie_report,
+                  "segment_vote": segment_vote_report,
                   "component_cleanup": cleanup_report,
                   "vegetation_base_to_ground": vegetation_report, "building_enclosure": building_report,
                   "depth_gate": {str(item['scan']): item.get('depth_gate', {}) for item in scan_results if 'scan' in item},

@@ -14,6 +14,7 @@ from e57cls.files import atomic_json, new_output
 from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
+from e57cls.vote.segments import apply_segment_vote
 from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.store import load_scan, reduced_store
 from e57cls.output.e57 import write_e57
@@ -55,7 +56,7 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
 RECLASSIFY_POST_VOTE_PREFIXES = ('stairs_', 'surface_tie_', 'component_', 'cable_', 'electrical_',
                                  'vegetation_', 'building_', 'geometry_fill', 'geometry_', 'terrain_', 'tree_',
                                  'class_transfer_', 'scene_context_', 'scene_consistency', 'scene_name_', 'scene_neighbour_',
-                                 'scene_openness_')
+                                 'scene_openness_', 'segment_')
 INPUT_MODES = frozenset({'static', 'slam'})
 REQUESTED_INPUT_MODES = INPUT_MODES | {'auto'}
 
@@ -161,7 +162,7 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority, vote_families=families)
     result = {'surface_ties': None, 'building_enclosure': None, 'stairs_geometry': None,
               'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_rules': None,
-              'scene_consistency': None, 'geometry_fill': None}
+              'segment_vote': None, 'scene_consistency': None, 'geometry_fill': None}
     origin = np.asarray(config['voxel_origin'])
     if config['surface_tie_break']:
         result['surface_ties'] = votes.resolve_surface_ties(by_id, origin, config['voxel_size'], config['surface_tie_share'],
@@ -170,6 +171,8 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
         result['building_enclosure'] = votes.split_ground_floor_by_building(by_id['ground'], by_id['floor'],
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'], config['building_boundary_max_cells'])
+    result['segment_vote'] = apply_segment_vote(votes, by_id, origin, config['voxel_size'], config,
+                                                active_codes=active_codes)
     terrain = None
     if config['geometry_rules']:
         terrain = work/'terrain.npz'

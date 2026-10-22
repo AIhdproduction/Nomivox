@@ -44,7 +44,10 @@ class TerrainIndex:
 def _features(points, k, radius):
     """Return local shape descriptors for the supplied feature-cell centres."""
     count = len(points)
-    result = np.zeros((count, 4), np.float32)
+    # The final three values retain the oriented local normal.  Keeping it
+    # with the existing descriptors lets all geometric post-processing share
+    # one bounded neighbourhood calculation.
+    result = np.zeros((count, 7), np.float32)
     if not count:
         return result
     tree = cKDTree(points)
@@ -63,9 +66,15 @@ def _features(points, k, radius):
         if values[0] <= 1e-12:
             continue
         normal = vectors[:, 0]
-        result[index] = ((values[0]-values[1])/values[0],
-                         (values[1]-values[2])/values[0],
-                         values[2]/values.sum() if values.sum() else 0., abs(normal[2]))
+        # Plane normals have no inherent direction.  Use one deterministic
+        # hemisphere so adjacent planar feature cells can be compared.
+        if (normal[2] < 0 or (normal[2] == 0 and (normal[0] < 0
+                or (normal[0] == 0 and normal[1] < 0)))):
+            normal = -normal
+        result[index, :4] = ((values[0]-values[1])/values[0],
+                              (values[1]-values[2])/values[0],
+                              values[2]/values.sum() if values.sum() else 0., abs(normal[2]))
+        result[index, 4:] = normal
     return result
 
 
@@ -88,8 +97,10 @@ def _prepare_tables(votes, voxel_size, cell_size, tile_size, checkpoint):
         CREATE TEMP TABLE geometry_features(
             cx INTEGER, cy INTEGER, cz INTEGER, x REAL, y REAL, z REAL,
             linearity REAL, planarity REAL, scatter REAL, verticality REAL,
+            nx REAL DEFAULT 0, ny REAL DEFAULT 0, nz REAL DEFAULT 0,
             hag REAL, covered INTEGER DEFAULT 0, PRIMARY KEY(cx,cy,cz)
         ) WITHOUT ROWID;
+        CREATE TEMP TABLE geometry_meta(name TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
         CREATE INDEX geometry_voxels_cells ON geometry_voxels(cx,cy,cz);
     """)
     cursor = db.execute('SELECT key,code,confidence FROM decisions ORDER BY key')
@@ -129,12 +140,44 @@ def _make_features(votes, origin, voxel_size, config, checkpoint):
         descriptors = _features(world, config['geometry_knn'], config['geometry_knn_radius'])
         core = [(row, point, values) for row, point, values in zip(rows, world, descriptors)
                 if tuple(np.floor(np.asarray(row[:3])*cell_size/tile_size).astype(np.int64)) == (tx, ty, tz)]
-        db.executemany('INSERT OR REPLACE INTO geometry_features VALUES (?,?,?,?,?,?,?,?,?,?,?,0)',
+        db.executemany('INSERT OR REPLACE INTO geometry_features VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
             ((int(row[0]), int(row[1]), int(row[2]), *map(float, point), *map(float, values), None)
              for row, point, values in core))
         if tile_number % 16 == 0:
             db.commit()
     db.commit()
+
+
+def _geometry_signature(origin, voxel_size, config):
+    """Return the feature parameters that must match for a TEMP-table reuse."""
+    return json.dumps({'origin': np.asarray(origin, np.float64).tolist(), 'voxel_size': float(voxel_size),
+                       'cell_size': float(config['geometry_cell_size']),
+                       'tile_size': float(config['geometry_tile_size']), 'halo': float(config['geometry_halo']),
+                       'knn': int(config['geometry_knn']), 'radius': float(config['geometry_knn_radius'])},
+                      sort_keys=True, separators=(',', ':'))
+
+
+def prepare_geometry_features(votes, origin, voxel_size, config, checkpoint=lambda: None):
+    """Prepare feature tables once per compatible post-processing chain."""
+    signature = _geometry_signature(origin, voxel_size, config)
+    row = votes.db.execute("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='geometry_meta'").fetchone()
+    cached = (row is not None and votes.db.execute("SELECT value FROM geometry_meta WHERE name='signature'").fetchone())
+    if cached and cached[0] == signature:
+        return False
+    _prepare_tables(votes, voxel_size, config['geometry_cell_size'], config['geometry_tile_size'], checkpoint)
+    _make_features(votes, np.asarray(origin, np.float64), voxel_size, config, checkpoint)
+    votes.db.execute("INSERT INTO geometry_meta VALUES ('signature',?)", (signature,))
+    votes.db.commit()
+    return True
+
+
+def refresh_geometry_decisions(votes):
+    """Reflect changed decisions in already prepared feature voxels in SQL."""
+    exists = votes.db.execute("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='geometry_voxels'").fetchone()
+    if exists:
+        votes.db.execute('''UPDATE geometry_voxels AS g SET code=d.code,confidence=d.confidence
+                            FROM decisions AS d WHERE d.key=g.key''')
+        votes.db.commit()
 
 
 def _terrain(votes, origin, config, target, checkpoint, by_id):
@@ -275,8 +318,8 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
     if not config['geometry_rules']:
         return result
     origin = np.asarray(origin, np.float64)
-    _prepare_tables(votes, voxel_size, config['geometry_cell_size'], config['geometry_tile_size'], checkpoint)
-    _make_features(votes, origin, voxel_size, config, checkpoint)
+    prepare_geometry_features(votes, origin, voxel_size, config, checkpoint)
+    refresh_geometry_decisions(votes)
     active_codes = {int(value) for value in (by_id.values() if active_codes is None else active_codes)}
     scene_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint)
     result['terrain'] = _terrain(votes, origin, config, Path(terrain_target), checkpoint, by_id)

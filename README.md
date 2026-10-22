@@ -164,6 +164,20 @@ stepped stair components, retains sparse semantic surfaces when their connected
 3 mm per metre of scanner distance up to 5 cm. A zero transfer range factor
 keeps the previous fixed-radius behaviour.
 
+After voxel voting, the cloud is split into geometry-connected **10 cm** feature-cell
+segments. Planar cells join when their normals differ by at most **15 degrees** and
+their plane distance is at most **3 cm**; non-planar objects form separate segments,
+and boundary cells attach to exactly one plane, so planes and objects never merge.
+SAM votes are summed per segment. At a segment share of at least **60%**,
+unclassified voxels and weakly decided voxels (own share below 60%, winner support
+at least 25%) adopt the segment class. Stairs, doors, windows, electrical objects,
+traffic signs, manholes, and class **68** are never overwritten; voxels below
+`min_observations` remain unchanged and do not contribute. This reduces patchy
+surfaces such as pillars split between wall and column, and partly unclassified
+tabletops. It takes roughly as long as voxel voting, sharing the geometry-rule
+features. Disable it with `segment_vote: false`; tune the `segment_*` thresholds
+through `reclassify` without another SAM run.
+
 Vote post-processing for small-island removal and the stair, tree, and surface
 steps is vectorized. `log.txt` records the work performed for each class.
 
@@ -380,9 +394,10 @@ in der Override-Datei sind zulässig; der ursprüngliche Vote-Cache bleibt erhal
 ```
 
 The retained post-processing controls include `geometry_rules`, `vote_families`,
-and the `terrain_*`/`tree_*` thresholds. Geometry rules create a compact terrain
-artifact for the run. Its optional output-only terrain fill assigns class 2 to an
-otherwise unclassified point only when uncovered DTM evidence supports it.
+the `terrain_*`/`tree_*` thresholds, and the `segment_*` controls. Geometry rules
+create a compact terrain artifact for the run. Its optional output-only terrain
+fill assigns class 2 to an otherwise unclassified point only when uncovered DTM
+evidence supports it.
 Reclassify overrides also include `scene_consistency`, `scene_context_*`,
 `scene_name_*`, `scene_neighbour_*`, and `scene_openness_*`.
 

@@ -41,6 +41,10 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "geometry_fill_max_planes": 400, "geometry_fill_min_component_voxels": 20,
             "geometry_fill_ransac_trials": 256, "geometry_fill_ransac_max_trials": 1024,
             "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
+            "segment_vote": True, "segment_min_planarity": .5, "segment_normal_angle": 15.,
+            "segment_plane_distance": .03, "segment_min_cells": 3, "segment_min_share": .6,
+            "segment_weak_share": .6, "segment_fill_min_support": 0., "segment_flip_min_support": .25,
+            "segment_protected_classes": ["stairs", "door", "window", "electrical", "traffic_sign", "manhole"],
             "geometry_rules_outdoor_vegetation": True, "geometry_rules_ground_floor": True,
             "scene_context_margin": .8, "scene_consistency": True,
             "scene_consistency_fallbacks": {"floor": ["ground", "sidewalk", "road"], "ceiling": ["building"],
@@ -261,23 +265,36 @@ def resolve_config(config: dict, base: Path = PROJECT):
     if (not isinstance(value['component_cleanup'], bool) or not isinstance(value['surface_tie_break'], bool)
             or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
             or not isinstance(value['mirror_shape_regularize'], bool) or not isinstance(value['geometry_rules'], bool)
+            or not isinstance(value['segment_vote'], bool)
             or not isinstance(value['geometry_rules_outdoor_vegetation'], bool)
             or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)
             or not isinstance(value['scene_consistency'], bool)):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels', 'component_min_cells', 'component_sparse_max_voxels_per_cell', 'cable_component_min_voxels',
                 'electrical_component_min_voxels', 'geometry_fill_max_planes', 'geometry_fill_min_component_voxels',
-                'geometry_fill_ransac_trials', 'geometry_fill_ransac_max_trials'):
+                'geometry_fill_ransac_trials', 'geometry_fill_ransac_max_trials', 'segment_min_cells'):
         if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
             raise ValueError(f'Invalid {key}')
     for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius', 'class_transfer_radius_max', 'reflection_neighbor_radius',
                 'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
                 'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_cell_size', 'geometry_tile_size',
+                'segment_plane_distance',
                 'geometry_halo', 'geometry_knn_radius', 'terrain_cell_size', 'terrain_max_gap', 'terrain_max_slope',
                 'terrain_ground_tolerance', 'terrain_cover_min_height', 'terrain_cover_max_height',
                 'tree_crown_radius', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    for key in ('segment_min_planarity', 'segment_min_share', 'segment_weak_share',
+                'segment_fill_min_support', 'segment_flip_min_support'):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 <= value[key] <= 1):
+            raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['segment_normal_angle'], (int, float)) or isinstance(value['segment_normal_angle'], bool)
+            or not 0 <= value['segment_normal_angle'] <= 180):
+        raise ValueError('Invalid segment normal angle')
+    if (not isinstance(value['segment_protected_classes'], list)
+            or not all(isinstance(item, str) for item in value['segment_protected_classes'])):
+        raise ValueError('Invalid segment protected classes')
     if (not isinstance(value['scene_context_margin'], (int, float)) or isinstance(value['scene_context_margin'], bool)
             or not 0 < value['scene_context_margin'] <= 1):
         raise ValueError('Invalid scene context margin')

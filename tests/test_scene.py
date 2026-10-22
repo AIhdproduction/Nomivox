@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 import numpy as np
 from e57cls.scene.presets import validate_preset
@@ -33,10 +34,42 @@ def test_indoor_supported_ceiling_and_sky_through_window():
 def test_preset_validation_and_code_map():
     p = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
     assert validate_preset(p) == ([], ['reserved_las_code:sanitary_fixtures:63'])
+    appliances = next(item for item in p['classes'] if item['id'] == 'appliances')
+    furniture = next(item for item in p['classes'] if item['id'] == 'furniture')
+    assert appliances['code'] == 118
+    assert appliances['scene'] == 'indoor'
+    assert appliances['prompts'] == [
+        'stove', 'cooktop', 'kitchen oven', 'dishwasher', 'range hood', 'extractor hood',
+        'washing machine', 'clothes dryer', 'microwave oven',
+    ]
+    assert {'refrigerator', 'fridge'} <= set(furniture['prompts'])
     p['classes'][1]['prompts'].append(p['classes'][0]['prompts'][0])
     assert any(e.startswith('prompt_conflict') for e in validate_preset(p)[0])
     p['code_map'] = {'1': 0}
     assert 'special_codes_cannot_be_remapped' in validate_preset(p)[0]
+
+
+def test_builtin_codes_are_reserved_for_custom_classes_and_old_presets():
+    p = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    custom = dict(id='custom_class', name_de='Custom class', name_en='Custom class', code=118,
+                  color='#123456', scene='both', enabled=True, prompts=['custom object'],
+                  min_instance_conf=None, min_mask_conf=None)
+    p['classes'].append(custom)
+    assert 'reserved_builtin_code:custom_class' in validate_preset(p)[0]
+
+    without_appliances = deepcopy(p)
+    without_appliances['classes'] = [item for item in without_appliances['classes']
+                                     if item['id'] != 'appliances']
+    assert 'reserved_builtin_code:custom_class' in validate_preset(without_appliances)[0]
+
+    mapped = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    mapped['classes'].append({**custom, 'code': 23})
+    mapped['code_map'] = {'23': 117}
+    assert 'reserved_builtin_code:custom_class' in validate_preset(mapped)[0]
+
+    old_preset = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    old_preset['classes'] = [item for item in old_preset['classes'] if item['id'] != 'appliances']
+    assert validate_preset(old_preset) == ([], ['reserved_las_code:sanitary_fixtures:63'])
 
 
 def test_added_classes_are_scene_scoped_and_have_english_prompts():

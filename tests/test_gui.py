@@ -5,7 +5,7 @@ import numpy as np
 import pye57
 import pytest
 from pathlib import Path
-from PySide6.QtCore import QProcess,QCoreApplication,QEvent
+from PySide6.QtCore import QProcess,QCoreApplication,QEvent,Qt
 from PySide6.QtWidgets import QApplication,QFileDialog,QInputDialog,QMessageBox
 from e57cls.gui.eta import RunEstimator
 from e57cls.gui import window as window_module
@@ -82,6 +82,45 @@ def test_scene_event_displays_covered_outdoor_detail(qt_application):
     finally:
         window.close()
         window.deleteLater()
+
+
+def test_builtin_class_codes_are_not_editable_but_custom_codes_are(qt_application):
+    window = MainWindow(None, auto_start=False)
+    try:
+        window.preset['classes'].append(dict(
+            id='custom_class', name_de='Custom class', name_en='Custom class', code=23,
+            color='#123456', scene='both', enabled=True, prompts=['custom object'],
+            min_instance_conf=None, min_mask_conf=None,
+        ))
+        window.load_table()
+        builtin_row = next(index for index, item in enumerate(window.preset['classes'])
+                           if item['id'] == 'furniture')
+        custom_row = len(window.preset['classes']) - 1
+        assert not window.class_table.item(builtin_row, 3).flags() & Qt.ItemFlag.ItemIsEditable
+        assert window.class_table.item(custom_row, 3).flags() & Qt.ItemFlag.ItemIsEditable
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_add_class_skips_and_rejects_builtin_codes(qt_application, monkeypatch):
+    window = MainWindow(None, auto_start=False)
+    suggested, messages = [], []
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *args: ('Custom class', True))
+    monkeypatch.setattr(QInputDialog, 'getInt',
+                        lambda *args: (suggested.append(args[3]) or (118, True)))
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: messages.append(args))
+    try:
+        window.add_class()
+        builtin_codes = set(window_module.builtin_code_ids())
+        assert suggested[0] not in builtin_codes
+        assert messages[-1][2] == tr('class_code_taken', code=118)
+        assert all(item['id'] != 'custom_class' for item in window.preset['classes'])
+    finally:
+        window.close()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 def write_preview_source(path, count):

@@ -18,7 +18,7 @@ to run the classifier.
 
 - Process E57 files containing multiple scan positions and associated embedded images.
 - Select indoor and outdoor classes automatically or use manual scene settings.
-- Use 34 object classes with 246 English search prompts, and edit or add classes.
+- Use 35 object classes with 256 English search prompts, and edit or add classes.
 - Combine spatial evidence from multiple scan positions, prioritizing confidently detected stairs over floors and ceilings.
 - Detect mirrors and window glass, assigning class 68 to points behind their estimated surfaces within the corresponding image masks.
 - Export valid original points with coordinates, available RGB colors, and scan membership.
@@ -232,12 +232,22 @@ For example, the outdoor ground class searches for `ground`, `soil`, `earth`,
 respective classes. Class 76 covers loose objects such as clothing, suitcases,
 bags, toys, blankets, and tools.
 
+Kitchen and household appliances (118) covers stoves, cooktops, ovens,
+dishwashers, range hoods, washing machines, clothes dryers, and microwave ovens;
+refrigerators stay with furniture (117); televisions are not part of class 118.
+
 Additional prompts broaden the search but do not guarantee higher accuracy and
 can increase processing time. Prefer specific terms; duplicate prompts in
 competing classes are flagged during preset validation. The `auxiliary` section
 contains helper prompts for sky, mirrors, and window glass. **Unclassified (1)**
 is the fallback class, while **Reflection (68)** follows the mask/geometry rule
 above. Neither is an ordinary text-searched object class.
+
+Built-in classes keep fixed codes - their code cell is locked in the class table.
+Classes added in the interface receive a free code from 23 to 60; codes of
+built-in classes (including 1 and 68) are reserved even when the built-in class
+is disabled or removed, and preset validation rejects a custom class or code
+mapping that uses one.
 
 ### Included object classes
 
@@ -277,6 +287,7 @@ above. Neither is an ordinary text-searched object class.
 | 114 | Heating, ventilation, and air conditioning | Indoor |
 | 116 | Ceiling equipment | Indoor |
 | 117 | Furniture | Indoor |
+| 118 | Kitchen and household appliances | Indoor |
 
 The exported legend documents the project-specific meaning of each code.
 **63** is explicitly used for sanitary fixtures here, although this code is

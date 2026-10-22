@@ -633,7 +633,31 @@
         "wardrobe",
         "chest of drawers",
         "dining table",
-        "bookcase"
+        "bookcase",
+        "refrigerator",
+        "fridge"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "appliances",
+      "name_de": "Küchen- und Haushaltsgeräte",
+      "name_en": "Kitchen and household appliances",
+      "code": 118,
+      "color": "#FF8A65",
+      "scene": "indoor",
+      "enabled": true,
+      "prompts": [
+        "stove",
+        "cooktop",
+        "kitchen oven",
+        "dishwasher",
+        "range hood",
+        "extractor hood",
+        "washing machine",
+        "clothes dryer",
+        "microwave oven"
       ],
       "min_instance_conf": null,
       "min_mask_conf": null

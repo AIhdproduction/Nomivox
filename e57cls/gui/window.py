@@ -19,7 +19,7 @@ from e57cls.gui.eta import RunEstimator, load_profile, save_profile
 from e57cls.io.inspector import INSPECTION_SCHEMA
 from e57cls.gui.theme import apply_theme
 from e57cls.pipeline.config import PROJECT,DEFAULTS,resolve_config
-from e57cls.scene.presets import validate_preset
+from e57cls.scene.presets import builtin_code_ids, validate_preset
 from e57cls.scene.resolve import scan_display_name, name_hint
 
 STRINGS = json.loads((PROJECT/'e57cls/gui/strings_de.json').read_text(encoding='utf-8'))
@@ -770,6 +770,7 @@ class MainWindow(QMainWindow):
 
     def load_table(self):
         self.loading = True
+        builtin_ids = set(builtin_code_ids().values())
         self.class_table.setRowCount(len(self.preset['classes']))
         for row,c in enumerate(self.preset['classes']):
             active = QTableWidgetItem()
@@ -783,6 +784,8 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if col == 4:
                     item.setData(Qt.ItemDataRole.DecorationRole,self.color_swatch(value))
+                if col == 3 and c['id'] in builtin_ids:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.class_table.setItem(row,col,item)
         self.class_table.resizeColumnsToContents()
         self.loading = False
@@ -838,7 +841,7 @@ class MainWindow(QMainWindow):
         name,ok = QInputDialog.getText(self,tr('add_class'),tr('class_name'))
         if not ok or not name.strip():
             return
-        used = {item['code'] for item in self.preset['classes']}
+        used = {item['code'] for item in self.preset['classes']} | set(builtin_code_ids())
         suggested = next((code for code in range(23,61) if code not in used),23)
         code,ok = QInputDialog.getInt(self,tr('add_class'),tr('class_code'),suggested,23,60)
         if not ok:

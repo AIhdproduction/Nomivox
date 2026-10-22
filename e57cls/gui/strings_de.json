@@ -299,6 +299,7 @@
   "validation_invalid_code": "Klassencode muss zwischen 1 und 255 liegen",
   "validation_invalid_code_map": "Ungültige Code-Zuordnung",
   "validation_duplicate_or_invalid_export_code": "Ausgabecode ungültig oder doppelt",
+  "validation_reserved_builtin_code": "Code ist für eine eingebaute Klasse reserviert",
   "validation_reserved_las_code": "Reservierter LAS-Code wird verwendet",
   "validation_invalid_color": "Farbe muss als #RRGGBB angegeben werden",
   "validation_special_code_in_class": "Code 1 und 68 sind für Sonderklassen reserviert",

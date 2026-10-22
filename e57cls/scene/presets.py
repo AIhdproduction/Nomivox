@@ -1,10 +1,24 @@
 """Validate user-editable semantic classes before allocating GPU work."""
+import json
 import re
 from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
 
 from e57cls.seg.cache import SCORE_FLOOR
 
 STANDARD = set(range(1, 23)) - {8, 12}
+
+
+@lru_cache(maxsize=1)
+def builtin_code_ids():
+    """Return the fixed codes and IDs defined by the bundled default preset."""
+    path = Path(__file__).resolve().parents[2] / 'presets' / 'default.json'
+    preset = json.loads(path.read_text(encoding='utf-8'))
+    return {
+        item['code']: item['id']
+        for item in [*preset.get('special', []), *preset.get('classes', [])]
+    }
 
 
 def validate_preset(preset, require_active_classes=True):
@@ -17,6 +31,7 @@ def validate_preset(preset, require_active_classes=True):
         return ['no_classes'], []
     mapping = preset.get('code_map', {})
     pairs = {frozenset(p) for p in preset.get('scene_resolved_pairs', [])}
+    builtin_codes = builtin_code_ids()
     for item in [*preset.get('special', []), *entries]:
         ident, code = item.get('id', ''), item.get('code')
         if not re.fullmatch('[a-z0-9_]+', ident) or ident in ids:
@@ -33,6 +48,8 @@ def validate_preset(preset, require_active_classes=True):
         if exported in codes or not 1 <= exported <= 255:
             errors.append(f'duplicate_or_invalid_export_code:{ident}')
         codes.add(exported)
+        if builtin_codes.get(exported) not in (None, ident):
+            errors.append(f'reserved_builtin_code:{ident}')
         if code < 64 and code not in STANDARD:
             warnings.append(f'reserved_las_code:{ident}:{code}')
         if not re.fullmatch('#[0-9a-fA-F]{6}', item.get('color', '')):

@@ -1540,10 +1540,10 @@ def _prepare_outdoor_objects(votes, by_id, origin, voxel_size, object_cell, outl
         return None
     names = ('building', 'wall', 'steel_structure', 'utility_pole', 'traffic_sign', 'fence', 'vehicle',
              'power_line', 'tree_trunk')
-    codes = {1} | {int(by_id[name]) for name in names if name in by_id}
+    source_codes = {1} | {int(by_id[name]) for name in names if name in by_id}
     evidence = {int(by_id[name]) for name in ('building', 'wall', 'utility_pole', 'traffic_sign', 'fence',
                                                'vehicle', 'power_line') if name in by_id}
-    if not codes and not evidence:
+    if not source_codes and not evidence:
         return None
     db.executescript('''
         DROP TABLE IF EXISTS temp.shape_outdoor_voxels;
@@ -1551,56 +1551,66 @@ def _prepare_outdoor_objects(votes, by_id, origin, voxel_size, object_cell, outl
         DROP TABLE IF EXISTS temp.shape_outdoor_evidence;
         DROP TABLE IF EXISTS temp.shape_outdoor_structure;
         DROP TABLE IF EXISTS temp.shape_tree_grid;
-        CREATE TEMP TABLE shape_outdoor_voxels(key BLOB PRIMARY KEY,object INTEGER NOT NULL) WITHOUT ROWID;
+        CREATE TEMP TABLE shape_outdoor_voxels(key BLOB NOT NULL,object INTEGER NOT NULL);
         CREATE TEMP TABLE shape_outdoor_objects(object INTEGER PRIMARY KEY,l1 REAL,l2 REAL,l3 REAL,
             min_z REAL,max_z REAL,x REAL,y REAL,z REAL,barrier INTEGER NOT NULL,structural INTEGER NOT NULL) WITHOUT ROWID;
         CREATE TEMP TABLE shape_outdoor_structure(key BLOB PRIMARY KEY) WITHOUT ROWID;
         INSERT INTO shape_outdoor_structure SELECT DISTINCT key FROM shape_structure_voxels;
     ''')
-    code_sql = ','.join('?' for _ in sorted(codes))
+    code_sql = ','.join('?' for _ in sorted(source_codes))
+    evidence_codes = tuple(sorted(evidence))
     if evidence:
-        evidence_sql = ','.join('?' for _ in sorted(evidence))
-        db.execute('CREATE TEMP TABLE shape_outdoor_evidence(key BLOB PRIMARY KEY) WITHOUT ROWID')
+        evidence_sql = ','.join('?' for _ in evidence_codes)
+        mask_sql = '+'.join(f'CASE WHEN class=? THEN {1 << index} ELSE 0 END'
+                            for index in range(len(evidence_codes)))
+        db.execute('CREATE TEMP TABLE shape_outdoor_evidence(key BLOB PRIMARY KEY,mask INTEGER NOT NULL) WITHOUT ROWID')
         db.execute(f'''INSERT INTO shape_outdoor_evidence
-                       SELECT DISTINCT key FROM votes WHERE class IN ({evidence_sql})''', tuple(sorted(evidence)))
+                       SELECT key,SUM({mask_sql}) FROM votes
+                       WHERE class IN ({evidence_sql}) GROUP BY key''',
+                   (*evidence_codes, *evidence_codes))
     where = f'd.code IN ({code_sql})'
     evidence_join = ''
     if evidence:
         where += ' OR ev.key IS NOT NULL'
         evidence_join = 'LEFT JOIN shape_outdoor_evidence ev USING(key)'
-    key_parts, cell_parts = [], []
-    cursor = db.execute(f'''SELECT g.key,g.ix,g.iy,g.iz,d.code
+    key_parts, index_parts, decision_code_parts, evidence_mask_parts, structural_parts = [], [], [], [], []
+    cursor = db.execute(f'''SELECT g.key,g.ix,g.iy,g.iz,d.code,
+                                    COALESCE(ev.mask,0),
+                                    CASE WHEN sv.key IS NULL THEN 0 ELSE 1 END
                              FROM geometry_voxels g JOIN decisions d USING(key)
                              JOIN geometry_context gc USING(key) JOIN observations o USING(key)
                              {evidence_join}
+                             LEFT JOIN shape_outdoor_structure sv USING(key)
                              WHERE gc.scene_context=1 AND o.count>=? AND ({where})
-                             ORDER BY g.key''',
-                        (int(min_observations), *sorted(codes)))
+                             ''',
+                        (int(min_observations), *sorted(source_codes)))
     while batch := cursor.fetchmany(100_000):
         checkpoint()
-        keys = _keys_from_rows(batch)
-        key_parts.append(keys)
-        cell_parts.append(_grid_coordinates(keys.view('<i8').reshape(-1, 3), origin, voxel_size, object_cell))
+        key_parts.append(_keys_from_rows(batch))
+        index_parts.append(np.asarray([row[1:4] for row in batch], np.int64))
+        decision_code_parts.append(np.fromiter((row[4] for row in batch), dtype=np.int64, count=len(batch)))
+        evidence_mask_parts.append(np.fromiter((row[5] for row in batch), dtype=np.int64, count=len(batch)))
+        structural_parts.append(np.fromiter((row[6] for row in batch), dtype=bool, count=len(batch)))
     cursor.close()
     if not key_parts:
         return None
     keys = np.concatenate(key_parts)
-    cells = np.concatenate(cell_parts)
+    indices = np.concatenate(index_parts)
+    decision_codes = np.concatenate(decision_code_parts)
+    evidence_masks = np.concatenate(evidence_mask_parts)
+    structural = np.concatenate(structural_parts)
+    cells = _grid_coordinates(indices, origin, voxel_size, object_cell)
     unique = np.unique(cells, axis=0)
     labels = _component_labels(unique)
     low, high = unique.min(axis=0), unique.max(axis=0)
     grid_keys = _linear_keys(unique, low, high-low+1)
     source_keys = _linear_keys(cells, low, high-low+1)
     objects = labels[np.searchsorted(grid_keys, source_keys)]
-    db.executemany('INSERT INTO shape_outdoor_voxels VALUES (?,?)',
-                   ((bytes(key), int(obj)) for key, obj in zip(keys, objects)))
     count = int(objects.max()+1)
     records = []
 
-    def finish(rows):
-        obj = int(rows[0][0])
-        indices = np.asarray([row[1:4] for row in rows], np.int64)
-        point = np.asarray(origin, np.float64)+(indices.astype(np.float64)+.5)*float(voxel_size)
+    def finish(obj, selected):
+        point = np.asarray(origin, np.float64)+(indices[selected].astype(np.float64)+.5)*float(voxel_size)
         center = point.mean(axis=0)
         if len(point) >= 3:
             _, _, vectors = np.linalg.svd(point-center, full_matrices=False)
@@ -1609,46 +1619,31 @@ def _prepare_outdoor_objects(votes, by_id, origin, voxel_size, object_cell, outl
             extent = np.sort(extent)[::-1]
         else:
             extent = np.zeros(3)
-        barriers = _outline_facade_cells(indices, outline)
-        structural = np.fromiter((row[4] for row in rows), dtype=bool, count=len(rows))
+        barriers = _outline_facade_cells(indices[selected], outline)
         records.append((obj, *map(float, extent), float(point[:, 2].min()), float(point[:, 2].max()),
-                        *map(float, center), int(barriers.any()), int(structural.any())))
+                        *map(float, center), int(barriers.any()), int(structural[selected].any())))
 
-    cursor = db.execute('''SELECT ov.object,g.ix,g.iy,g.iz,
-                                  CASE WHEN sv.key IS NULL THEN 0 ELSE 1 END
-                           FROM shape_outdoor_voxels ov JOIN geometry_voxels g USING(key)
-                           LEFT JOIN shape_outdoor_structure sv USING(key)
-                           ORDER BY ov.object,g.key''')
-    carry = []
-    while batch := cursor.fetchmany(100_000):
+    order, starts, stops = _label_group_bounds(objects)
+    for start, stop in zip(starts, stops):
         checkpoint()
-        rows = carry+batch
-        last, split = rows[-1][0], len(rows)
-        while split and rows[split-1][0] == last:
-            split -= 1
-        if split:
-            start = 0
-            for stop in range(1, split+1):
-                if stop == split or rows[stop][0] != rows[start][0]:
-                    finish(rows[start:stop])
-                    start = stop
-        carry = rows[split:]
-    cursor.close()
-    if carry:
-        finish(carry)
+        selected = order[start:stop]
+        finish(int(objects[selected[0]]), selected)
     db.executemany('INSERT INTO shape_outdoor_objects VALUES (?,?,?,?,?,?,?,?,?,?,?)', records)
-    db.execute('CREATE INDEX shape_outdoor_voxels_object ON shape_outdoor_voxels(object,key)')
     db.commit()
-    return {'count': count, 'codes': codes}
+    return {'count': count, 'codes': source_codes, 'keys': keys, 'objects': objects,
+            'decision_codes': decision_codes, 'evidence_codes': evidence_codes,
+            'evidence_masks': evidence_masks}
 
 
-def _outdoor_vote_shares(db, count, min_observations, checkpoint):
+def _outdoor_vote_shares(db, prepared, checkpoint):
+    count = int(prepared['count'])
+    db.executemany('INSERT INTO shape_outdoor_voxels VALUES (?,?)',
+                   ((memoryview(key), int(obj)) for key, obj in zip(prepared['keys'], prepared['objects'])))
     totals = np.zeros(count, np.float64)
     shares = {}
     cursor = db.execute('''SELECT ov.object,v.class,SUM(v.weight) FROM shape_outdoor_voxels ov
-                           JOIN votes v USING(key) JOIN observations o USING(key)
-                           WHERE o.count>=? GROUP BY ov.object,v.class ORDER BY ov.object,v.class''',
-                        (int(min_observations),))
+                           CROSS JOIN votes v WHERE v.key=ov.key
+                           GROUP BY ov.object,v.class ORDER BY ov.object,v.class''')
     rows = []
     while batch := cursor.fetchmany(100_000):
         checkpoint()
@@ -1656,10 +1651,11 @@ def _outdoor_vote_shares(db, count, min_observations, checkpoint):
     if not rows:
         return totals, shares
     objects = np.asarray([row[0] for row in rows], np.int64)
+    classes = np.asarray([row[1] for row in rows], np.int64)
     values = np.asarray([row[2] for row in rows], np.float64)
     totals += np.bincount(objects, weights=values, minlength=count)
-    for code in np.unique(np.asarray([row[1] for row in rows], np.int64)):
-        selected = np.asarray([row[1] == int(code) for row in rows])
+    for code in np.unique(classes):
+        selected = classes == int(code)
         values_by_object = np.bincount(objects[selected], weights=values[selected], minlength=count)
         shares[int(code)] = np.divide(values_by_object, totals, out=np.zeros(count), where=totals > 0)
     return totals, shares
@@ -1670,6 +1666,7 @@ def _apply_outdoor_targets(votes, targets, rule_by_object, active, immutable, mi
         return False
     db = votes.db
     db.execute('DROP TABLE IF EXISTS temp.shape_outdoor_targets')
+    db.execute('CREATE INDEX IF NOT EXISTS shape_outdoor_voxels_object ON shape_outdoor_voxels(object,key)')
     rule_names = tuple(sorted(set(rule_by_object.values())))
     rule_ids = {name: index for index, name in enumerate(rule_names)}
     db.execute('CREATE TEMP TABLE shape_outdoor_targets(object INTEGER PRIMARY KEY,target INTEGER NOT NULL,rule INTEGER NOT NULL) WITHOUT ROWID')
@@ -1838,13 +1835,26 @@ def _apply_outdoor_objects(votes, by_id, origin, voxel_size, config, outline, ac
     if prepared is None:
         return False
     db, count = votes.db, prepared['count']
-    _, shares = _outdoor_vote_shares(db, count, min_observations, checkpoint)
     rows = db.execute('SELECT object,l1,l2,l3,min_z,max_z,x,y,z,barrier,structural FROM shape_outdoor_objects ORDER BY object').fetchall()
     values = np.asarray([row[1:10] for row in rows], np.float64)
     l1, l2, l3, low, high = (values[:, index] for index in range(5))
     barrier = values[:, 8] > .5
     height = high-low
     base_z = float(db.execute('SELECT MIN(iz) FROM geometry_voxels').fetchone()[0] or 0)*float(voxel_size)
+    db.execute('DROP TABLE IF EXISTS temp.shape_outdoor_line_guard')
+    db.execute('CREATE TEMP TABLE shape_outdoor_line_guard(key BLOB PRIMARY KEY) WITHOUT ROWID')
+    line_objects = (l1 >= 3.) & (l2 <= .30)
+    line_rows = line_objects[prepared['objects']]
+    if line_rows.any():
+        line_keys = prepared['keys'][line_rows]
+        db.executemany('INSERT INTO shape_outdoor_line_guard VALUES (?)', ((memoryview(key),) for key in line_keys))
+    building = _code(by_id, 'building')
+    if building is not None and building in active and building in prepared['evidence_codes']:
+        building_mask = 1 << prepared['evidence_codes'].index(int(building))
+        if (np.all(prepared['decision_codes'] == int(building))
+                and np.all((prepared['evidence_masks'] & ~building_mask) == 0)):
+            return False
+    _, shares = _outdoor_vote_shares(db, prepared, checkpoint)
     def share(name):
         code = _code(by_id, name)
         return shares.get(code, np.zeros(count)) if code is not None else np.zeros(count)
@@ -1881,13 +1891,18 @@ def _apply_outdoor_objects(votes, by_id, origin, voxel_size, config, outline, ac
         for obj in np.flatnonzero((height >= .3) & (height <= 3.) & (l3 >= .08) & ~barrier & evidence):
             if int(obj) not in target:
                 target[int(obj)], rule[int(obj)] = int(outdoor_wall), 'outdoor_wall'
-    building = _code(by_id, 'building')
     if building is not None and building in active:
         facade_evidence = (share('building') >= min_share) | (share('wall') >= min_share)
         for obj in np.flatnonzero((height >= .3) & (height <= 3.) & barrier & facade_evidence):
             target[int(obj)], rule[int(obj)] = int(building), 'outdoor_building'
     choose(~steel_guard, 'building', 'outdoor_building')
     choose(np.ones(count, bool), 'traffic_sign', 'traffic_sign', overwrite=True)
+    target_by_object = np.full(count, -1, np.int64)
+    for obj, code in target.items():
+        target_by_object[int(obj)] = int(code)
+    selected_target = target_by_object[prepared['objects']]
+    if not np.any((selected_target >= 0) & (prepared['decision_codes'] != selected_target)):
+        return False
     return _apply_outdoor_targets(votes, target, rule, active, immutable, min_observations, checkpoint, result)
 
 
@@ -1899,9 +1914,11 @@ def _tree_stems(votes, by_id, origin, voxel_size, config, min_observations, chec
     db = votes.db
     db.executescript('''
         DROP TABLE IF EXISTS temp.shape_tree_trunk_votes;
+        DROP TABLE IF EXISTS temp.shape_tree_sources;
         CREATE TEMP TABLE shape_tree_trunk_votes(
             key BLOB PRIMARY KEY,trunk_weight REAL NOT NULL,total_weight REAL NOT NULL
         ) WITHOUT ROWID;
+        CREATE TEMP TABLE shape_tree_sources(key BLOB PRIMARY KEY) WITHOUT ROWID;
     ''')
     # Only keys carrying trunk evidence need a total-vote aggregate.  This
     # avoids grouping every exterior voxel through the votes table.
@@ -1909,25 +1926,19 @@ def _tree_stems(votes, by_id, origin, voxel_size, config, min_observations, chec
                   SELECT tv.key,tv.weight,SUM(v.weight)
                   FROM votes tv JOIN votes v USING(key)
                   WHERE tv.class=? GROUP BY tv.key''', (int(trunk),))
-    has_trunk = (db.execute('SELECT 1 FROM decisions WHERE code=? LIMIT 1', (int(trunk),)).fetchone() is not None
-                 or db.execute('SELECT 1 FROM shape_tree_trunk_votes LIMIT 1').fetchone() is not None)
-    has_tree = tree is not None and db.execute('SELECT 1 FROM votes WHERE class=? LIMIT 1',
-                                                (int(tree),)).fetchone() is not None
-    if not has_trunk and not has_tree:
-        return []
+    db.execute('INSERT OR IGNORE INTO shape_tree_sources SELECT key FROM decisions WHERE code=?', (int(trunk),))
+    db.execute('''INSERT OR IGNORE INTO shape_tree_sources
+                  SELECT key FROM shape_tree_trunk_votes WHERE trunk_weight>=.30*total_weight''')
     index_parts, context_parts = [], []
-    cursor = db.execute('''SELECT g.key,g.ix,g.iy,g.iz,d.code,gc.scene_context,
-                                  tv.trunk_weight,tv.total_weight
-                           FROM geometry_voxels g JOIN decisions d USING(key) JOIN geometry_context gc USING(key)
-                           JOIN observations o USING(key) LEFT JOIN shape_tree_trunk_votes tv USING(key)
-                           WHERE gc.scene_context IN (1,-1) AND o.count>=?
-                             AND (d.code=? OR COALESCE(tv.trunk_weight,0.)>=.30*COALESCE(tv.total_weight,0.))
-                           ORDER BY g.key''',
-                        (int(min_observations), int(trunk)))
+    cursor = db.execute('''SELECT g.ix,g.iy,g.iz,gc.scene_context
+                           FROM shape_tree_sources ts JOIN geometry_voxels g USING(key)
+                           JOIN geometry_context gc USING(key) JOIN observations o USING(key)
+                           WHERE gc.scene_context IN (1,-1) AND o.count>=?''',
+                        (int(min_observations),))
     while batch := cursor.fetchmany(100_000):
         checkpoint()
-        index_parts.append(np.asarray([row[1:4] for row in batch], np.int64))
-        context_parts.append(np.fromiter((row[5] for row in batch), dtype=np.int8, count=len(batch)))
+        index_parts.append(np.asarray([row[:3] for row in batch], np.int64))
+        context_parts.append(np.fromiter((row[3] for row in batch), dtype=np.int8, count=len(batch)))
     cursor.close()
     indices = np.concatenate(index_parts) if index_parts else np.empty((0, 3), np.int64)
     contexts = np.concatenate(context_parts) if context_parts else np.empty(0, np.int8)
@@ -2005,11 +2016,9 @@ def _apply_tree_crowns(votes, by_id, origin, voxel_size, config, active, immutab
     db = votes.db
     db.execute('DROP TABLE IF EXISTS temp.shape_tree_line_guard')
     db.execute('CREATE TEMP TABLE shape_tree_line_guard(key BLOB PRIMARY KEY) WITHOUT ROWID')
-    exists = db.execute("SELECT name FROM sqlite_temp_master WHERE type='table' AND name='shape_outdoor_objects'").fetchone()
+    exists = db.execute("SELECT name FROM sqlite_temp_master WHERE type='table' AND name='shape_outdoor_line_guard'").fetchone()
     if exists:
-        db.execute('''INSERT OR IGNORE INTO shape_tree_line_guard
-                      SELECT ov.key FROM shape_outdoor_voxels ov JOIN shape_outdoor_objects o USING(object)
-                      WHERE o.l1>=3. AND o.l2<=.30''')
+        db.execute('INSERT OR IGNORE INTO shape_tree_line_guard SELECT key FROM shape_outdoor_line_guard')
     trunk = _code(by_id, 'tree_trunk')
     for name in ('utility_pole', 'power_line', 'tree_trunk'):
         code = _code(by_id, name)
@@ -2017,55 +2026,42 @@ def _apply_tree_crowns(votes, by_id, origin, voxel_size, config, active, immutab
             db.execute('INSERT OR IGNORE INTO shape_tree_line_guard SELECT key FROM decisions WHERE code=?', (int(code),))
     radius_max, radius_min = float(config['tree_crown_radius_max']), float(config['tree_crown_radius_min'])
     max_height = float(config['tree_crown_max_height'])
-    tree_grid_size = max(1, int(np.ceil(radius_max/float(voxel_size))))
-    db.executescript('DROP TABLE IF EXISTS temp.shape_tree_grid;')
-    db.execute('''CREATE TEMP TABLE shape_tree_grid(
-                   gx INTEGER NOT NULL,gy INTEGER NOT NULL,key BLOB NOT NULL,
-                   PRIMARY KEY(gx,gy,key)
-               ) WITHOUT ROWID''')
-    # The tree grid turns one whole-store scan per stem into one sequential
-    # materialization plus bounded cell lookups.  TEMP storage is file-backed.
-    db.execute('''INSERT INTO shape_tree_grid
-                  SELECT CAST(floor(g.ix*1.0/?) AS INTEGER),CAST(floor(g.iy*1.0/?) AS INTEGER),g.key
-                  FROM geometry_voxels g JOIN geometry_context gc USING(key) JOIN observations o USING(key)
-                  LEFT JOIN shape_tree_line_guard lg USING(key)
-                  WHERE gc.scene_context IN (1,-1) AND o.count>=? AND lg.key IS NULL
-                    AND NOT EXISTS (SELECT 1 FROM shape_structure_voxels sv WHERE sv.key=g.key)''',
-               (tree_grid_size, tree_grid_size, int(min_observations)))
-    db.commit()
     selected_key_parts, radii, crowns = [], [], []
     tree_immutable = set(immutable)
     if trunk is not None:
         tree_immutable.add(int(trunk))
     hard = np.asarray(sorted(tree_immutable), np.int64)
+    cell_ratio = float(voxel_size)/float(config['geometry_cell_size'])
     for stem in stems:
         low_index = np.floor((np.asarray((stem['x']-radius_max, stem['y']-radius_max, stem['top']-.05))-np.asarray(origin))/float(voxel_size)).astype(np.int64)
         high_index = np.ceil((np.asarray((stem['x']+radius_max, stem['y']+radius_max, stem['top']+max_height))-np.asarray(origin))/float(voxel_size)).astype(np.int64)
         key_parts, index_parts, code_parts = [], [], []
-        grid_low = np.floor_divide(low_index[:2], tree_grid_size)
-        grid_high = np.floor_divide(high_index[:2], tree_grid_size)
-        for grid_x in range(int(grid_low[0]), int(grid_high[0])+1):
-            cursor = db.execute('''SELECT g.key,g.ix,g.iy,g.iz,d.code
-                                   FROM shape_tree_grid tg JOIN geometry_voxels g USING(key) JOIN decisions d USING(key)
-                                   WHERE tg.gx=? AND tg.gy BETWEEN ? AND ?
-                                     AND g.ix BETWEEN ? AND ? AND g.iy BETWEEN ? AND ? AND g.iz BETWEEN ? AND ?''',
-                                (grid_x, int(grid_low[1]), int(grid_high[1]),
-                                 int(low_index[0]), int(high_index[0]), int(low_index[1]), int(high_index[1]),
-                                 int(low_index[2]), int(high_index[2])))
-            while batch := cursor.fetchmany(100_000):
-                checkpoint()
-                key_parts.append(_keys_from_rows(batch))
-                index_parts.append(np.asarray([row[1:4] for row in batch], np.int64))
-                code_parts.append(np.fromiter((row[4] for row in batch), dtype=np.int64, count=len(batch)))
-            cursor.close()
+        low_cell = np.floor(low_index*cell_ratio).astype(np.int64)
+        high_cell = np.floor(high_index*cell_ratio).astype(np.int64)
+        cursor = db.execute('''SELECT g.key,g.ix,g.iy,g.iz,d.code
+                               FROM geometry_voxels g JOIN decisions d USING(key)
+                               JOIN geometry_context gc USING(key) JOIN observations o USING(key)
+                               LEFT JOIN shape_tree_line_guard lg USING(key)
+                               WHERE g.cx BETWEEN ? AND ? AND g.cy BETWEEN ? AND ? AND g.cz BETWEEN ? AND ?
+                                 AND g.ix BETWEEN ? AND ? AND g.iy BETWEEN ? AND ? AND g.iz BETWEEN ? AND ?
+                                 AND gc.scene_context IN (1,-1) AND o.count>=? AND lg.key IS NULL
+                                 AND NOT EXISTS (SELECT 1 FROM shape_structure_voxels sv WHERE sv.key=g.key)''',
+                            (int(low_cell[0]), int(high_cell[0]), int(low_cell[1]), int(high_cell[1]),
+                             int(low_cell[2]), int(high_cell[2]), int(low_index[0]), int(high_index[0]),
+                             int(low_index[1]), int(high_index[1]), int(low_index[2]), int(high_index[2]),
+                             int(min_observations)))
+        while batch := cursor.fetchmany(100_000):
+            checkpoint()
+            key_parts.append(_keys_from_rows(batch))
+            index_parts.append(np.asarray([row[1:4] for row in batch], np.int64))
+            code_parts.append(np.fromiter((row[4] for row in batch), dtype=np.int64, count=len(batch)))
+        cursor.close()
         if not key_parts:
             radii.append(radius_min)
             continue
         keys = np.concatenate(key_parts)
         indices = np.concatenate(index_parts)
         codes = np.concatenate(code_parts)
-        order = np.argsort(keys, kind='stable')
-        keys, indices, codes = keys[order], indices[order], codes[order]
         points = np.asarray(origin, np.float64)+(indices.astype(np.float64)+.5)*float(voxel_size)
         distance = np.linalg.norm(points[:, :2]-np.asarray((stem['x'], stem['y'])), axis=1)
         relative = points[:, 2]-stem['top']

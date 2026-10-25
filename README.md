@@ -129,20 +129,27 @@ continuously. Until enough progress is available, it displays
 4. **Determine the scene.** For each scan, SAM sky/ceiling evidence, laser
    returns, and horizontal openness from geometry alone are combined. Canopies
    and arcades resolve as **Aussen (überdacht)** (covered outdoor) and use
-   outdoor classes. Scan names
-   can provide a hint, for example Riegl folders such as `01_Aussen` or floor
-   names such as `UG1` and `1OG`; `scene_name_hint_mode` selects `prefer`,
-   `tiebreak`, or `off`, and conflicts with the data are reported as warnings.
-   Unresolved scans use nearby scans at a similar height when available;
-   otherwise all scene classes are requested for them. Independently of the
-   scan decision, each voxel takes the scene of its closest observing scanner
-   when that scanner is clearly closer (`scene_context_margin`). Door and window zones remain
-   ambiguous and retain their vote result. A consistency pass, enabled by
-   `scene_consistency`, remaps scene-specific classes to their counterpart
-   (floor to ground/sidewalk/road; ceiling/wall/door to building; building to
-   wall; ground/road/sidewalk to floor), then the best suitable alternative, or
-   class 1. Classes marked `both` remain unchanged. Manual settings take
-   precedence.
+   outdoor classes. In scan scene resolution, a preferred scan-name hint
+   (`scene_name_hint_mode: "prefer"`) ranks strictly above covered-outdoor data
+   evidence; scan names can provide a hint, for example Riegl folders such as
+   `01_Aussen` or floor names such as `UG1` and `1OG`, and conflicts with data
+   are reported as warnings. Unresolved scans use nearby scans at a similar
+   height when available; otherwise all scene classes are requested for them.
+   Independently of the scan decision, each voxel takes the scene of its closest
+   observing scanner when that scanner is clearly closer (`scene_context_margin`).
+   A 2D building outline raster provides an additional scene signal: it applies
+   only where a cell is enclosed AND covered (`scene_outline_min_cover: 0.5`),
+   while voxels in the roof band (`scene_outline_roof_band: 0.4`) retain their
+   scanner context. Unenclosed exterior cells are never forced to outdoor unless
+   the project contains at least one outdoor scan. Facade surfaces are resolved
+   per structural plane: the exterior skin becomes building, while the interior
+   skin becomes wall. Door and window zones remain ambiguous and retain their
+   vote result. A consistency pass, enabled by `scene_consistency`, remaps
+   scene-specific classes to their counterpart (floor to ground/sidewalk/road;
+   ceiling/wall/door to building; building to wall; ground/road/sidewalk to
+   floor), then the best suitable alternative, or class 1. Classes marked `both`
+   remain unchanged. Note that `reclassify` imports the resolved per-scan scene
+   classification directly from the source run. Manual settings take precedence.
 5. **Segment objects.** SAM processes the English prompts for each class. Ordinary
    class segmentation combines prompt confidence maps by taking their maximum.
    Overlapping image tiles, confidence thresholds, and a mask-boundary margin
@@ -150,53 +157,101 @@ continuously. Until enough progress is available, it displays
 6. **Project onto points and combine votes.** Projection and depth checks restrict
    label transfer to visible points. Spatial voxels collect class evidence;
    multiple views from the same scan do not count as independent scan observations.
-7. **Export original points.** Classes are transferred to the valid original
-   points. The export is read back to check point counts and class codes, plus
-   sampled coordinates and scan membership.
+   Post-processing between voting and export is described in the section below.
+7. **Export original points.** Final classes are transferred to the valid original points, not just voxel representatives. Direct class transfer expands from 3 mm per metre of scanner distance up to 5 cm (`class_transfer_radius_max`), and optional export fills populate unclassified points inside measured tree crowns and ground DTM bands. The exported LAS/LAZ file is read back to verify point counts, class codes, sampled coordinates, and scan membership.
 
-The default voxel size is **2 cm**. Voxels combine classification evidence;
-the export contains the valid original points, not just voxel representatives.
-Stairs with at least **0.65 confidence** take priority over ground, floor, and
-ceiling in conflicting observations, including observations from different scans.
-Their vote share must also reach 25%. Post-processing preserves only geometrically
-stepped stair components, retains sparse semantic surfaces when their connected
-10 cm cell component is large enough, and expands direct class transfer from
-3 mm per metre of scanner distance up to 5 cm. A zero transfer range factor
-keeps the previous fixed-radius behaviour.
+### Post-processing after voting
 
-After voxel voting, the cloud is split into geometry-connected **10 cm** feature-cell
-segments. Planar cells join when their normals differ by at most **15 degrees** and
-their plane distance is at most **3 cm**; non-planar objects form separate segments,
-and boundary cells attach to exactly one plane, so planes and objects never merge.
-SAM votes are summed per segment. At a segment share of at least **60%**,
-unclassified voxels and weakly decided voxels (own share below 60%, winner support
-at least 25%) adopt the segment class. Stairs, doors, windows, electrical objects,
-traffic signs, manholes, and class **68** are never overwritten; voxels below
-`min_observations` remain unchanged and do not contribute. This reduces patchy
-surfaces such as pillars split between wall and column, and partly unclassified
-tabletops. It takes roughly as long as voxel voting, sharing the geometry-rule
-features. Disable it with `segment_vote: false`; tune the `segment_*` thresholds
-through `reclassify` without another SAM run.
+The default voxel size is **2 cm** (`voxel_size: 0.02`). Between voxel voting and final point export, spatial voxel decisions undergo a structured, twelve-stage post-processing sequence (matching the order in `_postprocess`):
 
-Vote post-processing for small-island removal and the stair, tree, and surface
-steps is vectorized. `log.txt` records the work performed for each class.
+1. **Voxel decision** (`min_observations: 1`, `min_winning_share: 0.50`): Voxel-level votes are combined across scans. A class wins if its vote share reaches `min_winning_share` with at least `min_observations`. Stairs with at least `stairs_min_confidence` (0.65) and 25% vote share (`stairs_priority_min_share: 0.25`) take precedence over competing floor and ground observations (`stairs_priority_over: ['floor', 'ground']`). Vote families (`vote_families: [['ground', 'floor']]`) pool related classes during initial decision. Disable stair priority with `stairs_priority: false`.
+2. **Surface ties** (`surface_tie_break: true`): Resolves close votes between wall, ceiling, and floor using local surface normals when the winning share is between 0.50 and `surface_tie_share` (0.55). Surfaces steeper than 60° resolve to wall, flatter than 30° to floor or ceiling depending on elevation relative to scanner height, and intermediate slopes to ceiling. Disable with `surface_tie_break: false`.
+3. **Building enclosure (ground/floor)** (`building_enclosure: true`): Separates exterior ground from interior floors using a 2D building outline raster derived from building and wall evidence. A flood-fill from outside through openings isolates exterior terrain from enclosed rooms. Disable with `building_enclosure: false`.
+4. **Segment voting** (`segment_vote: true`): Groups voxels into geometry-connected 10 cm feature-cell segments. Planar cells join when normals differ by at most 15° (`segment_normal_angle: 15.0`) and plane distance is at most 3 cm (`segment_plane_distance: 0.03`). If a segment has a winning class with at least 60% share (`segment_min_share: 0.6`), unclassified and weakly decided voxels adopt the segment class. Protected classes (stairs, doors, windows, electrical equipment, traffic signs, manhole covers, and class 68) are never overwritten. Disable with `segment_vote: false`.
+5. **Geometry rules** (`geometry_rules: true`): Refines terrain and vegetation using 10 cm feature cells, evaluating local scatter, height distribution, and adjacency. Generates a compact terrain elevation grid (`terrain.npz`) for subsequent terrain fill. Disable with `geometry_rules: false` (or individually with `geometry_rules_outdoor_vegetation: false` and `geometry_rules_ground_floor: false`).
+6. **Stairs check** (`stairs_geometry_check: true`): Verifies stair candidates against geometric step criteria (minimum total rise 25 cm, at least 3 distinct step levels with 10–23 cm rise and 20–45 cm tread, non-planar step structure). Voxel clusters that form flat planes or fail step geometry revert to competing floor or ground classes. Disable with `stairs_geometry_check: false`.
+7. **Scene consistency** (`scene_consistency: true`): Enforces indoor/outdoor consistency per voxel based on scanner distance margins (`scene_context_margin: 0.8`) and building outline evidence (`scene_outline: true`). Remaps misplaced scene-specific classes to their opposite-scene counterparts or configured fallbacks, leaving classes valid in both scenes unchanged. Disable with `scene_consistency: false`.
+8. **Plane extraction** (RANSAC, once): Detects major structural planes (walls, floors, ceilings) across the cloud and saves them to `planes.npz`. This RANSAC extraction runs once and is shared by geometry fill and shape rules without repeated plane fitting. Automatically executed when either `geometry_fill: true` or `shape_rules: true` is enabled.
+9. **Shape rules** (`shape_rules: true`): Evaluates object candidates on a fine 4 cm grid against the measured RANSAC structure layer with its noise band envelope. Applies dedicated indoor, technical, and outdoor object rules based on dimensions, height above floor, wall distance, and mantle planarity. Disable with `shape_rules: false`.
+10. **Ground DTM band** (`ground_dtm: true`): Constructs a Delaunay TIN digital terrain model (`dtm.npz`) from the lowest exterior ground points outside buildings. Ground points deviating more than 3 cm (`ground_dtm_band: 0.03`) from the DTM take their second-best SAM class (cached in `ground_alternatives.npz`), while unclassified points within 3 cm outside buildings become ground. Disable with `ground_dtm: false`.
+11. **Small-component cleanup** (`component_cleanup: true`): Removes isolated voxel clusters below minimum size thresholds (12 voxels or 4 feature cells) to eliminate floating noise artifacts. Thin cables require a minimum span of 20 cm, and electrical equipment requires at least 6 cm. Disable with `component_cleanup: false`.
+12. **Vegetation base** (`vegetation_base_to_ground: true`): Identifies low-vegetation voxels immediately adjacent to terrain within a 4 cm vertical band (`vegetation_ground_band: 0.04`). Converts these ground-contact vegetation bases into ground (class 2) to eliminate false shrub stems right at the surface. Disable with `vegetation_base_to_ground: false`.
 
-After segment voting, shape rules keep the measured RANSAC structure layer and
-apply indoor and outdoor object rules at the original **4 cm** object grid.
-The shared building-outline raster supplies a second scene signal: proven
-enclosed cells are indoor below their local roof or ceiling, while exterior
-cells are outdoor when an outdoor scan exists. Facade bands retain their scan
-context. Outdoor rules cover curbs, free-standing walls,
-poles, signs, fences, vehicles, overhead lines, and building canopies. Tree
-crowns use a lollipop model: a recognised stem measures the 90th-percentile
-radius directly above its top and one metre higher; the larger value, clamped
-by `tree_crown_radius_min` and `tree_crown_radius_max`, recolours only
-non-structural crown voxels. The optional `tree_crown_fill: true` also fills
-otherwise unclassified export points inside the measured crown volume, without
-overwriting another class. Shape rules do not reinterpret road and sidewalk:
-their SAM and segment-voting decisions remain unchanged. In scene resolution, a preferred scan-name
-hint ranks above covered-outdoor data evidence. `scene_outline: false` disables
-the added outline signal without changing the scanner-based context.
+### Shape rules
+
+Shape rules operate after segment voting. They keep the measured RANSAC structure layer with a statistical noise band envelope (`shape_layer_sigma_factor: 2.5`, capped at `shape_layer_max_band: 0.08` to accommodate noisy SLAM scans) and apply rules on the original **4 cm** object grid (`shape_object_cell: 0.04`). Local floor and ceiling levels are determined dynamically per room zone, accommodating sloped roofs (slopes steeper than 60° count as walls, flatter slopes as ceilings). Large objects exceeding 6 m in extent (`shape_object_max_size: 6.0`) are skipped to protect whole facades or continuous surfaces. Rules only select classes for which SAM has voted in that segment or object (`shape_min_vote_share: 0.10`), with explicit exceptions confirmed by Domenic: furniture vs. household clutter, wall pilasters, flush wall items, and carpet.
+
+- **Indoor objects:**
+  - *Columns vs. pilasters:* Free-standing vertical structures with a footprint smaller than 1.5 × 1.5 m (`shape_column_max_size: 1.5`) spanning at least 70% of local room height (`shape_column_min_height_share: 0.7`) become columns (108). Vertical structures touching an adjacent wall become wall pilasters and are classified as walls (100).
+  - *Built-in cabinets:* Objects standing on the floor with front surfaces 0.3–0.7 m in front of a wall (`shape_cabinet_offset: [0.3, 0.7]`) classify as furniture (117), even when built up to the ceiling.
+  - *Beams:* Linear elements (length ≥ 1.5 m, width ≤ 0.6 m) within 0.5 m below ceilings or roof slopes classify as beams (109), explicitly including sloped rafters in attics.
+  - *Carpet:* Thin floor coverings (≤ 3 cm above floor level) classify as floor (102).
+  - *Wall items:* Elements mounted on walls that are flush within 3 cm (`shape_wall_flush_max: 0.03`) merge into wall (100); protruding items (> 3 cm) become unclassified (1), while deeper wall cabinets (depth ≥ 0.25 m, height ≥ 0.4 m) classify as furniture (117). Electrical wall fixtures (switches and outlets) are exempt from the 3 cm wall rule.
+  - *Furniture vs. household clutter:* Portable items smaller than 0.5 m (`shape_clutter_max_size: 0.5`) resting on furniture or floors classify as loose objects and household clutter (76); larger items classify as furniture (117).
+- **Technical installations:**
+  - *Pipes:* Elongated cylinders (length ≥ 0.5 m, diameter 3–60 cm, non-planar mantle < 50%) classify as pipe (111). Round ventilation ducts and sprinkler heads/pipes also classify as pipe.
+  - *HVAC:* Rectangular ventilation ducts (cross-section ≥ 15 cm, planar mantle ≥ 50%) and wall-mounted radiators (5–30 cm off wall, 5–25 cm above floor, height ≥ 30 cm, width ≥ 30 cm) classify as HVAC (114).
+  - *Cables:* Thin wires (cross-section < 3 cm) and open cable trays (width 10–60 cm, height < 15 cm mounted along walls or ceilings) classify as cable (112).
+  - *Ceiling equipment:* Fixtures suspended within 1.0 m (`shape_ceiling_equipment_max_drop: 1.0`) below ceilings, including ceiling lamps and smoke detectors, classify as ceiling equipment (116).
+  - *Sanitary fixtures:* Sinks, toilets, bathtubs, bidets, urinals, glass shower partitions, and vanity under-cabinets classify as sanitary fixtures (63).
+  - *Railings:* Barriers with handrails at 0.85–1.1 m height, explicitly including glass railings, classify as railing (107). Steel structures and scaffolding remain steel structures (110).
+- **Outdoor objects:**
+  - *Curbs:* Narrow steps (5–20 cm elevation step, width ≤ 0.35 m) between roads and sidewalks classify as curbs (74).
+  - *Outdoor walls:* Free-standing garden, retaining, and boundary walls not part of a building classify as outdoor walls (78); building plinths stay with building (6).
+  - *Utility poles:* Slender vertical structures (height ≥ 3 m, cross-section ≤ 0.5 m) classify as utility poles (84).
+  - *Traffic signs:* Sign plates and their supporting posts together classify as traffic signs (81).
+  - *Fences:* Linear outdoor barriers (height 0.8–2.0 m, length ≥ 2.0 m, thickness ≤ 0.3 m) classify as fences (77).
+  - *Vehicles:* Cars, vans, trucks, as well as bicycles, motorcycles, scooters, and trailers classify as vehicles (91).
+  - *Overhead lines:* Thin elevated spans (length ≥ 3 m, height ≥ 4 m above lowest ground) without immediate vertical supports classify as power lines (14).
+  - *Canopies and carports:* Covered outdoor roof structures classify as building (6), unless identified as a visible steel structure (110).
+  - *Road vs. sidewalk:* Decided strictly by SAM 3 votes and segment voting; shape rules perform no geometric reinterpretation between roads (11) and sidewalks (73).
+
+### Trees
+
+Tree crowns are reconstructed using a geometric lollipop model:
+- **Stem detection:** Tree stems are identified from classification decisions (tree_trunk 95), vote evidence (trunk weight ≥ 30% of total votes), or geometric shape fitting (vertical cylinders with diameter 0.1–1.5 m and height ≥ 0.8 m below tall vegetation evidence).
+- **Two-slice crown radius:** The crown radius is measured dynamically per tree in two horizontal slices: one directly above the top of the trunk and a second slice 1.0 m higher. The 90th percentile radial distance of points in each slice is measured, the larger radius wins, and the value is clamped between `tree_crown_radius_min` (default 1.0 m) and `tree_crown_radius_max` (default 8.0 m).
+- **Crown voxel recoloring:** All voxels above the trunk top within the vertical crown cylinder up to `tree_crown_max_height` (default 25 m) are assigned to tall vegetation (class 5). Large RANSAC planes (building facades, roofs, ground), straight linear structures (utility poles, overhead lines), and protected classes (stairs 105, reflection 68) are never overwritten.
+- **Tree trunks protected:** Tree trunks (class 95) are immutable and are never overwritten by crown expansion or fill rules.
+- **Crown interior fill (`tree_crown_fill: true`):** Identified crown cylinders are saved to `tree_crowns.npz`. During point export, previously unclassified points located inside the measured crown volume adopt class 5 without overwriting any already classified point.
+
+### Ground from a TIN DTM
+
+Exterior ground points are validated and completed against a Triangulated Irregular Network Digital Terrain Model (TIN DTM):
+- **DTM generation:** The lowest exterior ground-family points (ground 2, road 11, sidewalk 73, curb 74, manhole 75) outside building outlines and excluding reflection points (class 68) are aggregated into 2D cells (`dtm_cell_size: 0.5` m) using a robust 10th-percentile height, filtered by slope (`terrain_max_slope: 0.75`), and triangulated via 2D Delaunay triangulation into `dtm.npz`.
+- **Height band check (`ground_dtm_band: 0.03`, 3 cm):**
+  - Ground points (class 2) deviating more than 3 cm from the DTM surface are demoted to their second-best SAM vote class (e.g. low vegetation in bushes or indoor floor visible through windows); if no other vote exists, they become unclassified (class 1). Runner-up classes are cached in `ground_alternatives.npz`.
+  - Unclassified points outside buildings located within 3 cm of the DTM surface are promoted to ground (class 2).
+- **Exempt classes:** Low vegetation (lawn 3), paved surfaces (roads 11, sidewalks 73, curbs 74, manholes 75), stairs (105), tree trunks (95), and reflections (68) are protected and untouched by DTM adjustments.
+- **Voxel and point application:** Applied to spatial voxels during post-processing and re-evaluated per point during LAS/LAZ export. When enabled (`ground_dtm: true`), it replaces the legacy 15 cm terrain fill.
+
+### Post-processing settings
+
+The following table summarizes the primary post-processing parameters and their default values (from `e57cls/pipeline/config.py`):
+
+| Setting | Default | Description |
+|---|---|---|
+| `segment_vote` | `true` | Enable geometry-connected segment voting |
+| `segment_min_share` | `0.6` | Minimum segment vote share to reclassify unclassified or weak voxels |
+| `segment_protected_classes` | `["stairs", "door", "window", "electrical", "traffic_sign", "manhole"]` | Classes never overwritten by segment voting |
+| `shape_rules` | `true` | Enable indoor, technical, and outdoor shape rules |
+| `shape_min_vote_share` | `0.10` | Minimum SAM vote share required for an object to adopt a shape-rule class |
+| `shape_object_cell` | `0.04` | Grid resolution (4 cm) for clustering object candidate components |
+| `shape_column_max_size` | `1.5` | Maximum horizontal cross-section (1.5 m) for free-standing columns |
+| `shape_wall_flush_max` | `0.03` | Maximum protrusion (3 cm) for flush wall-mounted items |
+| `shape_layer_max_band` | `0.08` | Upper bound (8 cm) for the RANSAC structure layer noise envelope |
+| `shape_object_max_size` | `6.0` | Maximum extent (6 m) above which objects are skipped by shape rules |
+| `scene_outline` | `true` | Use 2D building outline as an additional per-voxel scene context signal |
+| `scene_outline_min_cover` | `0.5` | Minimum overhead structural cover (0.5 m) required for indoor enclosure |
+| `scene_outline_roof_band` | `0.4` | Height band (0.4 m) around roof structures keeping scanner-derived context |
+| `ground_dtm` | `true` | Enable TIN DTM generation and elevation band validation for ground points |
+| `ground_dtm_band` | `0.03` | Elevation tolerance band (3 cm) around the DTM surface |
+| `dtm_cell_size` | `0.5` | 2D cell grid size (0.5 m) for aggregating DTM ground candidate heights |
+| `tree_crown_radius_min` | `1.0` | Minimum allowed tree crown radius (1.0 m) |
+| `tree_crown_radius_max` | `8.0` | Maximum allowed tree crown radius (8.0 m) |
+| `tree_crown_fill` | `true` | Fill unclassified export points within detected tree crown volumes |
+
+All of these parameters can be adjusted via reclassify overrides using their respective configuration prefixes (`segment_`, `shape_`, `scene_`, `ground_dtm`, `dtm_`, `tree_crown_`) without requiring a new SAM segmentation run.
 
 Raw masks are cached. Changing prompts recomputes the affected classes. Changes
 to voting thresholds can reuse existing raw masks. If GPU memory runs out, the
@@ -324,7 +379,7 @@ The following directory is created automatically beside the selected E57 file:
 ProjectFolder/
 ├── scan.e57
 └── klassifiziert/
-    └── <Scanname>_YYYYMMDD_HHMMSS/
+    └── <scan name>_<YYYYMMDD_HHMMSS>/
         ├── scan_classified.las       # or .laz
         ├── scan_classified_no_reflection.las   # optional copy without class 68
         ├── report.html / report.json
@@ -340,6 +395,16 @@ ProjectFolder/
         └── diagnostics/
             └── reflections/         # masks, overlays, and plane details
 ```
+
+During execution and reclassification, durable intermediate post-processing artifacts
+are created in the run or reclassify cache (`.cache/votes/<identity>/` or
+`<run>/reclassify_cache/`):
+
+- `planes.npz`: Extracted RANSAC structural planes (walls, floors, ceilings) reused across geometry fill and shape rules.
+- `terrain.npz`: 2D elevation grid of terrain features created by geometry rules for raster-based terrain fill.
+- `dtm.npz`: Triangulated Irregular Network Digital Terrain Model (TIN DTM) built from lowest exterior ground points.
+- `ground_alternatives.npz`: Second-best SAM candidate classes and confidences for ground points deviating off the DTM surface, applied during point export.
+- `tree_crowns.npz`: Geometric parameters (x, y, radius, z_min, z_max) of recognized tree crowns used to fill unclassified points inside crowns at export.
 
 The input E57 is not modified. LAS/LAZ 1.4 contains valid original points,
 available RGB colors, classes, and the scan ID as `Point Source ID`. The extra
@@ -426,15 +491,12 @@ in der Override-Datei sind zulässig; der ursprüngliche Vote-Cache bleibt erhal
 .cache\venv\Scripts\python.exe -m e57cls reclassify --from "D:\Data\Project\klassifiziert\<Scanname>_..." --out "D:\Data\Project\klassifiziert\run_tuned" --config overrides.json
 ```
 
-The retained post-processing controls include `geometry_rules`, `vote_families`,
-the `terrain_*`/`tree_*` thresholds, and the `segment_*` controls. Geometry rules
-create a compact terrain artifact for the run. Its optional output-only terrain
-fill assigns class 2 to an otherwise unclassified point only when uncovered DTM
-evidence supports it.
-Reclassify overrides also include `scene_consistency`, `scene_context_*`,
-`scene_outline` and `scene_outline_*`, `scene_name_*`, `scene_neighbour_*`, `scene_openness_*`,
-`segment_*`, `shape_*`, `tree_crown_*` (including `tree_crown_fill`), and
-`scene_outline` settings.
+Reclassify overrides allow adjusting post-processing parameters without repeating
+the SAM segmentation run. Supported override parameters include the `segment_*`,
+`shape_*`, `scene_*`, `ground_dtm`, `dtm_*`, `tree_crown_*` (including
+`tree_crown_fill`), `geometry_rules`, `geometry_fill*`, `stairs_*`,
+`surface_tie_*`, `component_*`, `cable_*`, `electrical_*`, and `vegetation_*`
+controls.
 
 Das folgende Prüfwerkzeug vergleicht die Szenen pro Scan mit den Scan-Namen,
 getrennt für Endergebnis und reine Datenerkennung, und zeigt Kennzahlen pro
@@ -484,6 +546,13 @@ around **773 million points**) has been processed. Before the indoor/outdoor
 package, 140 of its 157 scans were assigned correctly. The improvement from the
 indoor/outdoor package has so far been verified only with synthetic tests; an
 evaluation run on this dataset is still pending.
+
+Shape rules and the TIN DTM have been tuned on **HSLU_Trakt_4** (static TLS) and
+**Loris_home** (mobile SLAM). Noisy SLAM wall surfaces dynamically widen the RANSAC
+structure noise envelope up to 8 cm (`shape_layer_max_band`). Runtime of
+post-processing on large datasets (~50 million voxels) currently takes tens of
+minutes and is actively being optimized. Memory during LAS/LAZ export peaks around
+45 GB on large projects such as HSLU (773 million points).
 
 SAM can miss objects, produce overly broad masks, or confuse classes. The latest
 prompt additions have been checked for consistency; improved recognition accuracy

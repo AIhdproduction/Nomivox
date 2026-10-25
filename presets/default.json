@@ -166,7 +166,11 @@
         "van",
         "truck",
         "automobile",
-        "motor vehicle"
+        "motor vehicle",
+        "bicycle",
+        "motorcycle",
+        "scooter",
+        "trailer"
       ],
       "min_instance_conf": null,
       "min_mask_conf": null
@@ -243,6 +247,27 @@
         "site fence",
         "wire fence",
         "outdoor guardrail"
+      ],
+      "min_instance_conf": null,
+      "min_mask_conf": null
+    },
+    {
+      "id": "outdoor_wall",
+      "name_de": "Mauern aussen",
+      "name_en": "Outdoor walls",
+      "code": 78,
+      "color": "#A1887F",
+      "scene": "outdoor",
+      "enabled": true,
+      "prompts": [
+        "garden wall",
+        "retaining wall",
+        "stone wall",
+        "boundary wall",
+        "low wall",
+        "brick garden wall",
+        "concrete retaining wall",
+        "dry stone wall"
       ],
       "min_instance_conf": null,
       "min_mask_conf": null

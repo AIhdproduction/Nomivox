@@ -36,7 +36,7 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "class_transfer_radius_max": .05,
             "depth_gate_classes": ["door"], "door_depth_limit": 1.0,
             "door_max_width": 1.4, "door_max_height": 2.6,
-            "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "floor", "ground", "road", "sidewalk"],
+            "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "building", "floor", "ground", "road", "sidewalk"],
             "geometry_fill_min_area": .5, "geometry_fill_max_gap": .35, "geometry_fill_tolerance": .02,
             "geometry_fill_max_planes": 400, "geometry_fill_min_component_voxels": 20,
             "geometry_fill_ransac_trials": 256, "geometry_fill_ransac_max_trials": 1024,
@@ -45,17 +45,35 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "segment_plane_distance": .03, "segment_min_cells": 3, "segment_min_share": .6,
             "segment_weak_share": .6, "segment_fill_min_support": 0., "segment_flip_min_support": .25,
             "segment_protected_classes": ["stairs", "door", "window", "electrical", "traffic_sign", "manhole"],
+            "shape_rules": True, "shape_min_vote_share": .10, "shape_object_cell": .04, "shape_level_cell": .5,
+            "shape_level_min_area": .5, "shape_level_search": 2.,
+            "shape_structural_width": 1.5, "shape_structural_area": 2.,
+            "shape_object_max_size": 6.,
+            "shape_carpet_max_height": .03, "shape_column_max_size": 1.5,
+            "shape_column_min_height_share": .7, "shape_cabinet_offset": [.3, .7],
+            "shape_beam_min_length": 1.5, "shape_beam_max_width": .6,
+            "shape_beam_ceiling_gap": .5, "shape_wall_flush_max": .03,
+            "shape_layer_sigma_factor": 2.5, "shape_layer_max_band": .08,
+            "shape_wall_cabinet_min_depth": .25, "shape_clutter_max_size": .5,
+            "shape_pipe_min_length": .5, "shape_pipe_min_diameter": .03,
+            "shape_pipe_max_diameter": .6, "shape_duct_min_length": 1.,
+            "shape_duct_min_cross_section": .15, "shape_tech_planar_fraction": .45,
+            "shape_radiator_min_width": .3, "shape_railing_min_length": 1.,
+            "shape_ceiling_equipment_max_drop": 1.,
             "geometry_rules_outdoor_vegetation": True, "geometry_rules_ground_floor": True,
-            "scene_context_margin": .8, "scene_consistency": True,
+            "scene_context_margin": .8, "scene_outline": True, "scene_outline_min_cover": .5,
+            "scene_outline_roof_band": .4, "scene_consistency": True,
             "scene_consistency_fallbacks": {"floor": ["ground", "sidewalk", "road"], "ceiling": ["building"],
                 "wall": ["building"], "door": ["building"], "railing": ["fence"], "ground": ["floor"],
                 "road": ["floor"], "sidewalk": ["floor"], "curb": ["floor"], "manhole": ["floor"],
-                "building": ["wall"], "fence": ["railing"]},
+                "building": ["wall"], "fence": ["railing"], "outdoor_wall": ["wall"]},
             "geometry_halo": 1.5, "geometry_knn": 24, "geometry_knn_radius": 1.,
             "terrain_cell_size": .5, "terrain_max_gap": 5., "terrain_max_slope": .75,
             "terrain_ground_tolerance": .15, "terrain_fill": True,
             "terrain_cover_min_height": 1.8, "terrain_cover_max_height": 6.,
-            "tree_crown_radius": 4., "tree_crown_max_height": 25.,
+            "ground_dtm": True, "ground_dtm_band": .03, "dtm_cell_size": .5,
+            "tree_crown_radius": 4., "tree_crown_radius_min": 1., "tree_crown_radius_max": 8.,
+            "tree_crown_max_height": 25., "tree_crown_fill": True,
             "tree_crown_grow_radius": 6.,
             "vegetation_base_to_ground": True, "vegetation_ground_cell_size": .10,
             "vegetation_ground_band": .04,
@@ -99,6 +117,12 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "mirror_shape_min_iou": .75, "mirror_shape_max_growth": 1.35, "mirror_edge_search": .10}
 
 
+def _output_scan_name(source: Path) -> str:
+    name = re.sub(r"[^\w.-]", "_", source.stem, flags=re.UNICODE)
+    name = re.sub(r"_+", "_", name).strip("._ ")[:80].strip("._ ")
+    return name or "scan"
+
+
 def resolve_config(config: dict, base: Path = PROJECT):
     value = {**DEFAULTS, **config}
     source = Path(value["source"])
@@ -110,7 +134,7 @@ def resolve_config(config: dict, base: Path = PROJECT):
     if not model.exists():
         model = PROJECT/"models/sam3.pt"
     defaults = {"cache": PROJECT/".cache", "model": model, "preset": PROJECT/"presets/default.json",
-                "output": source.parent/"klassifiziert"/f"run_{datetime.now():%Y%m%d_%H%M%S}"}
+                "output": source.parent/"klassifiziert"/f"{_output_scan_name(source)}_{datetime.now():%Y%m%d_%H%M%S}"}
     for key, default in defaults.items():
         path = Path(value.get(key, default))
         value[key] = str((base/path).resolve() if not path.is_absolute() else path.resolve())
@@ -265,9 +289,12 @@ def resolve_config(config: dict, base: Path = PROJECT):
     if (not isinstance(value['component_cleanup'], bool) or not isinstance(value['surface_tie_break'], bool)
             or not isinstance(value['geometry_fill'], bool) or not isinstance(value['stairs_geometry_check'], bool)
             or not isinstance(value['mirror_shape_regularize'], bool) or not isinstance(value['geometry_rules'], bool)
-            or not isinstance(value['segment_vote'], bool)
+            or not isinstance(value['segment_vote'], bool) or not isinstance(value['shape_rules'], bool)
+            or not isinstance(value['scene_outline'], bool)
             or not isinstance(value['geometry_rules_outdoor_vegetation'], bool)
             or not isinstance(value['geometry_rules_ground_floor'], bool) or not isinstance(value['terrain_fill'], bool)
+            or not isinstance(value['tree_crown_fill'], bool)
+            or not isinstance(value['ground_dtm'], bool)
             or not isinstance(value['scene_consistency'], bool)):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels', 'component_min_cells', 'component_sparse_max_voxels_per_cell', 'cable_component_min_voxels',
@@ -279,25 +306,48 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
                 'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_cell_size', 'geometry_tile_size',
                 'segment_plane_distance',
+                'shape_object_cell', 'shape_level_cell', 'shape_level_min_area', 'shape_level_search', 'shape_structural_width',
+                'shape_structural_area', 'shape_object_max_size', 'shape_carpet_max_height', 'shape_column_max_size',
+                'shape_column_min_height_share', 'shape_beam_min_length', 'shape_beam_max_width',
+                'shape_beam_ceiling_gap', 'shape_wall_flush_max', 'shape_layer_sigma_factor', 'shape_layer_max_band',
+                'shape_wall_cabinet_min_depth',
+                'shape_clutter_max_size', 'shape_pipe_min_length', 'shape_pipe_min_diameter',
+                'shape_pipe_max_diameter', 'shape_duct_min_length', 'shape_duct_min_cross_section',
+                'shape_radiator_min_width', 'shape_railing_min_length', 'shape_ceiling_equipment_max_drop',
                 'geometry_halo', 'geometry_knn_radius', 'terrain_cell_size', 'terrain_max_gap', 'terrain_max_slope',
                 'terrain_ground_tolerance', 'terrain_cover_min_height', 'terrain_cover_max_height',
-                'tree_crown_radius', 'tree_crown_max_height', 'tree_crown_grow_radius'):
+                'dtm_cell_size', 'ground_dtm_band',
+                'tree_crown_radius', 'tree_crown_radius_min', 'tree_crown_radius_max', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    for key in ('scene_outline_min_cover', 'scene_outline_roof_band'):
+        if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
+                or not 0 <= value[key] < float('inf')):
+            raise ValueError(f'Invalid {key}')
     for key in ('segment_min_planarity', 'segment_min_share', 'segment_weak_share',
-                'segment_fill_min_support', 'segment_flip_min_support'):
+                'segment_fill_min_support', 'segment_flip_min_support', 'shape_min_vote_share',
+                'shape_tech_planar_fraction'):
         if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
                 or not 0 <= value[key] <= 1):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['shape_object_cell'], (int, float)) or isinstance(value['shape_object_cell'], bool)
+            or not .02 <= value['shape_object_cell'] <= .2):
+        raise ValueError('Invalid shape object cell')
     if (not isinstance(value['segment_normal_angle'], (int, float)) or isinstance(value['segment_normal_angle'], bool)
             or not 0 <= value['segment_normal_angle'] <= 180):
         raise ValueError('Invalid segment normal angle')
+    if (not isinstance(value['shape_cabinet_offset'], list) or len(value['shape_cabinet_offset']) != 2
+            or any(not isinstance(item, (int, float)) or isinstance(item, bool) for item in value['shape_cabinet_offset'])
+            or not 0 < value['shape_cabinet_offset'][0] <= value['shape_cabinet_offset'][1]):
+        raise ValueError('Invalid shape cabinet offset')
     if (not isinstance(value['segment_protected_classes'], list)
             or not all(isinstance(item, str) for item in value['segment_protected_classes'])):
         raise ValueError('Invalid segment protected classes')
     if (not isinstance(value['scene_context_margin'], (int, float)) or isinstance(value['scene_context_margin'], bool)
             or not 0 < value['scene_context_margin'] <= 1):
         raise ValueError('Invalid scene context margin')
+    if value['tree_crown_radius_min'] > value['tree_crown_radius_max']:
+        raise ValueError('Invalid tree crown radius range')
     if (not isinstance(value['scene_consistency_fallbacks'], dict)
             or any(not isinstance(name, str) or not isinstance(items, list)
                    or not all(isinstance(item, str) for item in items)

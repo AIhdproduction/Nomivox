@@ -18,7 +18,7 @@ to run the classifier.
 
 - Process E57 files containing multiple scan positions and associated embedded images.
 - Select indoor and outdoor classes automatically or use manual scene settings.
-- Use 35 object classes with 256 English search prompts, and edit or add classes.
+- Use 36 object classes with 268 English search prompts, and edit or add classes.
 - Combine spatial evidence from multiple scan positions, prioritizing confidently detected stairs over floors and ceilings.
 - Detect mirrors and window glass, assigning class 68 to points behind their estimated surfaces within the corresponding image masks.
 - Export valid original points with coordinates, available RGB colors, and scan membership.
@@ -181,6 +181,23 @@ through `reclassify` without another SAM run.
 Vote post-processing for small-island removal and the stair, tree, and surface
 steps is vectorized. `log.txt` records the work performed for each class.
 
+After segment voting, shape rules keep the measured RANSAC structure layer and
+apply indoor and outdoor object rules at the original **4 cm** object grid.
+The shared building-outline raster supplies a second scene signal: proven
+enclosed cells are indoor below their local roof or ceiling, while exterior
+cells are outdoor when an outdoor scan exists. Facade bands retain their scan
+context. Outdoor rules cover curbs, free-standing walls,
+poles, signs, fences, vehicles, overhead lines, and building canopies. Tree
+crowns use a lollipop model: a recognised stem measures the 90th-percentile
+radius directly above its top and one metre higher; the larger value, clamped
+by `tree_crown_radius_min` and `tree_crown_radius_max`, recolours only
+non-structural crown voxels. The optional `tree_crown_fill: true` also fills
+otherwise unclassified export points inside the measured crown volume, without
+overwriting another class. Shape rules do not reinterpret road and sidewalk:
+their SAM and segment-voting decisions remain unchanged. In scene resolution, a preferred scan-name
+hint ranks above covered-outdoor data evidence. `scene_outline: false` disables
+the added outline signal without changing the scanner-based context.
+
 Raw masks are cached. Changing prompts recomputes the affected classes. Changes
 to voting thresholds can reuse existing raw masks. If GPU memory runs out, the
 application attempts smaller prompt batches or image tiles and logs the changes.
@@ -236,6 +253,10 @@ Kitchen and household appliances (118) covers stoves, cooktops, ovens,
 dishwashers, range hoods, washing machines, clothes dryers, and microwave ovens;
 refrigerators stay with furniture (117); televisions are not part of class 118.
 
+Outdoor walls (78) covers free-standing garden, retaining and boundary walls;
+building plinths stay with buildings (6). Vehicles (91) include bicycles,
+motorcycles, scooters and trailers.
+
 Additional prompts broaden the search but do not guarantee higher accuracy and
 can increase processing time. Prefer specific terms; duplicate prompts in
 competing classes are flagged during preset validation. The `auxiliary` section
@@ -267,6 +288,7 @@ mapping that uses one.
 | 75 | Manhole covers | Outdoor |
 | 76 | Loose objects, household clutter, and materials | Indoor and outdoor |
 | 77 | Fences and outdoor guardrails | Outdoor |
+| 78 | Outdoor walls | Outdoor |
 | 81 | Traffic signs | Outdoor |
 | 84 | Utility poles and streetlights | Outdoor |
 | 91 | Vehicles | Outdoor |
@@ -302,7 +324,7 @@ The following directory is created automatically beside the selected E57 file:
 ProjectFolder/
 ├── scan.e57
 └── klassifiziert/
-    └── run_YYYYMMDD_HHMMSS/
+    └── <Scanname>_YYYYMMDD_HHMMSS/
         ├── scan_classified.las       # or .laz
         ├── scan_classified_no_reflection.las   # optional copy without class 68
         ├── report.html / report.json
@@ -393,7 +415,7 @@ Für einen abgeschlossenen Lauf erzeugt der folgende Befehl einen Qualitätsberi
 in `quality/` mit `quality.json`, deutschen Draufsichten und einer HTML-Übersicht:
 
 ```powershell
-.cache\venv\Scripts\python.exe -m e57cls quality "D:\Data\Project\klassifiziert\run_..." --step 40
+.cache\venv\Scripts\python.exe -m e57cls quality "D:\Data\Project\klassifiziert\<Scanname>_..." --step 40
 ```
 
 Mit `cache_cleanup: "keep_all"` kann die gespeicherte Abstimmung ohne erneute
@@ -401,7 +423,7 @@ Bildsegmentierung nachklassifiziert werden. Nur Nachbearbeitungs- und Exportwert
 in der Override-Datei sind zulässig; der ursprüngliche Vote-Cache bleibt erhalten.
 
 ```powershell
-.cache\venv\Scripts\python.exe -m e57cls reclassify --from "D:\Data\Project\klassifiziert\run_..." --out "D:\Data\Project\klassifiziert\run_tuned" --config overrides.json
+.cache\venv\Scripts\python.exe -m e57cls reclassify --from "D:\Data\Project\klassifiziert\<Scanname>_..." --out "D:\Data\Project\klassifiziert\run_tuned" --config overrides.json
 ```
 
 The retained post-processing controls include `geometry_rules`, `vote_families`,
@@ -410,7 +432,9 @@ create a compact terrain artifact for the run. Its optional output-only terrain
 fill assigns class 2 to an otherwise unclassified point only when uncovered DTM
 evidence supports it.
 Reclassify overrides also include `scene_consistency`, `scene_context_*`,
-`scene_name_*`, `scene_neighbour_*`, and `scene_openness_*`.
+`scene_outline` and `scene_outline_*`, `scene_name_*`, `scene_neighbour_*`, `scene_openness_*`,
+`segment_*`, `shape_*`, `tree_crown_*` (including `tree_crown_fill`), and
+`scene_outline` settings.
 
 Das folgende Prüfwerkzeug vergleicht die Szenen pro Scan mit den Scan-Namen,
 getrennt für Endergebnis und reine Datenerkennung, und zeigt Kennzahlen pro
@@ -420,7 +444,7 @@ Für Nachjustieren ohne SAM muss der Ursprungslauf `cache_cleanup: "keep_all"`
 verwenden.
 
 ```powershell
-.cache\venv\Scripts\python.exe -m e57cls.tools.scene_eval "D:\Data\Project\klassifiziert\run_..." [--grid]
+.cache\venv\Scripts\python.exe -m e57cls.tools.scene_eval "D:\Data\Project\klassifiziert\<Scanname>_..." [--grid]
 ```
 
 Without an explicit `output` value, the CLI creates a new run folder beside the

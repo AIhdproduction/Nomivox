@@ -152,7 +152,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
            progress, mirror, density, without_reflections, class_transfer_radius, geometry_planes, geometry_fill_tolerance,
            terrain, terrain_ground_tolerance, terrain_fill,
            station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None,
-           class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None):
+           class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
+           tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
     source_file = lib.ImageFile(str(source), "r")
     image = lib.ImageFile(str(path), "w")
     total = sum(selected_count(store, density) for store in stores)
@@ -166,7 +167,9 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
         with ClassifiedSource(path.parent, stores, votes, origin, voxel_size, skipped, mirror, class_transfer_radius, checkpoint,
                               geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
                               progress, force_unclassified, terrain_outdoor_scans, class_transfer_range_factor,
-                              class_transfer_radius_max, transfer_station_positions) as classified:
+                              class_transfer_radius_max, transfer_station_positions, tree_crowns, tree_fill,
+                              ground_dtm=ground_dtm, ground_dtm_alternatives=ground_dtm_alternatives,
+                              ground_dtm_band=ground_dtm_band) as classified:
           for store in stores:
             prototypes = store.meta["metadata"]["points"]["fields"]
             fields = {name: prototypes.get(name, {"type": "Float"}) for name in store.meta["arrays"]
@@ -255,7 +258,8 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
               output_density="reduced", geometry_planes=None, geometry_fill_tolerance=.02,
               terrain=None, terrain_ground_tolerance=.15, terrain_fill=False,
               station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None,
-              class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None):
+              class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
+              tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
     """Write an E57 atomically, retaining images and Nomivox extension fields."""
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -265,7 +269,9 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
                         progress, mirror, output_density, primary_without_reflections, class_transfer_radius,
                         geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
                         station_ids, station_count, force_unclassified, terrain_outdoor_scans,
-                        class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions)
+                        class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions,
+                        tree_crowns, tree_fill, ground_dtm=ground_dtm,
+                        ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band)
         started = time.perf_counter()
         result["readback"] = verify_e57(temporary, source, stores, result["record_count"], allowed_codes,
                                           primary_without_reflections, result.pop("_samples"))
@@ -278,7 +284,9 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
                                   progress, mirror, output_density, True, class_transfer_radius,
                                   geometry_planes, geometry_fill_tolerance, terrain, terrain_ground_tolerance, terrain_fill,
                                   station_ids, station_count, force_unclassified, terrain_outdoor_scans,
-                                  class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions)
+                                  class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions,
+                                  tree_crowns, tree_fill, ground_dtm=ground_dtm,
+                                  ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band)
             started = time.perf_counter()
             verify_e57(extra_temporary, source, stores, extra_result["record_count"], allowed_codes, True,
                        extra_result.pop("_samples"))

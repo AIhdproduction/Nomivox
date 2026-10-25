@@ -36,6 +36,8 @@ def test_preset_validation_and_code_map():
     assert validate_preset(p) == ([], ['reserved_las_code:sanitary_fixtures:63'])
     appliances = next(item for item in p['classes'] if item['id'] == 'appliances')
     furniture = next(item for item in p['classes'] if item['id'] == 'furniture')
+    outdoor_wall = next(item for item in p['classes'] if item['id'] == 'outdoor_wall')
+    vehicle = next(item for item in p['classes'] if item['id'] == 'vehicle')
     assert appliances['code'] == 118
     assert appliances['scene'] == 'indoor'
     assert appliances['prompts'] == [
@@ -43,6 +45,13 @@ def test_preset_validation_and_code_map():
         'washing machine', 'clothes dryer', 'microwave oven',
     ]
     assert {'refrigerator', 'fridge'} <= set(furniture['prompts'])
+    assert outdoor_wall['code'] == 78
+    assert outdoor_wall['scene'] == 'outdoor'
+    assert outdoor_wall['prompts'] == [
+        'garden wall', 'retaining wall', 'stone wall', 'boundary wall', 'low wall',
+        'brick garden wall', 'concrete retaining wall', 'dry stone wall',
+    ]
+    assert {'bicycle', 'motorcycle', 'scooter', 'trailer'} <= set(vehicle['prompts'])
     p['classes'][1]['prompts'].append(p['classes'][0]['prompts'][0])
     assert any(e.startswith('prompt_conflict') for e in validate_preset(p)[0])
     p['code_map'] = {'1': 0}
@@ -72,6 +81,15 @@ def test_builtin_codes_are_reserved_for_custom_classes_and_old_presets():
     assert validate_preset(old_preset) == ([], ['reserved_las_code:sanitary_fixtures:63'])
 
 
+def test_outdoor_wall_code_is_reserved_for_custom_classes():
+    p = json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
+    p['classes'].append(dict(id='custom_outdoor_wall', name_de='Custom outdoor wall',
+                              name_en='Custom outdoor wall', code=78, color='#123456',
+                              scene='both', enabled=True, prompts=['custom masonry'],
+                              min_instance_conf=None, min_mask_conf=None))
+    assert 'reserved_builtin_code:custom_outdoor_wall' in validate_preset(p)[0]
+
+
 def test_added_classes_are_scene_scoped_and_have_english_prompts():
     from e57cls.pipeline.run import select_classes
     p=json.loads(Path('presets/default.json').read_text(encoding='utf-8'))
@@ -80,6 +98,7 @@ def test_added_classes_are_scene_scoped_and_have_english_prompts():
     assert 63 in indoor and 63 not in outdoor
     assert {'toilet','bathtub','washbasin'} <= set(indoor[63]['prompts'])
     assert 75 in outdoor and 75 not in indoor and 'manhole cover' in outdoor[75]['prompts']
+    assert 78 in outdoor and 78 not in indoor
     assert 95 in outdoor and 95 not in indoor and 'tree trunk' in outdoor[95]['prompts']
     assert 105 in outdoor and 105 in indoor and outdoor[105]['scene'] == 'both'
     assert 'tree trunk' not in outdoor[5]['prompts']
@@ -110,6 +129,17 @@ def test_scene_name_hints_and_resolution():
     assert resolved['scene'] == 'outdoor' and resolved['source'] == 'name' and resolved['conflict']
     assert resolve_scan_scene({'scene': 'covered_outdoor', 'metrics': {}}, {}, DEFAULTS)['class_mode'] == 'outdoor'
     assert resolve_scan_scene({'scene': 'unsure', 'metrics': {}}, {}, DEFAULTS)['class_mode'] == 'both'
+
+
+def test_scene_preferred_name_hint_precedes_covered_outdoor_data():
+    """Manual and preferred scan names rank above covered-outdoor evidence."""
+    detection = {'scene': 'covered_outdoor', 'metrics': {'horizontal_openness': .71}}
+    metadata = {'rlms:scanposGuid': '03_UG1 047'}
+    preferred = resolve_scan_scene(detection, metadata, DEFAULTS)
+    assert preferred['scene'] == 'indoor' and preferred['source'] == 'name'
+    assert resolve_scan_scene(detection, {}, DEFAULTS)['scene'] == 'outdoor'
+    tiebreak = resolve_scan_scene(detection, metadata, {**DEFAULTS, 'scene_name_hint_mode': 'tiebreak'})
+    assert tiebreak['scene'] == 'outdoor'
 
 
 def test_scene_openness_and_neighbours():

@@ -253,7 +253,7 @@ def extract_planes(votes, by_id, origin, voxel_size, config, target: Path, check
                 break
             slope = np.degrees(np.arccos(np.clip(abs(normal[2]), 0, 1)))
             if ((class_id in {'floor', 'ground', 'road', 'sidewalk'} and slope >= 20)
-                    or (class_id == 'wall' and slope <= 70)):
+                    or (class_id in {'wall', 'building'} and slope <= 70)):
                 continue
             cells = np.unique(_cells_from_uv(inliers@basis.T), axis=0)
             for piece in _split_cells(cells):

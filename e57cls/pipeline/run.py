@@ -23,6 +23,8 @@ from e57cls.geometry.visibility import DepthBuffer
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
 from e57cls.vote.segments import apply_segment_vote
+from e57cls.vote.shape_rules import apply_shape_rules
+from e57cls.vote.dtm import TinDTM, apply_ground_dtm_band, build_tin_dtm
 from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.inspector import inspect_file, markdown
 from e57cls.io.input_mode import detect_input_mode, pseudo_setup_points_check
@@ -1094,17 +1096,23 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                 'confidence': config['stairs_min_confidence'], 'min_share': config['stairs_priority_min_share']} if config['stairs_priority'] and 'stairs' in by_id else None
     families = [[by_id[name] for name in family if name in by_id] for family in config['vote_families']]
     votes.decide(config['min_observations'], config['min_winning_share'], codes, control.checkpoint, priority, families)
-    surface_ties = building = stairs = components = vegetation = geometry_rules = segment_vote = scene_consistency = None
+    surface_ties = building = stairs = components = vegetation = geometry_rules = segment_vote = shape_rules = scene_consistency = geometry_fill = None
+    outline = None
+    geometry_planes = None
     terrain = None
     if config['surface_tie_break']:
         surface_ties = votes.resolve_surface_ties(by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
             config['surface_tie_share'], config['surface_normal_radius'], config['min_observations'],
             [float(station.position[2]) for station in stations], control.checkpoint)
+    if config.get('scene_outline', True) or config['building_enclosure']:
+        outline = votes.building_outline([by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
+                                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                         config['building_boundary_max_cells'])
     if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
         building = votes.split_ground_floor_by_building(by_id['ground'], by_id['floor'],
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
             config['building_boundary_cell_size'], config['building_boundary_min_height'],
-            config['building_boundary_max_cells'], control.checkpoint)
+            config['building_boundary_max_cells'], control.checkpoint, outline=outline)
     segment_started = time.monotonic()
     segment_vote = apply_segment_vote(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'], config,
                                       control.checkpoint, active_codes={row['code'] for row in rows})
@@ -1116,7 +1124,7 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
         terrain = work/'terrain.npz'
         geometry_rules = apply_geometry_rules(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
                                               config, terrain, control.checkpoint,
-                                              active_codes={row['code'] for row in rows}, scan_context=rule_context)
+                                              active_codes={row['code'] for row in rows}, scan_context=rule_context, outline=outline)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         stairs = votes.reject_planar_stairs(by_id['stairs'], np.asarray(config['voxel_origin']), config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'],
@@ -1132,10 +1140,48 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     scene_started = time.monotonic()
     scene_consistency = enforce_scene_consistency(votes, all_classes, by_id, rule_context,
                                                   np.asarray(config['voxel_origin']), config['voxel_size'], config,
-                                                  {row['code'] for row in rows}, control.checkpoint)
+                                                  {row['code'] for row in rows}, control.checkpoint, outline=outline)
     timings['scene_context'] = ((geometry_rules or {}).get('scan_context', {}).get('duration_s', 0.)
                                 if geometry_rules else scene_consistency['duration_s'])
     timings['scene_consistency'] = time.monotonic()-scene_started
+    if config['geometry_fill'] or config['shape_rules']:
+        fill_started = time.monotonic()
+        geometry_planes = work/'planes.npz'
+        extracted_planes = extract_planes(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'],
+                                          config, geometry_planes, control.checkpoint)
+        timings['geometry_fill_planes'] = time.monotonic()-fill_started
+        if config['geometry_fill']:
+            geometry_fill = extracted_planes
+    shape_started = time.monotonic()
+    shape_rules = apply_shape_rules(votes, by_id, np.asarray(config['voxel_origin']), config['voxel_size'], config,
+                                    control.checkpoint, active_codes={row['code'] for row in rows}, scan_context=rule_context,
+                                    planes_path=geometry_planes, outline=outline)
+    timings['shape_rules'] = time.monotonic()-shape_started
+    ground_dtm = None
+    if config['ground_dtm']:
+        dtm_started = time.monotonic()
+        if outline is None:
+            barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
+            outline = votes.building_outline(barrier_codes, config['voxel_size'],
+                                             config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                             config['building_boundary_max_cells'])
+        dtm_path = work/'dtm.npz'
+        dtm_build_report = build_tin_dtm(
+            votes, by_id, outline, np.asarray(config['voxel_origin']), config['voxel_size'],
+            config, target_path=dtm_path, scan_context=rule_context, checkpoint=control.checkpoint
+        )
+        with TinDTM(dtm_path) as tin:
+            band_report = apply_ground_dtm_band(
+                votes, by_id, tin, outline, np.asarray(config['voxel_origin']), config['voxel_size'],
+                config, active_codes={row['code'] for row in rows}, checkpoint=control.checkpoint
+            )
+        timings['ground_dtm'] = time.monotonic()-dtm_started
+        ground_dtm = {
+            **band_report,
+            'dtm': dtm_build_report,
+            'artifact': str(dtm_path),
+            'path': str(dtm_path),
+        }
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
@@ -1170,26 +1216,36 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
     force_unclassified = lambda store, start, valid: ~np.asarray(observed[store.meta['scan_index']][start:start+len(valid)])[valid]
     transfer_station_positions = {station.id: np.asarray([cameras[index].pose.translation for index in station.camera_indices], np.float64)
                                   for station in stations}
+    export_ground_dtm = work/'dtm.npz' if config['ground_dtm'] and (work/'dtm.npz').is_file() else None
+    export_ground_alt = work/'ground_alternatives.npz' if config['ground_dtm'] and (work/'ground_alternatives.npz').is_file() else None
     if writer is write_e57:
         result = writer(path, source, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'], [row['code'] for row in rows], (),
                         control.checkpoint, progress, output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
                         class_transfer_range_factor=config['class_transfer_range_factor'],
                         class_transfer_radius_max=config['class_transfer_radius_max'], transfer_station_positions=transfer_station_positions,
-                        geometry_planes=None, terrain=terrain, terrain_ground_tolerance=config['terrain_ground_tolerance'],
+                        geometry_planes=geometry_planes if config['geometry_fill'] else None, terrain=terrain, terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        tree_crowns=work/'tree_crowns.npz' if config['tree_crown_fill'] else None,
+                        tree_fill=config['tree_crown_fill'],
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
-                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set())
+                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set(),
+                        ground_dtm=export_ground_dtm, ground_dtm_alternatives=export_ground_alt,
+                        ground_dtm_band=config['ground_dtm_band'])
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
                         output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
                         class_transfer_range_factor=config['class_transfer_range_factor'],
                         class_transfer_radius_max=config['class_transfer_radius_max'], transfer_station_positions=transfer_station_positions,
-                        geometry_planes=None, terrain=terrain,
+                        geometry_planes=geometry_planes if config['geometry_fill'] else None, terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        tree_crowns=work/'tree_crowns.npz' if config['tree_crown_fill'] else None,
+                        tree_fill=config['tree_crown_fill'],
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
-                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set())
+                        terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set(),
+                        ground_dtm=export_ground_dtm, ground_dtm_alternatives=export_ground_alt,
+                        ground_dtm_band=config['ground_dtm_band'])
     control.event('phase_finished', phase='output')
     result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
                   computed_points=sum(selected_count(store, 'reduced') for store in stores), output_points=result['record_count'], format=config['format'])
@@ -1215,8 +1271,9 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
               'stairs_priority_overrides': votes.priority_overrides, 'created_utc': datetime.now(timezone.utc).isoformat(),
               'surface_ties': surface_ties, 'building_enclosure': building, 'stairs_geometry': stairs,
               'component_cleanup': components, 'vegetation_base_to_ground': vegetation, 'geometry_rules': geometry_rules,
-              'segment_vote': segment_vote,
+              'segment_vote': segment_vote, 'shape_rules': shape_rules, 'ground_dtm': ground_dtm,
               'scene_consistency': scene_consistency,
+              'scene_outline': (scene_consistency or {}).get('scene_outline', (geometry_rules or {}).get('scan_context', {}).get('scene_outline')),
               'scene_resolution': {'scene': {scene: len(station_results)},
                                    'scene_detail': {scene: len(station_results)}, 'source': {'data': len(station_results)},
                                    'conflicts': [], 'unresolved': []},
@@ -1267,7 +1324,10 @@ def execute(config, backend_factory=None, listen=True):
     geometry_planes = None
     geometry_rules_report = None
     segment_vote_report = None
+    shape_rules_report = None
+    ground_dtm_report = None
     scene_consistency_report = None
+    scene_outline_report = None
     terrain = None
     def factory():
         nonlocal backend
@@ -1628,12 +1688,18 @@ def execute(config, backend_factory=None, listen=True):
                         config['surface_normal_radius'], config['min_observations'],
                         [scan_pose(store.meta['metadata']).translation[2] for store in classifiable_stores], control.checkpoint)
                     timings['surface_ties'] = time.monotonic()-tie_started
+                outline = None
+                if config.get('scene_outline', True) or config['building_enclosure']:
+                    barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
+                    outline = votes.building_outline(barrier_codes, config['voxel_size'],
+                                                     config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                                     config['building_boundary_max_cells'])
                 if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
                     barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
                     building_report = votes.split_ground_floor_by_building(
                         by_id['ground'], by_id['floor'], barrier_codes, config['voxel_size'],
                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
-                        config['building_boundary_max_cells'], control.checkpoint)
+                        config['building_boundary_max_cells'], control.checkpoint, outline=outline)
                 segment_started = time.monotonic()
                 segment_vote_report = apply_segment_vote(
                     votes, by_id, np.array(config['voxel_origin']), config['voxel_size'], config, control.checkpoint,
@@ -1649,7 +1715,7 @@ def execute(config, backend_factory=None, listen=True):
                     terrain = work/'terrain.npz'
                     geometry_rules_report = apply_geometry_rules(votes, by_id, np.array(config['voxel_origin']),
                         config['voxel_size'], config, terrain, control.checkpoint,
-                        active_codes={row['code'] for row in rows}, scan_context=rule_context)
+                        active_codes={row['code'] for row in rows}, scan_context=rule_context, outline=outline)
                     timings['geometry_rules'] = time.monotonic()-geometry_started
                 if config['stairs_geometry_check'] and 'stairs' in by_id:
                     stairs_geometry_report = votes.reject_planar_stairs(
@@ -1667,10 +1733,50 @@ def execute(config, backend_factory=None, listen=True):
                 scene_started = time.monotonic()
                 scene_consistency_report = enforce_scene_consistency(
                     votes, all_classes, by_id, rule_context, np.array(config['voxel_origin']), config['voxel_size'], config,
-                    {row['code'] for row in rows}, control.checkpoint)
+                    {row['code'] for row in rows}, control.checkpoint, outline=outline)
+                scene_outline_report = scene_consistency_report.get('scene_outline')
                 timings['scene_context'] = ((geometry_rules_report or {}).get('scan_context', {}).get('duration_s', 0.)
                                             if geometry_rules_report else scene_consistency_report['duration_s'])
                 timings['scene_consistency'] = time.monotonic()-scene_started
+                if config['geometry_fill'] or config['shape_rules']:
+                    fill_started = time.monotonic()
+                    geometry_planes = work/'planes.npz'
+                    extracted_planes = extract_planes(votes, by_id, np.array(config['voxel_origin']), config['voxel_size'],
+                                                      config, geometry_planes, control.checkpoint)
+                    timings['geometry_fill_planes'] = time.monotonic()-fill_started
+                    if config['geometry_fill']:
+                        geometry_fill_report = extracted_planes
+                shape_started = time.monotonic()
+                shape_rules_report = apply_shape_rules(
+                    votes, by_id, np.array(config['voxel_origin']), config['voxel_size'], config, control.checkpoint,
+                    active_codes={row['code'] for row in rows}, scan_context=rule_context, planes_path=geometry_planes,
+                    outline=outline)
+                timings['shape_rules'] = time.monotonic()-shape_started
+                ground_dtm_report = None
+                if config['ground_dtm']:
+                    dtm_started = time.monotonic()
+                    if outline is None:
+                        barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
+                        outline = votes.building_outline(barrier_codes, config['voxel_size'],
+                                                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                                         config['building_boundary_max_cells'])
+                    dtm_path = work/'dtm.npz'
+                    dtm_build_report = build_tin_dtm(
+                        votes, by_id, outline, np.array(config['voxel_origin']), config['voxel_size'],
+                        config, target_path=dtm_path, scan_context=rule_context, checkpoint=control.checkpoint
+                    )
+                    with TinDTM(dtm_path) as tin:
+                        band_report = apply_ground_dtm_band(
+                            votes, by_id, tin, outline, np.array(config['voxel_origin']), config['voxel_size'],
+                            config, active_codes={row['code'] for row in rows}, checkpoint=control.checkpoint
+                        )
+                    timings['ground_dtm'] = time.monotonic()-dtm_started
+                    ground_dtm_report = {
+                        **band_report,
+                        'dtm': dtm_build_report,
+                        'artifact': str(dtm_path),
+                        'path': str(dtm_path),
+                    }
                 if config['component_cleanup']:
                     cleanup_rules = []
                     if 'cable' in by_id:
@@ -1689,12 +1795,6 @@ def execute(config, backend_factory=None, listen=True):
                     vegetation_report = votes.vegetation_bases_to_ground(
                         by_id['low_vegetation'], by_id['ground'], config['voxel_size'],
                         config['vegetation_ground_cell_size'], config['vegetation_ground_band'], control.checkpoint)
-                if config['geometry_fill']:
-                    fill_started = time.monotonic()
-                    geometry_planes = work/'planes.npz'
-                    geometry_fill_report = extract_planes(votes, by_id, np.array(config['voxel_origin']), config['voxel_size'],
-                                                         config, geometry_planes, control.checkpoint)
-                    timings['geometry_fill_planes'] = time.monotonic()-fill_started
                 timings["voting"] = time.monotonic()-vote_start
                 control.event("phase_finished", phase="voting")
             else:
@@ -1715,6 +1815,8 @@ def execute(config, backend_factory=None, listen=True):
                        path, stores, votes, np.array(config["voxel_origin"]), config["voxel_size"], inspection["metadata"].get("coordinateMetadata", ""),
                        [r["code"] for r in rows], skipped, control.checkpoint,
                        lambda phase,fraction,scan: control.event("progress", phase=phase, fraction=fraction, scan=scan))
+        export_ground_dtm = work/'dtm.npz' if semantic_run and config['ground_dtm'] and (work/'dtm.npz').is_file() else None
+        export_ground_alt = work/'ground_alternatives.npz' if semantic_run and config['ground_dtm'] and (work/'ground_alternatives.npz').is_file() else None
         result = writer(*output_args, mirror=mirrors.output if mirrors else None,
                         no_reflection=config['extra_no_reflection'], primary_without_reflections=not semantic_run,
                         class_transfer_radius=config['class_transfer_radius'] if semantic_run else 0.,
@@ -1725,7 +1827,12 @@ def execute(config, backend_factory=None, listen=True):
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain if semantic_run else None,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
-                        terrain_outdoor_scans={item['scan'] for item in scan_results if item.get('scene') == 'outdoor'})
+                        tree_crowns=work/'tree_crowns.npz' if semantic_run and config['tree_crown_fill'] else None,
+                        tree_fill=semantic_run and config['tree_crown_fill'],
+                        terrain_outdoor_scans={item['scan'] for item in scan_results if item.get('scene') == 'outdoor'},
+                        ground_dtm=export_ground_dtm,
+                        ground_dtm_alternatives=export_ground_alt,
+                        ground_dtm_band=config['ground_dtm_band'])
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}
@@ -1746,6 +1853,8 @@ def execute(config, backend_factory=None, listen=True):
                   "stairs_geometry": stairs_geometry_report,
                   "surface_ties": surface_tie_report,
                   "segment_vote": segment_vote_report,
+                  "shape_rules": shape_rules_report,
+                  "ground_dtm": ground_dtm_report,
                   "component_cleanup": cleanup_report,
                   "vegetation_base_to_ground": vegetation_report, "building_enclosure": building_report,
                   "depth_gate": {str(item['scan']): item.get('depth_gate', {}) for item in scan_results if 'scan' in item},
@@ -1754,6 +1863,7 @@ def execute(config, backend_factory=None, listen=True):
                                     'confidence': 96},
                   "geometry_rules": geometry_rules_report,
                   "scene_consistency": scene_consistency_report,
+                  "scene_outline": scene_outline_report,
                   "scene_resolution": scene_resolution_report(scan_results),
                   "scene_audit": scene_audit(scan_results, result.get('scan_class_counts', {}), preset, mapping),
                   "mask_cache_behavior": "Mask identities include the prompts of one class. Removing doorway invalidates only door masks; other class masks remain reusable.",

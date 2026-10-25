@@ -13,7 +13,7 @@ DEFAULT_FALLBACKS = {
     'floor': ['ground', 'sidewalk', 'road'], 'ceiling': ['building'], 'wall': ['building'],
     'door': ['building'], 'railing': ['fence'], 'ground': ['floor'], 'road': ['floor'],
     'sidewalk': ['floor'], 'curb': ['floor'], 'manhole': ['floor'], 'building': ['wall'],
-    'fence': ['railing'],
+    'fence': ['railing'], 'outdoor_wall': ['wall'],
 }
 
 
@@ -40,7 +40,7 @@ def _fits(scenes, code, scene):
 
 
 def enforce_scene_consistency(votes, preset_classes, by_id, scan_context, origin, voxel_size, config,
-                              active_codes, checkpoint=lambda: None):
+                              active_codes, checkpoint=lambda: None, outline=None):
     """Replace only certain indoor/outdoor conflicts, retaining vote confidence where possible."""
     started = time.monotonic()
     result = {'enabled': bool(config.get('scene_consistency', True)),
@@ -48,8 +48,10 @@ def enforce_scene_consistency(votes, preset_classes, by_id, scan_context, origin
               'changed': {}, 'unclassified': 0, 'duration_s': 0.}
     if not result['enabled']:
         return result
-    context_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint)
+    context_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint,
+                                          outline=outline)
     result['context_voxels'] = context_report['context_voxels']
+    result['scene_outline'] = context_report.get('scene_outline', {})
     active_codes = {int(code) for code in active_codes}
     scenes, names = _scene_codes(preset_classes, by_id, active_codes)
     indoor_only = sorted(code for code, values in scenes.items() if values == {'indoor'})

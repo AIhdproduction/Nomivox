@@ -13,6 +13,7 @@ from scipy.spatial import cKDTree
 
 from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import PlaneIndex
+from e57cls.vote.dtm import TinDTM
 from e57cls.vote.engine import voxel_keys
 from e57cls.vote.geometry_rules import TerrainIndex
 
@@ -418,12 +419,90 @@ class ClassPointIndex:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
+class TreeCrownIndex:
+    """Compact lollipop crown volumes written by the shape-rule pass."""
+
+    def __init__(self, path):
+        with np.load(Path(path), allow_pickle=False) as data:
+            self.x = np.asarray(data['x'], np.float64)
+            self.y = np.asarray(data['y'], np.float64)
+            self.radius = np.asarray(data['radius'], np.float64)
+            self.z_min = np.asarray(data['z_min'], np.float64)
+            self.z_max = np.asarray(data['z_max'], np.float64)
+        if not (len(self.x) == len(self.y) == len(self.radius) == len(self.z_min) == len(self.z_max)):
+            raise ValueError('tree crown artifact arrays must have equal length')
+
+    def mask(self, points):
+        points = np.asarray(points, np.float64)
+        result = np.zeros(len(points), bool)
+        for x, y, radius, low, high in zip(self.x, self.y, self.radius, self.z_min, self.z_max):
+            if high <= low or radius <= 0.:
+                continue
+            vertical = (points[:, 2] >= low) & (points[:, 2] <= high)
+            selected = np.flatnonzero(vertical)
+            if len(selected):
+                delta = points[selected, :2]-np.asarray((x, y))
+                result[selected] |= np.einsum('ij,ij->i', delta, delta) <= radius*radius
+        return result
+
+
+class GroundDtmIndex:
+    """Read-only TIN DTM and ground alternative class lookup used during export."""
+
+    def __init__(self, dtm_path, alternatives_path=None, band=0.03, origin=None, voxel_size=0.02):
+        self.dtm = TinDTM(dtm_path) if dtm_path and Path(dtm_path).is_file() else None
+        self.band = float(band)
+        self.origin = np.asarray(origin, dtype=np.float64) if origin is not None else None
+        self.voxel_size = float(voxel_size)
+
+        if alternatives_path is None and dtm_path is not None:
+            cand = Path(dtm_path).parent / 'ground_alternatives.npz'
+            if cand.is_file():
+                alternatives_path = cand
+
+        self._alt_archive = None
+        self.keys = np.empty(0, dtype='V24')
+        self.codes = np.empty(0, dtype=np.uint16)
+        self.outline_applied = False
+        self.outline_inside_barrier = None
+        self.outline_origin = None
+        self.outline_cells = 1
+        self.outline_shape = None
+
+        if alternatives_path and Path(alternatives_path).is_file():
+            self._alt_archive = np.load(alternatives_path, allow_pickle=False)
+            if 'keys' in self._alt_archive:
+                self.keys = np.asarray(self._alt_archive['keys'], dtype='V24')
+            if 'codes' in self._alt_archive:
+                self.codes = np.asarray(self._alt_archive['codes'], dtype=np.uint16)
+            if 'outline_applied' in self._alt_archive:
+                self.outline_applied = bool(self._alt_archive['outline_applied'])
+            if self.outline_applied and 'outline_inside_barrier' in self._alt_archive:
+                self.outline_inside_barrier = np.asarray(self._alt_archive['outline_inside_barrier'], dtype=bool)
+                self.outline_origin = np.asarray(self._alt_archive['outline_origin'], dtype=np.int64)
+                self.outline_cells = int(self._alt_archive['outline_cells'])
+                self.outline_shape = tuple(np.asarray(self._alt_archive['outline_shape'], dtype=np.int64))
+            if 'origin' in self._alt_archive and self.origin is None:
+                self.origin = np.asarray(self._alt_archive['origin'], dtype=np.float64)
+            if 'voxel_size' in self._alt_archive and not self.voxel_size:
+                self.voxel_size = float(self._alt_archive['voxel_size'])
+
+    def close(self):
+        if self.dtm is not None:
+            self.dtm.close()
+            self.dtm = None
+        if self._alt_archive is not None:
+            self._alt_archive.close()
+            self._alt_archive = None
+
+
 class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
                  geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
                  terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None,
-                 class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None):
+                 class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
+                 tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
         self.radius_max = float(radius if class_transfer_radius_max is None else class_transfer_radius_max)
@@ -438,10 +517,26 @@ class ClassifiedSource:
         self.terrain_ground_tolerance = terrain_ground_tolerance
         self.terrain_fill = terrain_fill
         self.terrain_outdoor_scans = None if terrain_outdoor_scans is None else set(terrain_outdoor_scans)
+        self.tree_crowns = TreeCrownIndex(tree_crowns) if tree_crowns and Path(tree_crowns).is_file() else None
+        self.tree_fill = bool(tree_fill)
+        if ground_dtm is not None:
+            if isinstance(ground_dtm, GroundDtmIndex):
+                self.ground_dtm = ground_dtm
+            elif isinstance(ground_dtm, (list, tuple)) and len(ground_dtm) >= 2:
+                self.ground_dtm = GroundDtmIndex(ground_dtm[0], ground_dtm[1], ground_dtm_band, self.origin, self.voxel_size)
+            elif isinstance(ground_dtm, dict):
+                dtm_p = ground_dtm.get('dtm') or ground_dtm.get('artifact') or ground_dtm.get('path')
+                alt_p = ground_dtm.get('alternatives') or ground_dtm.get('ground_alternatives')
+                b = float(ground_dtm.get('band', ground_dtm_band))
+                self.ground_dtm = GroundDtmIndex(dtm_p, alt_p, b, self.origin, self.voxel_size)
+            else:
+                self.ground_dtm = GroundDtmIndex(ground_dtm, ground_dtm_alternatives, ground_dtm_band, self.origin, self.voxel_size)
+        else:
+            self.ground_dtm = None
         self.geometry_fill_counts = {}
         self.progress = progress
         self.force_unclassified = force_unclassified
-        self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0., 'terrain_fill': 0.}
+        self.timing_seconds = {'lookup_mirror': 0., 'transfer': 0., 'plane_fill': 0., 'terrain_fill': 0., 'tree_fill': 0., 'ground_dtm': 0.}
 
     def __enter__(self):
         if not self.radius_max: return self
@@ -527,7 +622,7 @@ class ClassifiedSource:
             for code, number in zip(*np.unique(filled[assigned], return_counts=True)):
                 self.geometry_fill_counts[str(int(code))] = self.geometry_fill_counts.get(str(int(code)), 0)+int(number)
             self.timing_seconds['plane_fill'] += time.perf_counter()-started
-        if store.meta['scan_index'] not in self.skipped and self.terrain is not None and self.terrain_fill and (self.terrain_outdoor_scans is None
+        if store.meta['scan_index'] not in self.skipped and self.terrain is not None and self.terrain_fill and self.ground_dtm is None and (self.terrain_outdoor_scans is None
                                                                or store.meta['scan_index'] in self.terrain_outdoor_scans):
             started = time.perf_counter()
             unknown = codes == 1
@@ -540,6 +635,91 @@ class ClassifiedSource:
         if self.force_unclassified is not None:
             unseen = self.force_unclassified(store, start, valid)
             codes[unseen], confidence[unseen], states[unseen] = 1, 0, 0
+        if store.meta['scan_index'] not in self.skipped and self.tree_crowns is not None and self.tree_fill:
+            started = time.perf_counter()
+            unknown = codes == 1
+            filled = self.tree_crowns.mask(world[unknown])
+            ids = np.flatnonzero(unknown)[filled]
+            codes[ids], confidence[ids] = 5, 64
+            if len(ids):
+                self.geometry_fill_counts['tree_fill'] = self.geometry_fill_counts.get('tree_fill', 0)+len(ids)
+            self.timing_seconds['tree_fill'] += time.perf_counter()-started
+        if store.meta['scan_index'] not in self.skipped and self.ground_dtm is not None and self.ground_dtm.dtm is not None:
+            started = time.perf_counter()
+            origin = self.origin
+            voxel_size = self.voxel_size
+            band = self.ground_dtm.band
+
+            # 1. Ground points: check DTM height; if |z - DTM| > band -> second class or 1
+            is_ground = (codes == 2)
+            if np.any(is_ground):
+                ground_indices = np.flatnonzero(is_ground)
+                ground_pts = world[ground_indices]
+                dtm_h = self.ground_dtm.dtm.height(ground_pts[:, :2])
+                valid_dtm = np.isfinite(dtm_h)
+                above_band = valid_dtm & (np.abs(ground_pts[:, 2] - dtm_h) > band)
+                if np.any(above_band):
+                    demote_sub_indices = np.flatnonzero(above_band)
+                    demote_indices = ground_indices[demote_sub_indices]
+                    demote_pts = ground_pts[demote_sub_indices]
+
+                    q_keys = voxel_keys(demote_pts, origin, voxel_size)
+                    if len(self.ground_dtm.keys):
+                        found_idx = np.searchsorted(self.ground_dtm.keys, q_keys)
+                        matched = (found_idx < len(self.ground_dtm.keys))
+                        matched[matched] &= (self.ground_dtm.keys[found_idx[matched]] == q_keys[matched])
+                        new_c = np.ones(len(q_keys), dtype=np.uint8)
+                        if matched.any():
+                            new_c[matched] = self.ground_dtm.codes[found_idx[matched]]
+                    else:
+                        new_c = np.ones(len(q_keys), dtype=np.uint8)
+
+                    codes[demote_indices] = new_c
+                    unclass_mask = (new_c == 1)
+                    if np.any(unclass_mask):
+                        confidence[demote_indices[unclass_mask]] = 0
+
+                    self.geometry_fill_counts['ground_dtm_to_alt'] = (
+                        self.geometry_fill_counts.get('ground_dtm_to_alt', 0) + len(demote_indices)
+                    )
+
+            # 2. Unclassified points (code 1): if outside building outline and |z - DTM| <= band -> 2
+            is_unclass = (codes == 1)
+            if np.any(is_unclass):
+                unclass_indices = np.flatnonzero(is_unclass)
+                unclass_pts = world[unclass_indices]
+                dtm_h = self.ground_dtm.dtm.height(unclass_pts[:, :2])
+                valid_dtm = np.isfinite(dtm_h)
+                within_band = valid_dtm & (np.abs(unclass_pts[:, 2] - dtm_h) <= band)
+
+                if np.any(within_band):
+                    cand_sub_indices = np.flatnonzero(within_band)
+                    cand_pts = unclass_pts[cand_sub_indices]
+
+                    if self.ground_dtm.outline_applied and self.ground_dtm.outline_inside_barrier is not None:
+                        pt_indices = np.floor((cand_pts - origin) / voxel_size).astype(np.int64)
+                        grid_xy = pt_indices[:, :2] // self.ground_dtm.outline_cells
+                        raster_idx = grid_xy - self.ground_dtm.outline_origin
+                        gx = raster_idx[:, 0]
+                        gy = raster_idx[:, 1]
+                        shape = self.ground_dtm.outline_shape
+                        in_grid = (gx >= 0) & (gx < shape[0]) & (gy >= 0) & (gy < shape[1])
+                        excluded = np.zeros(len(cand_pts), bool)
+                        if in_grid.any():
+                            excluded[in_grid] = self.ground_dtm.outline_inside_barrier[gx[in_grid], gy[in_grid]]
+                        outside = ~excluded
+                    else:
+                        outside = np.ones(len(cand_pts), bool)
+
+                    if np.any(outside):
+                        promote_indices = unclass_indices[cand_sub_indices[outside]]
+                        codes[promote_indices] = 2
+                        confidence[promote_indices] = 64
+                        self.geometry_fill_counts['ground_dtm_fill'] = (
+                            self.geometry_fill_counts.get('ground_dtm_fill', 0) + len(promote_indices)
+                        )
+
+            self.timing_seconds['ground_dtm'] += time.perf_counter() - started
         return world, codes, confidence, states
 
     def close(self):
@@ -560,6 +740,12 @@ class ClassifiedSource:
         if terrain is not None:
             try:
                 terrain.close()
+            except Exception:
+                pass
+        ground_dtm, self.ground_dtm = self.ground_dtm, None
+        if ground_dtm is not None:
+            try:
+                ground_dtm.close()
             except Exception:
                 pass
         predictions, self.predictions = self.predictions, {}

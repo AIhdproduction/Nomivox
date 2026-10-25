@@ -91,3 +91,22 @@ def test_scene_consistency_indoor_fallbacks_and_both_classes_are_preserved(tmp_p
         assert votes.lookup(keys)[0].tolist() == [101, 103, 105, 1, 106, 106]
     finally:
         votes.close()
+
+
+def test_scene_consistency_falls_back_from_outdoor_wall_to_indoor_wall(tmp_path):
+    votes = VoteStore(tmp_path/'outdoor-wall.sqlite')
+    keys = voxel_keys([[0., 0., 0.]], np.zeros(3), 1.)
+    try:
+        votes.add_scan(1, 'indoor', [(keys, np.array([[.8, .2]], np.float32))], [78, 100])
+        votes.decide(1, .5, [78, 100])
+        report = enforce_scene_consistency(
+            votes,
+            [{'id': 'outdoor_wall', 'scene': 'outdoor'}, {'id': 'wall', 'scene': 'indoor'}],
+            {'outdoor_wall': 78, 'wall': 100},
+            {1: {'scene': 'indoor', 'outdoor': False, 'position': [0., 0., 0.],
+                 'allowed_codes': {78, 100}}},
+            np.zeros(3), 1., DEFAULTS, {78, 100}, lambda: None)
+        assert votes.lookup(keys)[0].tolist() == [100]
+        assert report['changed'] == {'78->100': 1}
+    finally:
+        votes.close()

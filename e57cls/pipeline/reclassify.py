@@ -15,6 +15,8 @@ from e57cls.geometry.cameras import scan_pose
 from e57cls.geometry.fill import extract_planes
 from e57cls.vote.geometry_rules import apply_geometry_rules
 from e57cls.vote.segments import apply_segment_vote
+from e57cls.vote.shape_rules import apply_shape_rules
+from e57cls.vote.dtm import TinDTM, apply_ground_dtm_band, build_tin_dtm
 from e57cls.vote.scene_consistency import enforce_scene_consistency
 from e57cls.io.store import load_scan, reduced_store
 from e57cls.output.e57 import write_e57
@@ -51,12 +53,13 @@ RECLASSIFY_OVERRIDE_KEYS = frozenset({
     'terrain_cover_min_height', 'terrain_cover_max_height', 'tree_crown_radius', 'tree_crown_max_height',
     'tree_crown_grow_radius', 'class_transfer_radius', 'class_transfer_range_factor',
     'class_transfer_radius_max', 'output_density', 'format', 'extra_no_reflection',
-    'cache_cleanup', 'vote_families',
+    'cache_cleanup', 'vote_families', 'scene_outline', 'scene_outline_min_cover', 'scene_outline_roof_band',
+    'ground_dtm', 'ground_dtm_band', 'dtm_cell_size',
 })
 RECLASSIFY_POST_VOTE_PREFIXES = ('stairs_', 'surface_tie_', 'component_', 'cable_', 'electrical_',
                                  'vegetation_', 'building_', 'geometry_fill', 'geometry_', 'terrain_', 'tree_',
                                  'class_transfer_', 'scene_context_', 'scene_consistency', 'scene_name_', 'scene_neighbour_',
-                                 'scene_openness_', 'segment_')
+                                 'scene_openness_', 'scene_outline_', 'segment_', 'shape_', 'ground_dtm', 'dtm_')
 INPUT_MODES = frozenset({'static', 'slam'})
 REQUESTED_INPUT_MODES = INPUT_MODES | {'auto'}
 
@@ -162,22 +165,29 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     votes.decide(config['min_observations'], config['min_winning_share'], codes, priority=priority, vote_families=families)
     result = {'surface_ties': None, 'building_enclosure': None, 'stairs_geometry': None,
               'component_cleanup': None, 'vegetation_base_to_ground': None, 'geometry_rules': None,
-              'segment_vote': None, 'scene_consistency': None, 'geometry_fill': None}
+              'segment_vote': None, 'shape_rules': None, 'ground_dtm': None, 'scene_consistency': None, 'scene_outline': None,
+              'geometry_fill': None}
     origin = np.asarray(config['voxel_origin'])
     if config['surface_tie_break']:
         result['surface_ties'] = votes.resolve_surface_ties(by_id, origin, config['voxel_size'], config['surface_tie_share'],
             config['surface_normal_radius'], config['min_observations'], scanner_heights)
+    outline = None
+    if config.get('scene_outline', True) or config['building_enclosure']:
+        outline = votes.building_outline([by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
+                                         config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                         config['building_boundary_max_cells'])
     if config['building_enclosure'] and {'ground', 'floor'}.issubset(by_id):
         result['building_enclosure'] = votes.split_ground_floor_by_building(by_id['ground'], by_id['floor'],
             [by_id[key] for key in ('building', 'wall') if key in by_id], config['voxel_size'],
-            config['building_boundary_cell_size'], config['building_boundary_min_height'], config['building_boundary_max_cells'])
+            config['building_boundary_cell_size'], config['building_boundary_min_height'], config['building_boundary_max_cells'],
+            outline=outline)
     result['segment_vote'] = apply_segment_vote(votes, by_id, origin, config['voxel_size'], config,
                                                 active_codes=active_codes)
     terrain = None
     if config['geometry_rules']:
         terrain = work/'terrain.npz'
         result['geometry_rules'] = apply_geometry_rules(votes, by_id, origin, config['voxel_size'], config, terrain,
-                                                         active_codes=active_codes, scan_context=scan_context)
+                                                         active_codes=active_codes, scan_context=scan_context, outline=outline)
     if config['stairs_geometry_check'] and 'stairs' in by_id:
         result['stairs_geometry'] = votes.reject_planar_stairs(by_id['stairs'], origin, config['voxel_size'],
             config['stairs_plane_tolerance'], config['stairs_planar_fraction'], config['stairs_min_rise'], config['seed'], codes,
@@ -191,7 +201,39 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
             underside_maximum_gap=config['stairs_underside_max_gap'])
     result['scene_consistency'] = enforce_scene_consistency(
         votes, config['_preset_classes'], by_id, scan_context, origin, config['voxel_size'], config,
-        active_codes, lambda: None)
+        active_codes, lambda: None, outline=outline)
+    result['scene_outline'] = result['scene_consistency'].get('scene_outline')
+    planes = None
+    if config['geometry_fill'] or config['shape_rules']:
+        planes = work/'planes.npz'
+        extracted_planes = extract_planes(votes, by_id, origin, config['voxel_size'], config, planes)
+        if config['geometry_fill']:
+            result['geometry_fill'] = extracted_planes
+    result['shape_rules'] = apply_shape_rules(votes, by_id, origin, config['voxel_size'], config,
+                                              active_codes=active_codes, scan_context=scan_context,
+                                              planes_path=planes, outline=outline)
+    if config['ground_dtm']:
+        if outline is None:
+            barrier_codes = [by_id[key] for key in ('building', 'wall') if key in by_id]
+            outline = votes.building_outline(barrier_codes, config['voxel_size'],
+                                             config['building_boundary_cell_size'], config['building_boundary_min_height'],
+                                             config['building_boundary_max_cells'])
+        dtm_path = work/'dtm.npz'
+        dtm_build_report = build_tin_dtm(
+            votes, by_id, outline, origin, config['voxel_size'],
+            config, target_path=dtm_path, scan_context=scan_context, checkpoint=lambda: None
+        )
+        with TinDTM(dtm_path) as tin:
+            band_report = apply_ground_dtm_band(
+                votes, by_id, tin, outline, origin, config['voxel_size'],
+                config, active_codes=active_codes, checkpoint=lambda: None
+            )
+        result['ground_dtm'] = {
+            **band_report,
+            'dtm': dtm_build_report,
+            'artifact': str(dtm_path),
+            'path': str(dtm_path),
+        }
     if config['component_cleanup']:
         rules = []
         if 'cable' in by_id:
@@ -206,10 +248,6 @@ def _postprocess(votes, config, by_id, scanner_heights, work: Path, active_codes
     if config['vegetation_base_to_ground'] and 'low_vegetation' in by_id and 'ground' in by_id:
         result['vegetation_base_to_ground'] = votes.vegetation_bases_to_ground(by_id['low_vegetation'], by_id['ground'],
             config['voxel_size'], config['vegetation_ground_cell_size'], config['vegetation_ground_band'])
-    planes = None
-    if config['geometry_fill']:
-        planes = work/'planes.npz'
-        result['geometry_fill'] = extract_planes(votes, by_id, origin, config['voxel_size'], config, planes)
     return result, planes, terrain
 
 
@@ -286,6 +324,7 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
         stages, planes, terrain = _postprocess(votes, {**config, '_preset_classes': all_classes}, by_id,
             scanner_heights, copied_votes.parent,
             {row['code'] for row in rows}, scan_context)
+        tree_crowns = copied_votes.parent/'tree_crowns.npz'
         if station_tracking:
             votes.finalize_station_ids()
         writer = write_e57 if config['format'] == 'e57' else write_cloud
@@ -305,6 +344,9 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
                 [row['code'] for row in rows]) if writer is write_e57 else (
                 path, output_stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                 inspect['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows])
+        reclassify_work = copied_votes.parent
+        export_ground_dtm = reclassify_work/'dtm.npz' if config['ground_dtm'] and (reclassify_work/'dtm.npz').is_file() else None
+        export_ground_alt = reclassify_work/'ground_alternatives.npz' if config['ground_dtm'] and (reclassify_work/'ground_alternatives.npz').is_file() else None
         result = writer(*args, mirror=mirror.output if mirror else None, no_reflection=config['extra_no_reflection'],
                         output_density=config['output_density'], class_transfer_radius=config['class_transfer_radius'],
                         class_transfer_range_factor=config['class_transfer_range_factor'],
@@ -314,8 +356,13 @@ def reclassify(source_run: Path, output: Path, overrides_path: Path | None = Non
                         geometry_fill_tolerance=config['geometry_fill_tolerance'], terrain=terrain,
                         terrain_ground_tolerance=config['terrain_ground_tolerance'],
                         terrain_fill=config['terrain_fill'] and any(row['code'] == 2 for row in rows),
+                        tree_crowns=tree_crowns if config['tree_crown_fill'] else None,
+                        tree_fill=config['tree_crown_fill'],
                         station_ids=station_tracking,
-                        terrain_outdoor_scans=terrain_outdoor_scans)
+                        terrain_outdoor_scans=terrain_outdoor_scans,
+                        ground_dtm=export_ground_dtm,
+                        ground_dtm_alternatives=export_ground_alt,
+                        ground_dtm_band=config['ground_dtm_band'])
         result.update(point_reduction=config['point_reduction'], output_density=config['output_density'], format=config['format'])
         write_legends(target, rows)
         shutil.copy2(source_run/'scan_index.json', target/'scan_index.json')

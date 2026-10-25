@@ -832,22 +832,13 @@ class VoteStore:
         self._invalidate_lookup()
         return {'moved_voxels': len(moved), 'cells': len(floor)}
 
-    def split_ground_floor_by_building(self, ground_code, floor_code, barrier_codes, voxel_size,
-                                       cell_size, minimum_height, maximum_cells, checkpoint=lambda: None):
-        """Use observed, vertical building faces as a 2-D ground/floor barrier.
-
-        Building and wall voxels form a barrier only where the same XY cell has
-        a measured vertical extent.  Nothing is extrapolated between separate
-        faces: the exterior is flood-filled solely through observed openings.
-        Ground/floor labels are changed only when this produces an actual
-        enclosed region, preventing an incomplete facade from rewriting a
-        whole project.
-        """
-        codes = tuple(sorted({int(code) for code in barrier_codes}))
-        if not codes:
+    def building_outline(self, barrier_codes, voxel_size, cell_size, minimum_height, maximum_cells):
+        """Compute the 2-D building envelope raster (inside, outside, barrier, origin, cell size)."""
+        barrier_tuple = tuple(sorted({int(code) for code in barrier_codes}))
+        if not barrier_tuple:
             return {'applied': False, 'reason': 'no_barrier_classes'}
-        clause = ','.join('?' for _ in codes)
-        rows = list(self.db.execute(f'SELECT key FROM decisions WHERE code IN ({clause})', codes))
+        clause = ','.join('?' for _ in barrier_tuple)
+        rows = list(self.db.execute(f'SELECT key FROM decisions WHERE code IN ({clause})', barrier_tuple))
         if not rows:
             return {'applied': False, 'reason': 'no_building_or_wall_points'}
         building = np.frombuffer(b''.join(bytes(row[0]) for row in rows), dtype='<i8').reshape(-1, 3)
@@ -862,18 +853,6 @@ class VoteStore:
         if not len(barrier):
             return {'applied': False, 'reason': 'no_vertical_facade_cells'}
 
-        target_rows = list(self.db.execute('SELECT key,code FROM decisions WHERE code IN (?,?)',
-                                           (int(ground_code), int(floor_code))))
-        if not target_rows:
-            return {'applied': False, 'reason': 'no_ground_or_floor_points', 'barrier_cells': int(len(barrier))}
-        target_keys = [bytes(row[0]) for row in target_rows]
-        target_codes = np.asarray([row[1] for row in target_rows], np.uint8)
-        target = np.frombuffer(b''.join(target_keys), dtype='<i8').reshape(-1, 3)
-        target_xy = target[:, :2] // cells
-
-        # Work only around the actual building envelope.  Points outside are
-        # unquestionably exterior, but are updated only after an enclosed
-        # interior was proven below.
         lo = barrier.min(axis=0)-1
         hi = barrier.max(axis=0)+1
         shape = tuple((hi-lo+1).tolist())
@@ -886,14 +865,58 @@ class VoteStore:
         seed = np.zeros(shape, bool)
         seed[0, :], seed[-1, :], seed[:, 0], seed[:, -1] = True, True, True, True
         outside = binary_propagation(seed & ~blocked, structure=generate_binary_structure(2, 1), mask=~blocked)
+        inside = ~outside & ~blocked
+        return {
+            'applied': True,
+            'inside': inside,
+            'outside': outside,
+            'barrier': blocked,
+            'origin': lo,
+            'cells': cells,
+            'cell_size_m': cells*voxel_size,
+            'barrier_cells': int(len(barrier)),
+            'grid_cells': int(np.prod(shape, dtype=np.int64)),
+            'shape': shape,
+            'has_enclosed': bool(inside.any()),
+        }
 
-        in_grid = ((target_xy >= lo) & (target_xy <= hi)).all(axis=1)
+    def split_ground_floor_by_building(self, ground_code, floor_code, barrier_codes, voxel_size,
+                                       cell_size, minimum_height, maximum_cells, checkpoint=lambda: None, outline=None):
+        """Use observed, vertical building faces as a 2-D ground/floor barrier.
+
+        Building and wall voxels form a barrier only where the same XY cell has
+        a measured vertical extent.  Nothing is extrapolated between separate
+        faces: the exterior is flood-filled solely through observed openings.
+        Ground/floor labels are changed only when this produces an actual
+        enclosed region, preventing an incomplete facade from rewriting a
+        whole project.
+        """
+        outline = outline if outline is not None else self.building_outline(
+            barrier_codes, voxel_size, cell_size, minimum_height, maximum_cells)
+        if not outline.get('applied'):
+            return {key: value for key, value in outline.items() if key not in {'inside', 'outside', 'barrier'}}
+
+        target_rows = list(self.db.execute('SELECT key,code FROM decisions WHERE code IN (?,?)',
+                                           (int(ground_code), int(floor_code))))
+        if not target_rows:
+            return {'applied': False, 'reason': 'no_ground_or_floor_points',
+                    'barrier_cells': int(outline['barrier_cells'])}
+        target_keys = [bytes(row[0]) for row in target_rows]
+        target_codes = np.asarray([row[1] for row in target_rows], np.uint8)
+        target = np.frombuffer(b''.join(target_keys), dtype='<i8').reshape(-1, 3)
+        cells = int(outline['cells'])
+        target_xy = target[:, :2] // cells
+        lo = np.asarray(outline['origin'], np.int64)
+        shape = np.asarray(outline['shape'], np.int64)
+        high = lo+shape-1
+        blocked, outside = outline['barrier'], outline['outside']
+        in_grid = ((target_xy >= lo) & (target_xy <= high)).all(axis=1)
         grid_index = target_xy[in_grid]-lo
         inside = np.zeros(len(target), bool)
         inside[in_grid] = ~outside[grid_index[:, 0], grid_index[:, 1]] & ~blocked[grid_index[:, 0], grid_index[:, 1]]
         if not inside.any():
-            return {'applied': False, 'reason': 'no_enclosed_floor_area', 'barrier_cells': int(len(barrier)),
-                    'grid_cells': int(np.prod(shape, dtype=np.int64))}
+            return {'applied': False, 'reason': 'no_enclosed_floor_area', 'barrier_cells': int(outline['barrier_cells']),
+                    'grid_cells': int(outline['grid_cells'])}
 
         # No nearest-neighbour or gap interpolation happens here.  A target is
         # inside only if an observed facade barrier blocks every 4-connected
@@ -907,9 +930,9 @@ class VoteStore:
                                 ((int(wanted[index]), target_keys[index]) for index in ids))
         self.db.commit()
         self._invalidate_lookup()
-        return {'applied': True, 'barrier_cells': int(len(barrier)), 'grid_cells': int(np.prod(shape, dtype=np.int64)),
+        return {'applied': True, 'barrier_cells': int(outline['barrier_cells']), 'grid_cells': int(outline['grid_cells']),
                 'inside_voxels': int(inside.sum()), 'ground_voxels': int((~inside).sum()),
-                'changed_voxels': int(changed.sum()), 'cell_size_m': cells*voxel_size}
+                'changed_voxels': int(changed.sum()), 'cell_size_m': float(outline['cell_size_m'])}
 
     def lookup(self, keys):
         keys = np.ascontiguousarray(keys, dtype='V24').reshape(-1)

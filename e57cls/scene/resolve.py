@@ -54,8 +54,6 @@ def resolve_scan_scene(detection, metadata, config, manual_mode=None):
         scene, source = hint['scene'], 'name'
     else:
         scene, source, detail = 'unsure', 'pending', detail if detail in ('mixed', 'unsure') else 'unsure'
-    if detail == 'covered_outdoor':
-        scene = 'outdoor'
     class_mode = scene if scene in ('indoor', 'outdoor') else ('indoor' if config.get('scene_unresolved_classes') == 'indoor' else 'both')
     return {'scene': scene, 'scene_detail': detail, 'data_scene': data_scene, 'name_hint': hint,
             'source': source, 'conflict': conflict, 'class_mode': class_mode,

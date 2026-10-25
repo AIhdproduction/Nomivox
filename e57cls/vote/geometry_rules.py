@@ -175,8 +175,12 @@ def refresh_geometry_decisions(votes):
     """Reflect changed decisions in already prepared feature voxels in SQL."""
     exists = votes.db.execute("SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='geometry_voxels'").fetchone()
     if exists:
+        # A full UPDATE rewrites every geometry voxel even when the preceding
+        # stage left its decision unchanged.  Most shape-rule rounds are in
+        # exactly that state, so restrict the synchronisation to real deltas.
         votes.db.execute('''UPDATE geometry_voxels AS g SET code=d.code,confidence=d.confidence
-                            FROM decisions AS d WHERE d.key=g.key''')
+                            FROM decisions AS d WHERE d.key=g.key
+                              AND (g.code!=d.code OR g.confidence!=d.confidence)''')
         votes.db.commit()
 
 
@@ -277,7 +281,7 @@ def _alternatives(votes, active_codes):
         ) WHERE rank=1''', tuple(sorted(active_codes)))
 
 
-def _tree_seeds(votes, by_id, config):
+def _tree_seeds(votes, by_id, config, voxel_size=None):
     if 'tree_trunk' not in by_id:
         return []
     rows = votes.db.execute('''SELECT v.ix,v.iy,v.iz,f.linearity FROM geometry_voxels v
@@ -295,7 +299,11 @@ def _tree_seeds(votes, by_id, config):
     seeds = []
     for component in range(count):
         points = grouped_coordinates[offsets[component]:offsets[component+1]]
-        if (points[:, 2].ptp()*config['geometry_cell_size']) < .8:
+        # ``points`` are voxel indices, not geometry-feature cells.  The
+        # optional fallback keeps the private helper compatible with older
+        # callers while every pipeline path passes the actual voxel size.
+        scale = float(voxel_size if voxel_size is not None else config.get('voxel_size', config['geometry_cell_size']))
+        if (np.ptp(points[:, 2])*scale) < .8:
             continue
         centered = points-points.mean(axis=0)
         _, _, vectors = np.linalg.svd(centered, full_matrices=False)
@@ -307,7 +315,7 @@ def _tree_seeds(votes, by_id, config):
 
 
 def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_target: Path, checkpoint=lambda: None,
-                         active_codes=None, scan_context=None):
+                         active_codes=None, scan_context=None, outline=None):
     """Apply geometric corrections and persist terrain/coverage evidence.
 
     Temporary SQLite tables keep the feature calculation bounded to an 8 m
@@ -321,7 +329,8 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
     prepare_geometry_features(votes, origin, voxel_size, config, checkpoint)
     refresh_geometry_decisions(votes)
     active_codes = {int(value) for value in (by_id.values() if active_codes is None else active_codes)}
-    scene_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint)
+    scene_report = ensure_scene_context(votes, by_id, scan_context, origin, voxel_size, config, checkpoint,
+                                        outline=outline)
     result['terrain'] = _terrain(votes, origin, config, Path(terrain_target), checkpoint, by_id)
     _alternatives(votes, active_codes)
     db = votes.db
@@ -379,9 +388,11 @@ def apply_geometry_rules(votes, by_id, origin, voxel_size, config, terrain_targe
                 wanted = target_or_fallback('ground', alternative, allow_ground)
             if wanted is not None and wanted != current:
                 changes[bytes(key)] = (int(wanted), confidence)
-    seeds = _tree_seeds(votes, by_id, config)
+    seeds = _tree_seeds(votes, by_id, config, voxel_size)
     result['tree_seeds'] = len(seeds)
-    if seeds:
+    # Stage 2c owns tree crowns when shape rules are enabled.  The legacy
+    # feature-cell cylinder remains the backwards-compatible fallback only.
+    if seeds and not config.get('shape_rules', False):
         seed_xy = np.asarray([item[:2] for item in seeds], np.float64)*voxel_size
         seed_top = np.asarray([item[2] for item in seeds], np.float64)*voxel_size
         tree = cKDTree(seed_xy)

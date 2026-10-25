@@ -60,13 +60,23 @@ class ClassPointIndex:
         def commit(self):
             return None
 
-    def __init__(self, path, origin, block=2., radius=None, max_tile_points=5_000_000, checkpoint=lambda: None):
+    _tag_dtype = np.dtype([('root', '<i8'), ('path', '<u8')])
+    _tree_node_bytes = 64
+    _parallel_query_minimum = 20_000
+
+    def __init__(self, path, origin, block=2., radius=None, max_tile_points=1_000_000, checkpoint=lambda: None,
+                 cache_gb=4.0):
         self.origin = np.asarray(origin, np.float64)
         self.block = float(block)
         # Stand-alone users of the historic class did not provide a radius.
         # Keep their small-cell queries correct; production passes its exact
         # transfer radius and therefore duplicates only the needed edge band.
         self.radius = self.block if radius is None else float(radius)
+        if not isinstance(max_tile_points, (int, np.integer)) or isinstance(max_tile_points, (bool, np.bool_)) or max_tile_points < 1:
+            raise ValueError('max_tile_points must be a positive integer')
+        if (not isinstance(cache_gb, (int, float, np.integer, np.floating)) or isinstance(cache_gb, (bool, np.bool_))
+                or not np.isfinite(cache_gb) or cache_gb <= 0):
+            raise ValueError('cache_gb must be greater than zero')
         self.max_tile_points = int(max_tile_points)
         self.directory = Path(str(path)+'.tiles')
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -94,7 +104,15 @@ class ClassPointIndex:
         self._stage_limit = self._global_buffer_limit
         self._super_tile_width = max(1, int(round(16/self.block)))
         self._cache_bytes = 0
-        self._cache_limit = max(1, int(psutil.virtual_memory().available)//4)
+        self._cache_limit = max(1, int(float(cache_gb)*1024**3))
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
+        self._leaf_keys = {}
+        self._numeric_leaf_keys = {}
+        self._child_tags = np.empty(0, self._tag_dtype)
+        self._children_by_root = {}
+        self._max_tree_depth = 0
         self.checkpoint = checkpoint
 
     _key_bits = 21
@@ -249,6 +267,115 @@ class ClassPointIndex:
             key = (key[0], key[1]+(int(bits[0])*4+int(bits[1])*2+int(bits[2]),))
         return key
 
+    @staticmethod
+    def _path_code(path):
+        """Encode a child path with a leading marker so prefixes stay distinct."""
+        code = 1
+        for child in path:
+            code = (code << 3) | int(child)
+        return code
+
+    def _prepare_tile_lookup(self):
+        """Build numeric child and leaf lookups after the tile tree is final."""
+        self._leaf_keys = {}
+        self._numeric_leaf_keys = {}
+        self._children_by_root = {}
+        numeric_children = []
+        self._max_tree_depth = 0
+
+        for key in self._files:
+            root, path = key
+            code = self._path_code(path)
+            self._leaf_keys[(root, code)] = key
+            packed = self._linear_keys(np.asarray(root, np.int64)[None, :])
+            if packed is not None:
+                self._numeric_leaf_keys[(int(packed[0]), code)] = key
+
+        for key in self._children:
+            root, path = key
+            code = self._path_code(path)
+            self._max_tree_depth = max(self._max_tree_depth, len(path)+1)
+            self._children_by_root.setdefault(root, []).append(code)
+            packed = self._linear_keys(np.asarray(root, np.int64)[None, :])
+            if packed is not None:
+                numeric_children.append((int(packed[0]), code))
+
+        self._children_by_root = {root: np.sort(np.asarray(paths, np.uint64))
+                                  for root, paths in self._children_by_root.items()}
+        if numeric_children and self._max_tree_depth <= 20:
+            self._child_tags = np.asarray(numeric_children, dtype=self._tag_dtype)
+            self._child_tags.sort(order=('root', 'path'))
+        else:
+            self._child_tags = np.empty(0, self._tag_dtype)
+
+    @staticmethod
+    def _contains_sorted(values, probes):
+        """Return membership of numeric probes in one sorted numeric array."""
+        locations = np.searchsorted(values, probes)
+        result = locations < len(values)
+        result[result] &= values[locations[result]] == probes[result]
+        return result
+
+    def _numeric_child_mask(self, roots, paths):
+        if not len(self._child_tags):
+            return np.zeros(len(roots), bool)
+        tags = np.empty(len(roots), self._tag_dtype)
+        tags['root'] = roots
+        tags['path'] = paths
+        locations = np.searchsorted(self._child_tags, tags)
+        result = locations < len(self._child_tags)
+        result[result] &= self._child_tags[locations[result]] == tags[result]
+        return result
+
+    def _descend_paths(self, local, child_paths):
+        """Follow one root's child tree for a whole point group in NumPy."""
+        paths = np.ones(len(local), np.uint64)
+        if child_paths is None or not len(child_paths):
+            return paths
+        levels = np.zeros(len(local), np.uint8)
+        for _ in range(self._max_tree_depth):
+            descend = self._contains_sorted(child_paths, paths)
+            if not descend.any():
+                break
+            ids = np.flatnonzero(descend)
+            size = self.block/np.exp2(levels[ids])
+            bits = np.clip(np.floor(local[ids]/(size[:, None]/2)), 0, 1).astype(np.uint8)
+            child = (bits[:, 0]*4+bits[:, 1]*2+bits[:, 2]).astype(np.uint64)
+            paths[ids] = (paths[ids] << np.uint64(3)) | child
+            levels[ids] += 1
+        return paths
+
+    def _tile_paths(self, points, roots, packed_roots):
+        """Determine every leaf path with vector operations, not point callbacks."""
+        if not self._children:
+            return np.ones(len(points), np.uint64)
+        root_low = self.origin+roots*self.block
+        local = points-root_low
+        if packed_roots is not None and len(self._child_tags):
+            paths = np.ones(len(points), np.uint64)
+            levels = np.zeros(len(points), np.uint8)
+            for _ in range(self._max_tree_depth):
+                descend = self._numeric_child_mask(packed_roots, paths)
+                if not descend.any():
+                    break
+                ids = np.flatnonzero(descend)
+                size = self.block/np.exp2(levels[ids])
+                bits = np.clip(np.floor(local[ids]/(size[:, None]/2)), 0, 1).astype(np.uint8)
+                child = (bits[:, 0]*4+bits[:, 1]*2+bits[:, 2]).astype(np.uint64)
+                paths[ids] = (paths[ids] << np.uint64(3)) | child
+                levels[ids] += 1
+            return paths
+
+        paths = np.ones(len(points), np.uint64)
+        order = np.lexsort((roots[:, 2], roots[:, 1], roots[:, 0]))
+        sorted_roots = roots[order]
+        starts = np.r_[0, np.flatnonzero(np.any(sorted_roots[1:] != sorted_roots[:-1], axis=1))+1, len(order)]
+        for first, last in zip(starts[:-1], starts[1:]):
+            ids = order[first:last]
+            root = tuple(map(int, sorted_roots[first]))
+            paths[ids] = self._descend_paths(local[ids], self._children_by_root.get(root))
+        return paths
+
     def add(self, points, codes, ordinals=None):
         """Append direct sources, duplicating only points near a root-tile edge."""
         if self._finalized:
@@ -352,22 +479,83 @@ class ClassPointIndex:
                 continue
             if self._split(key):
                 pending.extend(child for child in self._files if child[0] == key[0] and len(child[1]) == len(key[1])+1)
+        self._prepare_tile_lookup()
         self._finalized = True
+
+    def cache_stats(self):
+        return {'index_cache_hits': int(self._cache_hits), 'index_cache_misses': int(self._cache_misses),
+                'index_cache_evictions': int(self._cache_evictions), 'index_cache_bytes': int(self._cache_bytes),
+                'index_cache_limit_bytes': int(self._cache_limit), 'index_tile_max_depth': int(self._max_tree_depth)}
 
     def _tree(self, key):
         cached = self.cache.get(key)
         if cached is not None:
+            self._cache_hits += 1
             self.cache.move_to_end(key)
             return cached
+        self._cache_misses += 1
         values = self._values(key)
-        cached = (cKDTree(values['xyz']), values['code'].copy(), values['ordinal'].copy(),
-                  int(values['xyz'].nbytes+values['code'].nbytes+values['ordinal'].nbytes))
+        xyz = np.ascontiguousarray(values['xyz'])
+        tree = cKDTree(xyz, copy_data=False)
+        labels, ordinals = values['code'].copy(), values['ordinal'].copy()
+        cost = int(tree.data.nbytes+tree.indices.nbytes+labels.nbytes+ordinals.nbytes+
+                   tree.size*self._tree_node_bytes)
+        cached = (tree, labels, ordinals, cost)
+        # A tile larger than the whole budget is still queryable, but retaining
+        # it would violate the configured cache limit after this call returns.
+        if cost > self._cache_limit:
+            return cached
         self.cache[key] = cached
-        self._cache_bytes += cached[3]
-        while len(self.cache) > 1 and self._cache_bytes > self._cache_limit:
+        self._cache_bytes += cost
+        while self._cache_bytes > self._cache_limit:
             _, old = self.cache.popitem(last=False)
             self._cache_bytes -= old[3]
+            self._cache_evictions += 1
         return cached
+
+    def _tie_winners(self, tree, points, distances, ordinals):
+        """Return deterministic lowest-ordinal winners for true equal-distance ties."""
+        tied = (np.isfinite(distances[:, 0]) & np.isfinite(distances[:, 1]) &
+                np.isclose(distances[:, 0], distances[:, 1], rtol=0, atol=1e-12))
+        tie_ids = np.flatnonzero(tied)
+        if not len(tie_ids):
+            return tie_ids, np.empty(0, np.intp)
+        workers = -1 if len(tie_ids) >= self._parallel_query_minimum else 1
+        candidates = tree.query_ball_point(points[tie_ids], distances[tie_ids, 0]+1e-12, workers=workers)
+        lengths = np.fromiter((len(item) for item in candidates), dtype=np.intp, count=len(candidates))
+        if not lengths.any():
+            return tie_ids[:0], np.empty(0, np.intp)
+        flat = np.concatenate([np.asarray(item, np.intp) for item in candidates if len(item)])
+        owners = np.repeat(np.arange(len(tie_ids), dtype=np.intp), lengths)
+        deltas = tree.data[flat]-points[tie_ids[owners]]
+        exact = np.isclose(np.sqrt(np.einsum('ij,ij->i', deltas, deltas)), distances[tie_ids[owners], 0],
+                           rtol=0, atol=1e-12)
+        if not exact.any():
+            return tie_ids[:0], np.empty(0, np.intp)
+        owners, flat = owners[exact], flat[exact]
+        order = np.lexsort((ordinals[flat], owners))
+        sorted_owners = owners[order]
+        first = np.r_[True, sorted_owners[1:] != sorted_owners[:-1]]
+        winners = order[first]
+        return tie_ids[owners[winners]], flat[winners]
+
+    def _query_group(self, points, ids, key, radius, result, selected_distances):
+        if key is None or key not in self._files:
+            return
+        tree, labels, ordinals, _ = self._tree(key)
+        count = min(2, len(labels))
+        workers = -1 if len(ids) >= self._parallel_query_minimum else 1
+        distances, local = tree.query(points[ids], k=count, distance_upper_bound=radius, workers=workers)
+        if count == 1:
+            distances, local = distances[:, None], local[:, None]
+        valid = np.isfinite(distances[:, 0])
+        if valid.any():
+            result[ids[valid]] = labels[local[valid, 0]]
+            selected_distances[ids[valid]] = distances[valid, 0]
+        if count > 1:
+            tied, chosen = self._tie_winners(tree, points[ids], distances, ordinals)
+            if len(tied):
+                result[ids[tied]] = labels[chosen]
 
     def nearest_codes(self, points, radius, return_distances=False):
         self._finalize()
@@ -377,31 +565,28 @@ class ClassPointIndex:
         if not len(points):
             return (result, selected_distances) if return_distances else result
         roots = np.floor((points-self.origin)/self.block).astype(np.int64)
-        tags = [self._tile_key(point, root) for point, root in zip(points, roots)]
-        order = np.argsort(np.asarray([repr(tag) for tag in tags]), kind='stable')
-        starts = np.r_[0, np.flatnonzero(np.asarray([tags[order[index]] != tags[order[index-1]] for index in range(1, len(order))]))+1, len(order)]
-        for first, last in zip(starts[:-1], starts[1:]):
-            ids, key = order[first:last], tags[order[first]]
-            if key not in self._files:
-                continue
-            tree, labels, ordinals, _ = self._tree(key)
-            count = min(2, len(labels))
-            distances, local = tree.query(points[ids], k=count, distance_upper_bound=radius, workers=-1)
-            if count == 1:
-                distances, local = distances[:, None], local[:, None]
-            valid = np.isfinite(distances[:, 0])
-            if valid.any():
-                result[ids[valid]] = labels[local[valid, 0]]
-                selected_distances[ids[valid]] = distances[valid, 0]
-            if count > 1:
-                tied = valid & np.isfinite(distances[:, 1]) & np.isclose(distances[:, 0], distances[:, 1], rtol=0, atol=1e-12)
-                for output_id, distance in zip(ids[tied], distances[tied, 0]):
-                    candidates = np.asarray(tree.query_ball_point(points[output_id], distance+1e-12))
-                    if len(candidates):
-                        squared = ((tree.data[candidates]-points[output_id])**2).sum(axis=1)
-                        exact = candidates[np.isclose(np.sqrt(squared), distance, rtol=0, atol=1e-12)]
-                        chosen = exact[np.argmin(ordinals[exact])]
-                        result[output_id] = labels[chosen]
+        packed_roots = self._linear_keys(roots)
+        paths = self._tile_paths(points, roots, packed_roots)
+        if packed_roots is not None:
+            order = np.lexsort((paths, packed_roots))
+            sorted_roots, sorted_paths = packed_roots[order], paths[order]
+            starts = np.r_[0, np.flatnonzero((sorted_roots[1:] != sorted_roots[:-1]) |
+                                              (sorted_paths[1:] != sorted_paths[:-1]))+1, len(order)]
+            for first, last in zip(starts[:-1], starts[1:]):
+                ids = order[first:last]
+                key = self._numeric_leaf_keys.get((int(sorted_roots[first]), int(sorted_paths[first])))
+                self._query_group(points, ids, key, radius, result, selected_distances)
+        else:
+            order = np.lexsort((paths, roots[:, 2], roots[:, 1], roots[:, 0]))
+            sorted_roots, sorted_paths = roots[order], paths[order]
+            changed = ((sorted_paths[1:] != sorted_paths[:-1]) |
+                       np.any(sorted_roots[1:] != sorted_roots[:-1], axis=1))
+            starts = np.r_[0, np.flatnonzero(changed)+1, len(order)]
+            for first, last in zip(starts[:-1], starts[1:]):
+                ids = order[first:last]
+                root = tuple(map(int, sorted_roots[first]))
+                key = self._leaf_keys.get((root, int(sorted_paths[first])))
+                self._query_group(points, ids, key, radius, result, selected_distances)
         return (result, selected_distances) if return_distances else result
 
     def close(self):
@@ -409,6 +594,11 @@ class ClassPointIndex:
             return
         self._closed = True
         self.cache.clear()
+        self._cache_bytes = 0
+        self._leaf_keys.clear()
+        self._numeric_leaf_keys.clear()
+        self._children_by_root.clear()
+        self._child_tags = np.empty(0, self._tag_dtype)
         self._buffers.clear()
         self._buffer_sizes.clear()
         self._buffered_bytes = 0
@@ -431,18 +621,30 @@ class TreeCrownIndex:
             self.z_max = np.asarray(data['z_max'], np.float64)
         if not (len(self.x) == len(self.y) == len(self.radius) == len(self.z_min) == len(self.z_max)):
             raise ValueError('tree crown artifact arrays must have equal length')
+        valid = (self.radius > 0.) & (self.z_max > self.z_min)
+        self.x, self.y = self.x[valid], self.y[valid]
+        self.radius, self.z_min, self.z_max = self.radius[valid], self.z_min[valid], self.z_max[valid]
+        self._max_radius = float(self.radius.max()) if len(self.radius) else 0.
+        self._tree = cKDTree(np.column_stack((self.x, self.y))) if len(self.radius) else None
 
     def mask(self, points):
         points = np.asarray(points, np.float64)
         result = np.zeros(len(points), bool)
-        for x, y, radius, low, high in zip(self.x, self.y, self.radius, self.z_min, self.z_max):
-            if high <= low or radius <= 0.:
+        if self._tree is None or not len(points):
+            return result
+        for start in range(0, len(points), 100_000):
+            stop = min(len(points), start+100_000)
+            block = points[start:stop]
+            candidates = self._tree.query_ball_point(block[:, :2], self._max_radius, workers=1)
+            lengths = np.fromiter((len(item) for item in candidates), dtype=np.intp, count=len(candidates))
+            if not lengths.any():
                 continue
-            vertical = (points[:, 2] >= low) & (points[:, 2] <= high)
-            selected = np.flatnonzero(vertical)
-            if len(selected):
-                delta = points[selected, :2]-np.asarray((x, y))
-                result[selected] |= np.einsum('ij,ij->i', delta, delta) <= radius*radius
+            crowns = np.concatenate([np.asarray(item, np.intp) for item in candidates if len(item)])
+            rows = np.repeat(np.arange(len(block), dtype=np.intp), lengths)
+            delta = block[rows, :2]-np.column_stack((self.x[crowns], self.y[crowns]))
+            inside = ((block[rows, 2] >= self.z_min[crowns]) & (block[rows, 2] <= self.z_max[crowns]) &
+                      (np.einsum('ij,ij->i', delta, delta) <= self.radius[crowns]**2))
+            result[start+rows[inside]] = True
         return result
 
 
@@ -499,10 +701,11 @@ class GroundDtmIndex:
 class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
-                 geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
-                 terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None,
-                 class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
-                 tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
+                  geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
+                  terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None,
+                  class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
+                  tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03,
+                  export_index_cache_gb=4.0, export_index_max_tile_points=1_000_000):
         self.directory, self.stores, self.votes, self.origin, self.voxel_size = Path(directory), stores, votes, np.asarray(origin), voxel_size
         self.skipped, self.mirror, self.radius, self.checkpoint = skipped, mirror, radius, checkpoint
         self.radius_max = float(radius if class_transfer_radius_max is None else class_transfer_radius_max)
@@ -511,6 +714,10 @@ class ClassifiedSource:
                                            for key, value in (transfer_station_positions or {}).items()}
         self.adaptive_transfer = bool(self.radius_max > self.radius and self.range_factor > 0.)
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
+        self.export_index_cache_gb = float(export_index_cache_gb)
+        self.export_index_max_tile_points = export_index_max_tile_points
+        self.index_cache_stats = {'index_cache_hits': 0, 'index_cache_misses': 0, 'index_cache_evictions': 0,
+                                  'index_cache_bytes': 0, 'index_cache_limit_bytes': 0, 'index_tile_max_depth': 0}
         self.geometry = PlaneIndex(geometry_planes) if geometry_planes else None
         self.terrain = TerrainIndex(terrain) if terrain else None
         self.geometry_fill_tolerance = geometry_fill_tolerance
@@ -542,7 +749,9 @@ class ClassifiedSource:
         if not self.radius_max: return self
         try:
             self.temporary = tempfile.TemporaryDirectory(prefix='e57cls_class_neighbours_', dir=self.directory)
-            self.index = ClassPointIndex(Path(self.temporary.name)/'classes', self.origin, radius=self.radius_max, checkpoint=self.checkpoint)
+            self.index = ClassPointIndex(Path(self.temporary.name)/'classes', self.origin, radius=self.radius_max,
+                                         checkpoint=self.checkpoint, cache_gb=self.export_index_cache_gb,
+                                         max_tile_points=self.export_index_max_tile_points)
             total = max(1, sum(selected_count(store, 'reduced') for store in self.stores))
             prepared = 0
             for store in self.stores:
@@ -611,6 +820,7 @@ class ClassifiedSource:
                 assigned = inherited != 0
             ids = np.flatnonzero(unknown)[assigned]; codes[ids], confidence[ids] = inherited[assigned], np.maximum(confidence[ids], 128)
             self.class_transfer_count += len(ids)
+            self.index_cache_stats = self.index.cache_stats()
             self.timing_seconds['transfer'] += time.perf_counter()-started
         if self.geometry is not None and store.meta['scan_index'] not in self.skipped:
             started = time.perf_counter()
@@ -727,6 +937,7 @@ class ClassifiedSource:
         index, self.index = self.index, None
         if index is not None:
             try:
+                self.index_cache_stats = index.cache_stats()
                 index.close()
             except Exception:
                 pass

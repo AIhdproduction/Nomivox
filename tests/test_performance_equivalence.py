@@ -3,11 +3,14 @@
 import os
 import sqlite3
 import time
+import gc
+import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import laspy
 import numpy as np
+import psutil
 import pytest
 from scipy.spatial import cKDTree
 
@@ -16,7 +19,7 @@ from e57cls.geometry.cameras import Camera, Pose
 from e57cls.mirror.evidence import DirectIndex
 from e57cls.output.classify import ClassifiedSource
 from e57cls.output.las import ClassPointIndex, write_cloud
-from e57cls.pipeline.config import DEFAULTS
+from e57cls.pipeline.config import DEFAULTS, resolve_config
 from e57cls.pipeline import run as pipeline_run
 from e57cls.vote.engine import VoteStore, voxel_keys
 import e57cls.vote.engine as vote_engine
@@ -405,28 +408,178 @@ def test_output_prepare_events_and_timing_are_reported(tmp_path):
     assert 'terrain_fill' in result['timing_seconds']
 
 
+def _frozen_legacy_tiled_codes(index, points, radius):
+    """Pre-vectorization transfer lookup retained as a byte-for-byte oracle."""
+    index._finalize()
+    points = np.asarray(points, np.float64)
+    result = np.zeros(len(points), np.uint8)
+    roots = np.floor((points-index.origin)/index.block).astype(np.int64)
+    tags = [index._tile_key(point, root) for point, root in zip(points, roots)]
+    order = np.argsort(np.asarray([repr(tag) for tag in tags]), kind='stable')
+    starts = np.r_[0, np.flatnonzero(np.asarray([tags[order[position]] != tags[order[position-1]]
+                                                  for position in range(1, len(order))]))+1, len(order)]
+    for first, last in zip(starts[:-1], starts[1:]):
+        ids, key = order[first:last], tags[order[first]]
+        if key not in index._files:
+            continue
+        tree, labels, ordinals, _ = index._tree(key)
+        count = min(2, len(labels))
+        distances, local = tree.query(points[ids], k=count, distance_upper_bound=radius, workers=-1)
+        if count == 1:
+            distances, local = distances[:, None], local[:, None]
+        valid = np.isfinite(distances[:, 0])
+        if valid.any():
+            result[ids[valid]] = labels[local[valid, 0]]
+        if count > 1:
+            tied = valid & np.isfinite(distances[:, 1]) & np.isclose(distances[:, 0], distances[:, 1], rtol=0, atol=1e-12)
+            for output_id, distance in zip(ids[tied], distances[tied, 0]):
+                candidates = np.asarray(tree.query_ball_point(points[output_id], distance+1e-12))
+                if len(candidates):
+                    squared = ((tree.data[candidates]-points[output_id])**2).sum(axis=1)
+                    exact = candidates[np.isclose(np.sqrt(squared), distance, rtol=0, atol=1e-12)]
+                    chosen = exact[np.argmin(ordinals[exact])]
+                    result[output_id] = labels[chosen]
+    return result
+
+
+def _rotated_export_store(tmp_path, local):
+    valid = np.ones(len(local), bool)
+    np.save(tmp_path/'rotated_xyz.npy', local)
+    np.save(tmp_path/'rotated_valid.npy', valid)
+    half_angle = np.deg2rad(30.)/2
+    pose = {'rotation': {'w': float(np.cos(half_angle)), 'x': 0., 'y': 0., 'z': float(np.sin(half_angle))},
+            'translation': {'x': 2_600_000., 'y': 1_200_000., 'z': 480.}}
+    return ScanStore(tmp_path, {'record_count': len(local), 'valid_count': len(local), 'scan_index': 1,
+        'arrays': {'xyz_local': {'path': 'rotated_xyz.npy'}, 'valid': {'path': 'rotated_valid.npy'}},
+        'metadata': {'pose': pose, 'points': {'fields': []}},
+        'bounds_local': {'min': local.min(axis=0).tolist(), 'max': local.max(axis=0).tolist()}})
+
+
+def test_vectorized_export_matches_frozen_legacy_for_rotated_georeferenced_tiles(tmp_path):
+    """Cover a 200k-point export, deep tiles, projected coordinates, and exact ties."""
+    rng = np.random.default_rng(20261025)
+    direct_count, point_count = 59_996, 200_000
+    centers = np.asarray(((-3., -3., .5), (-3., 3., .5), (3., -3., .5),
+                          (3., 3., .5), (0., 3., .5), (3., 0., .5)))
+    clustered = np.concatenate([center+rng.uniform(-.35, .35, (9_999, 3)) for center in centers])
+    direct_local = np.vstack((np.asarray(((-.02, 0., 0.), (.02, 0., 0.))), clustered))
+    direct_codes = rng.integers(2, 68, direct_count, dtype=np.uint8)
+    direct_codes[:2] = (9, 2)
+    sources = rng.integers(0, direct_count, point_count-direct_count)
+    unknown_local = direct_local[sources]+rng.uniform(-.004, .004, (point_count-direct_count, 3))
+    unknown_local[0] = (0., 0., 0.)
+    local = np.vstack((direct_local, unknown_local))
+    store = _rotated_export_store(tmp_path, local)
+    world = Pose.from_dict(store.meta['metadata']['pose']).to_world(local)
+    radius = .05
+
+    reference = ClassPointIndex(tmp_path/'reference', np.asarray((2_600_000., 1_200_000., 480.)), radius=radius,
+                                max_tile_points=512, cache_gb=.05)
+    try:
+        reference.add(world[:direct_count], direct_codes)
+        inherited = _frozen_legacy_tiled_codes(reference, world[direct_count:], radius)
+    finally:
+        reference.close()
+    expected = np.r_[direct_codes, np.where(inherited != 0, inherited, 1).astype(np.uint8)]
+    assert expected[direct_count] == 9
+
+    class Votes:
+        def lookup(self, keys):
+            return np.r_[direct_codes, np.ones(point_count-direct_count, np.uint8)], np.r_[
+                np.full(direct_count, 200, np.uint8), np.zeros(point_count-direct_count, np.uint8)]
+
+    output = tmp_path/'rotated.las'
+    result = write_cloud(output, [store], Votes(), np.asarray((2_600_000., 1_200_000., 480.)), .02, '', list(range(1, 256)),
+                         class_transfer_radius=radius, export_index_cache_gb=.05, export_index_max_tile_points=512)
+    actual = np.asarray(laspy.read(output).classification)
+    np.testing.assert_array_equal(actual, expected)
+    assert result['record_count'] == point_count
+    assert result['readback']['all_classes_valid']
+    assert result['index_tile_max_depth'] >= 2
+
+
+def test_export_index_cache_is_bounded_and_reports_lru_statistics(tmp_path):
+    rng = np.random.default_rng(20261026)
+    groups = [np.asarray((2.*root, 0., 0.))+rng.uniform(.1, .2, (5_000, 3)) for root in range(6)]
+    sources = np.concatenate(groups)
+    codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=.01, cache_gb=.001)
+    try:
+        index.add(sources, codes)
+        index.nearest_codes(groups[0][:100], .01)
+        index.nearest_codes(groups[0][:100], .01)
+        for group in groups[1:]:
+            index.nearest_codes(group[:100], .01)
+        stats = index.cache_stats()
+        assert stats['index_cache_hits'] >= 1
+        assert stats['index_cache_misses'] >= len(groups)
+        assert stats['index_cache_evictions'] >= 1
+        assert stats['index_cache_bytes'] <= stats['index_cache_limit_bytes']
+    finally:
+        index.close()
+    with pytest.raises(ValueError, match='cache_gb'):
+        ClassPointIndex(tmp_path/'invalid', np.zeros(3), cache_gb=0)
+
+
+def test_export_index_cache_config_default_and_validation(tmp_path):
+    source = tmp_path/'input.e57'
+    source.touch()
+    assert DEFAULTS['export_index_cache_gb'] == 4.0
+    assert DEFAULTS['export_index_max_tile_points'] == 1_000_000
+    config = resolve_config({'source': str(source), 'export_index_cache_gb': .5, 'export_index_max_tile_points': 123})
+    assert config['export_index_cache_gb'] == .5
+    assert config['export_index_max_tile_points'] == 123
+    with pytest.raises(ValueError, match='export_index_cache_gb'):
+        resolve_config({'source': str(source), 'export_index_cache_gb': 0})
+
+
 @pytest.mark.slow
-@pytest.mark.skipif(not os.environ.get('NOMIVOX_PERF_BENCHMARK'), reason='set NOMIVOX_PERF_BENCHMARK=1 to run benchmarks')
+@pytest.mark.skipif(not os.environ.get('NOMIVOX_RUN_SLOW'), reason='set NOMIVOX_RUN_SLOW=1 to run benchmarks')
 def test_tiled_transfer_benchmark(tmp_path):
-    """Report the requested end-to-end tile-index timings on synthetic data."""
+    """Report 10m transfer runtime and phase-local peak RSS before and after optimization."""
     rng = np.random.default_rng(20261018)
     sources = rng.uniform(0, 40, (3_000_000, 3))
     codes = rng.integers(2, 68, len(sources), dtype=np.uint8)
-    queries = rng.uniform(0, 40, (125_000, 3))
+    queries = rng.uniform(0, 40, (10_000_000, 3))
     radius = .01
-    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius)
+    index = ClassPointIndex(tmp_path/'classes', np.zeros(3), radius=radius, cache_gb=1.)
+
+    def measure(call):
+        process = psutil.Process()
+        peak = [process.memory_info().rss]
+        stop = threading.Event()
+        def sample():
+            while not stop.wait(.02):
+                peak[0] = max(peak[0], process.memory_info().rss)
+        watcher = threading.Thread(target=sample, daemon=True)
+        watcher.start()
+        started = time.perf_counter()
+        try:
+            value = call()
+        finally:
+            elapsed = time.perf_counter()-started
+            stop.set()
+            watcher.join()
+            peak[0] = max(peak[0], process.memory_info().rss)
+        return value, elapsed, peak[0]
+
     try:
         started = time.perf_counter()
         for start in range(0, len(sources), 500_000):
             index.add(sources[start:start+500_000], codes[start:start+500_000])
         index._finalize()
         add_seconds = time.perf_counter()-started
-        started = time.perf_counter()
-        result = index.nearest_codes(queries, radius)
-        query_seconds = time.perf_counter()-started
-        print(f'tiled transfer benchmark: add={add_seconds:.2f}s query={query_seconds:.2f}s')
-        assert result.shape == (len(queries),)
-        assert add_seconds <= 12
+        legacy, legacy_seconds, legacy_peak = measure(lambda: _frozen_legacy_tiled_codes(index, queries, radius))
+        index.cache.clear()
+        index._cache_bytes = 0
+        gc.collect()
+        result, query_seconds, query_peak = measure(lambda: index.nearest_codes(queries, radius))
+        print('tiled transfer benchmark: '
+              f'build={add_seconds:.2f}s legacy={legacy_seconds:.2f}s vectorized={query_seconds:.2f}s '
+              f'legacy_peak_rss_mib={legacy_peak/1024**2:.1f} vectorized_peak_rss_mib={query_peak/1024**2:.1f}')
+        np.testing.assert_array_equal(result, legacy)
+        assert query_seconds <= legacy_seconds/3
+        assert query_peak <= index._cache_limit+1024**3
     finally:
         index.close()
 

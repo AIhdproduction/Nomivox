@@ -33,7 +33,8 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "cable_component_min_voxels": 8, "cable_component_min_span": .20,
             "electrical_component_min_voxels": 8, "electrical_component_min_span": .06,
             "class_transfer_radius": .01, "class_transfer_range_factor": .003,
-            "class_transfer_radius_max": .05,
+            "class_transfer_radius_max": .05, "export_index_cache_gb": 4.0,
+            "export_index_max_tile_points": 1_000_000,
             "depth_gate_classes": ["door"], "door_depth_limit": 1.0,
             "door_max_width": 1.4, "door_max_height": 2.6,
             "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "building", "floor", "ground", "road", "sidewalk"],
@@ -320,6 +321,12 @@ def resolve_config(config: dict, base: Path = PROJECT):
                 'tree_crown_radius', 'tree_crown_radius_min', 'tree_crown_radius_max', 'tree_crown_max_height', 'tree_crown_grow_radius'):
         if not 0 < value[key] < float('inf'):
             raise ValueError(f'Invalid {key}')
+    if (not isinstance(value['export_index_cache_gb'], (int, float)) or isinstance(value['export_index_cache_gb'], bool)
+            or not 0 < value['export_index_cache_gb'] < float('inf')):
+        raise ValueError('Invalid export_index_cache_gb')
+    if (not isinstance(value['export_index_max_tile_points'], int) or isinstance(value['export_index_max_tile_points'], bool)
+            or value['export_index_max_tile_points'] < 1):
+        raise ValueError('Invalid export_index_max_tile_points')
     for key in ('scene_outline_min_cover', 'scene_outline_roof_band'):
         if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
                 or not 0 <= value[key] < float('inf')):

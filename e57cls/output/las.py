@@ -63,7 +63,8 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15, terrain_fill=False,
                 station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None,
                 class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
-                tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
+                tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03,
+                export_index_cache_gb=4.0, export_index_max_tile_points=1_000_000):
     header = make_header(stores, crs_wkt, station_ids=station_ids, station_count=station_count)
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -89,7 +90,9 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                               progress, force_unclassified, terrain_outdoor_scans, class_transfer_range_factor,
                               class_transfer_radius_max, transfer_station_positions, tree_crowns, tree_fill,
                               ground_dtm=ground_dtm, ground_dtm_alternatives=ground_dtm_alternatives,
-                              ground_dtm_band=ground_dtm_band) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
+                              ground_dtm_band=ground_dtm_band,
+                              export_index_cache_gb=export_index_cache_gb,
+                              export_index_max_tile_points=export_index_max_tile_points) as classified, laspy.open(temporary, mode="w", header=header, **writer_options) as writer:
             for store in stores:
                 scan = store.meta["scan_index"]
                 meta = store.meta["metadata"]
@@ -197,7 +200,7 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 "class_transfer_count": inherited_count,
                 "geometry_fill_counts": classified.geometry_fill_counts,
                 "readback": verification, "warnings": warnings, "las_scale_m": header.scales.tolist(),
-                "timing_seconds": {**classified.timing_seconds, **timing}}
+                "timing_seconds": {**classified.timing_seconds, **timing}, **classified.index_cache_stats}
     finally:
         if extra_writer:
             extra_writer.close()

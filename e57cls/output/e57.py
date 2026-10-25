@@ -153,7 +153,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
            terrain, terrain_ground_tolerance, terrain_fill,
            station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None,
            class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
-           tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
+           tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03,
+           export_index_cache_gb=4.0, export_index_max_tile_points=1_000_000):
     source_file = lib.ImageFile(str(source), "r")
     image = lib.ImageFile(str(path), "w")
     total = sum(selected_count(store, density) for store in stores)
@@ -169,7 +170,9 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
                               progress, force_unclassified, terrain_outdoor_scans, class_transfer_range_factor,
                               class_transfer_radius_max, transfer_station_positions, tree_crowns, tree_fill,
                               ground_dtm=ground_dtm, ground_dtm_alternatives=ground_dtm_alternatives,
-                              ground_dtm_band=ground_dtm_band) as classified:
+                              ground_dtm_band=ground_dtm_band,
+                              export_index_cache_gb=export_index_cache_gb,
+                              export_index_max_tile_points=export_index_max_tile_points) as classified:
           for store in stores:
             prototypes = store.meta["metadata"]["points"]["fields"]
             fields = {name: prototypes.get(name, {"type": "Float"}) for name in store.meta["arrays"]
@@ -249,7 +252,8 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
             "unclassified_share": int(counts[1])/max(1, written), "mirror_counts": mirrors.tolist(),
             "extra_removed_count": discarded, "class_transfer_count": transferred,
             "geometry_fill_counts": classified.geometry_fill_counts, "_samples": samples,
-            "timing_seconds": {**classified.timing_seconds, 'write': write_seconds, 'readback': 0.}}
+            "timing_seconds": {**classified.timing_seconds, 'write': write_seconds, 'readback': 0.},
+            **classified.index_cache_stats}
 
 
 def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allowed_codes,
@@ -259,7 +263,8 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
               terrain=None, terrain_ground_tolerance=.15, terrain_fill=False,
               station_ids=False, station_count=0, force_unclassified=None, terrain_outdoor_scans=None,
               class_transfer_range_factor=0., class_transfer_radius_max=None, transfer_station_positions=None,
-              tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03):
+              tree_crowns=None, tree_fill=False, ground_dtm=None, ground_dtm_alternatives=None, ground_dtm_band=.03,
+              export_index_cache_gb=4.0, export_index_max_tile_points=1_000_000):
     """Write an E57 atomically, retaining images and Nomivox extension fields."""
     temporary = path.with_name(path.stem+".partial"+path.suffix)
     extra = path.with_name(path.stem+"_no_reflection"+path.suffix)
@@ -271,7 +276,9 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
                         station_ids, station_count, force_unclassified, terrain_outdoor_scans,
                         class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions,
                         tree_crowns, tree_fill, ground_dtm=ground_dtm,
-                        ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band)
+                        ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band,
+                        export_index_cache_gb=export_index_cache_gb,
+                        export_index_max_tile_points=export_index_max_tile_points)
         started = time.perf_counter()
         result["readback"] = verify_e57(temporary, source, stores, result["record_count"], allowed_codes,
                                           primary_without_reflections, result.pop("_samples"))
@@ -286,7 +293,9 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
                                   station_ids, station_count, force_unclassified, terrain_outdoor_scans,
                                   class_transfer_range_factor, class_transfer_radius_max, transfer_station_positions,
                                   tree_crowns, tree_fill, ground_dtm=ground_dtm,
-                                  ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band)
+                                  ground_dtm_alternatives=ground_dtm_alternatives, ground_dtm_band=ground_dtm_band,
+                                  export_index_cache_gb=export_index_cache_gb,
+                                  export_index_max_tile_points=export_index_max_tile_points)
             started = time.perf_counter()
             verify_e57(extra_temporary, source, stores, extra_result["record_count"], allowed_codes, True,
                        extra_result.pop("_samples"))
@@ -296,6 +305,8 @@ def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allow
             result["extra_removed_count"] = extra_result["extra_removed_count"]
             for key, value in extra_result['timing_seconds'].items():
                 result['timing_seconds'][key] = result['timing_seconds'].get(key, 0.)+value
+            for key in ('index_cache_hits', 'index_cache_misses', 'index_cache_evictions'):
+                result[key] = result.get(key, 0)+extra_result.get(key, 0)
         return result
     except Exception:
         temporary.unlink(missing_ok=True)

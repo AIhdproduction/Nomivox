@@ -1230,7 +1230,8 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
                         terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set(),
                         ground_dtm=export_ground_dtm, ground_dtm_alternatives=export_ground_alt,
-                        ground_dtm_band=config['ground_dtm_band'])
+                        ground_dtm_band=config['ground_dtm_band'], export_index_cache_gb=config['export_index_cache_gb'],
+                        export_index_max_tile_points=config['export_index_max_tile_points'])
     else:
         result = writer(path, stores, votes, np.asarray(config['voxel_origin']), config['voxel_size'],
                         inspection['metadata'].get('coordinateMetadata', ''), [row['code'] for row in rows], (), control.checkpoint, progress,
@@ -1245,7 +1246,8 @@ def execute_slam(config, source, output, cache, inspection, store_report, stores
                         station_ids=True, station_count=len(stations), force_unclassified=force_unclassified,
                         terrain_outdoor_scans={store.meta['scan_index'] for store in stores} if scene == 'outdoor' else set(),
                         ground_dtm=export_ground_dtm, ground_dtm_alternatives=export_ground_alt,
-                        ground_dtm_band=config['ground_dtm_band'])
+                        ground_dtm_band=config['ground_dtm_band'], export_index_cache_gb=config['export_index_cache_gb'],
+                        export_index_max_tile_points=config['export_index_max_tile_points'])
     control.event('phase_finished', phase='output')
     result.update(point_reduction=config['point_reduction'], output_density=config['output_density'],
                   computed_points=sum(selected_count(store, 'reduced') for store in stores), output_points=result['record_count'], format=config['format'])
@@ -1832,7 +1834,8 @@ def execute(config, backend_factory=None, listen=True):
                         terrain_outdoor_scans={item['scan'] for item in scan_results if item.get('scene') == 'outdoor'},
                         ground_dtm=export_ground_dtm,
                         ground_dtm_alternatives=export_ground_alt,
-                        ground_dtm_band=config['ground_dtm_band'])
+                        ground_dtm_band=config['ground_dtm_band'], export_index_cache_gb=config['export_index_cache_gb'],
+                        export_index_max_tile_points=config['export_index_max_tile_points'])
         timings["output"] = time.monotonic()-output_start
         transferred = {"cartesianX","cartesianY","cartesianZ","colorRed","colorGreen","colorBlue","intensity"}
         omitted = {str(s.meta["scan_index"]): sorted(set(s.meta["metadata"]["points"]["fields"])-transferred) for s in stores}

@@ -151,6 +151,10 @@ def representatives(store, directory: Path, origin, size, checkpoint=lambda: Non
 
 
 class VoteStore:
+    # Export may coalesce equal voxel keys before calling lookup.  Adapters
+    # with order-dependent test or plugin behaviour can explicitly opt out.
+    lookup_is_key_pure = True
+
     def __init__(self, path, station_tracking=False):
         self.path = Path(path)
         self.station_tracking = bool(station_tracking)

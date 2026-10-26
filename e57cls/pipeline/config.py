@@ -39,8 +39,18 @@ DEFAULTS = {"schema_version": 1, "processing_mode": "classify_and_filter", "inpu
             "door_max_width": 1.4, "door_max_height": 2.6,
             "geometry_fill": True, "geometry_fill_classes": ["ceiling", "wall", "building", "floor", "ground", "road", "sidewalk"],
             "geometry_fill_min_area": .5, "geometry_fill_max_gap": .35, "geometry_fill_tolerance": .02,
-            "geometry_fill_max_planes": 400, "geometry_fill_min_component_voxels": 20,
-            "geometry_fill_ransac_trials": 256, "geometry_fill_ransac_max_trials": 1024,
+            # The plane limit applies per core tile, not to an entire class.
+            # 12 m raises support fractions in room-scale tiles while the
+            # halo preserves continuous facades across their boundaries.
+            "geometry_fill_max_planes": 400, "geometry_fill_tile_size": 12., "geometry_fill_tile_overlap": .75,
+            "geometry_fill_min_component_voxels": 20,
+            # Tile-local class supports are markedly denser than global
+            # supports; 64 seeded hypotheses are sufficient before the
+            # adaptive confidence bound takes over.
+            "geometry_fill_ransac_trials": 64, "geometry_fill_ransac_max_trials": 256,
+            # 20k score points bound a 64-hypothesis distance block to about
+            # 10 MB while retaining robust tile-local support estimates.
+            "geometry_fill_ransac_score_sample": 20_000,
             "geometry_rules": True, "geometry_cell_size": .10, "geometry_tile_size": 8.,
             "segment_vote": True, "segment_min_planarity": .5, "segment_normal_angle": 15.,
             "segment_plane_distance": .03, "segment_min_cells": 3, "segment_min_share": .6,
@@ -300,12 +310,13 @@ def resolve_config(config: dict, base: Path = PROJECT):
         raise ValueError('Invalid component cleanup setting')
     for key in ('component_min_voxels', 'component_min_cells', 'component_sparse_max_voxels_per_cell', 'cable_component_min_voxels',
                 'electrical_component_min_voxels', 'geometry_fill_max_planes', 'geometry_fill_min_component_voxels',
-                'geometry_fill_ransac_trials', 'geometry_fill_ransac_max_trials', 'segment_min_cells'):
+                'geometry_fill_ransac_trials', 'geometry_fill_ransac_max_trials', 'geometry_fill_ransac_score_sample', 'segment_min_cells'):
         if not isinstance(value[key], int) or isinstance(value[key], bool) or value[key] < 1:
             raise ValueError(f'Invalid {key}')
     for key in ('cable_component_min_span','electrical_component_min_span','class_transfer_radius', 'class_transfer_radius_max', 'reflection_neighbor_radius',
                 'surface_normal_radius','door_depth_limit','door_max_width','door_max_height','geometry_fill_min_area',
-                'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_cell_size', 'geometry_tile_size',
+                'geometry_fill_max_gap','geometry_fill_tolerance', 'geometry_fill_tile_size', 'geometry_fill_tile_overlap',
+                'geometry_cell_size', 'geometry_tile_size',
                 'segment_plane_distance',
                 'shape_object_cell', 'shape_level_cell', 'shape_level_min_area', 'shape_level_search', 'shape_structural_width',
                 'shape_structural_area', 'shape_object_max_size', 'shape_carpet_max_height', 'shape_column_max_size',
@@ -327,6 +338,8 @@ def resolve_config(config: dict, base: Path = PROJECT):
     if (not isinstance(value['export_index_max_tile_points'], int) or isinstance(value['export_index_max_tile_points'], bool)
             or value['export_index_max_tile_points'] < 1):
         raise ValueError('Invalid export_index_max_tile_points')
+    if value['geometry_fill_tile_overlap'] >= value['geometry_fill_tile_size']/2:
+        raise ValueError('Invalid geometry fill tile overlap')
     for key in ('scene_outline_min_cover', 'scene_outline_roof_band'):
         if (not isinstance(value[key], (int, float)) or isinstance(value[key], bool)
                 or not 0 <= value[key] < float('inf')):

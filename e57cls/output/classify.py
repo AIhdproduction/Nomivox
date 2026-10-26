@@ -26,7 +26,17 @@ def classify_points(store, start, stop, xyz, valid, votes, origin, voxel_size,
         world = scan_pose(store.meta["metadata"]).to_world(xyz[valid])
     if skipped_scan:
         return world, np.ones(len(world), np.uint8), np.zeros(len(world), np.uint8), np.zeros(len(world), np.uint8)
-    codes, confidence = votes.lookup(voxel_keys(world, origin, voxel_size))
+    keys = voxel_keys(world, origin, voxel_size)
+    # VoteStore's snapshot lookup is a pure key-to-value mapping.  TLS blocks
+    # commonly contain many points in every voxel, so look up each key once
+    # and scatter the result back to the original point order.  Third-party
+    # lookup implementations retain their historic call/order semantics.
+    if getattr(votes, 'lookup_is_key_pure', False) and len(keys) > 1:
+        unique_keys, inverse = np.unique(keys, return_inverse=True)
+        unique_codes, unique_confidence = votes.lookup(unique_keys)
+        codes, confidence = unique_codes[inverse], unique_confidence[inverse]
+    else:
+        codes, confidence = votes.lookup(keys)
     states = np.zeros(len(world), np.uint8)
     if mirror:
         codes, states = mirror(store, start, stop, valid, world, codes)
@@ -700,6 +710,9 @@ class GroundDtmIndex:
 
 class ClassifiedSource:
     """Reuse reduced direct predictions and transfer only from those predictions."""
+    _transfer_record_dtype = np.dtype([('xyz', '<f8', (3,)), ('row', '<i8'), ('scan', '<i4')])
+    _transfer_chunk_records = 250_000
+    _transfer_buffer_bytes_limit = 224*1024**2
     def __init__(self, directory, stores, votes, origin, voxel_size, skipped=(), mirror=None, radius=0., checkpoint=lambda: None,
                   geometry_planes=None, geometry_fill_tolerance=.02, terrain=None, terrain_ground_tolerance=.15,
                   terrain_fill=False, progress=lambda *args: None, force_unclassified=None, terrain_outdoor_scans=None,
@@ -714,6 +727,12 @@ class ClassifiedSource:
                                            for key, value in (transfer_station_positions or {}).items()}
         self.adaptive_transfer = bool(self.radius_max > self.radius and self.range_factor > 0.)
         self.temporary = self.index = None; self.predictions = {}; self.class_transfer_count = 0
+        self._stores_by_scan = {int(store.meta['scan_index']): store for store in stores}
+        self._transfer_prepared = False
+        self._transfer_query_count = 0
+        self._transfer_buffers = {}
+        self._transfer_buffer_bytes = 0
+        self.transfer_bucket_stats = {'transfer_bucket_files': 0, 'transfer_bucket_open_calls': 0}
         self.export_index_cache_gb = float(export_index_cache_gb)
         self.export_index_max_tile_points = export_index_max_tile_points
         self.index_cache_stats = {'index_cache_hits': 0, 'index_cache_misses': 0, 'index_cache_evictions': 0,
@@ -769,10 +788,127 @@ class ClassifiedSource:
                     prepared += int(valid.sum())
                     self.progress('output_prepare', prepared/total, scan)
                 for mapping in maps: mapping.flush()
+            self._prepare_reduced_transfer(total)
             return self
         except Exception:
             self.close()
             raise
+
+    def _transfer_bucket_path(self, root, path):
+        """Return the on-disk bucket for one finalized index leaf."""
+        root = tuple(int(value) for value in root)
+        return Path(self.temporary.name)/f'queries_{root[0]}_{root[1]}_{root[2]}_{int(path)}.bin'
+
+    def _flush_transfer_buffers(self):
+        """Append buffered records leaf-wise, largest leaves first."""
+        if not self._transfer_buffers:
+            return
+        buffers, self._transfer_buffers = self._transfer_buffers, {}
+        self._transfer_buffer_bytes = 0
+        for path, parts in sorted(buffers.items(), key=lambda item: -sum(part.nbytes for part in item[1])):
+            with path.open('ab') as handle:
+                self.transfer_bucket_stats['transfer_bucket_open_calls'] += 1
+                for part in parts:
+                    part.tofile(handle)
+
+    def _buffer_transfer_records(self, records, roots, paths):
+        """Keep leaf runs in RAM until the bounded append buffer is full."""
+        if self._transfer_buffer_bytes and (self._transfer_buffer_bytes+records.nbytes > self._transfer_buffer_bytes_limit):
+            self._flush_transfer_buffers()
+        order = np.lexsort((paths, roots[:, 2], roots[:, 1], roots[:, 0]))
+        sorted_roots, sorted_paths = roots[order], paths[order]
+        changes = ((sorted_paths[1:] != sorted_paths[:-1]) |
+                   np.any(sorted_roots[1:] != sorted_roots[:-1], axis=1))
+        starts = np.r_[0, np.flatnonzero(changes)+1, len(order)]
+        ordered = records[order]
+        for first, last in zip(starts[:-1], starts[1:]):
+            path = self._transfer_bucket_path(sorted_roots[first], sorted_paths[first])
+            self._transfer_buffers.setdefault(path, []).append(ordered[first:last])
+        self._transfer_buffer_bytes += records.nbytes
+
+    def _stage_transfer_buckets(self, total):
+        """Write unknown reduced predictions into bounded, spatially local buckets."""
+        staged = 0
+        for store in self.stores:
+            scan = int(store.meta['scan_index'])
+            if scan in self.skipped:
+                continue
+            codes = self.predictions[scan][0]
+            pose = scan_pose(store.meta['metadata'])
+            for start, xyz, valid in store.chunks(500_000):
+                self.checkpoint()
+                stop = start+len(xyz)
+                valid_rows = np.flatnonzero(valid)
+                unknown = np.asarray(codes[start:stop][valid], np.uint8) == 1
+                if unknown.any():
+                    rows = (start+valid_rows[unknown]).astype(np.int64, copy=False)
+                    world = pose.to_world(xyz[valid][unknown])
+                    roots = np.floor((world-self.origin)/self.index.block).astype(np.int64)
+                    packed_roots = self.index._linear_keys(roots)
+                    paths = self.index._tile_paths(world, roots, packed_roots)
+                    records = np.empty(len(world), self._transfer_record_dtype)
+                    records['xyz'], records['row'], records['scan'] = world, rows, scan
+                    self._buffer_transfer_records(records, roots, paths)
+                    self._transfer_query_count += len(records)
+                staged += len(valid_rows)
+                self.progress('output_transfer', staged/max(1, total), scan)
+        self._flush_transfer_buffers()
+        self.transfer_bucket_stats['transfer_bucket_files'] = len(list(Path(self.temporary.name).glob('queries_*.bin')))
+
+    def _apply_transfer_records(self, records):
+        """Query one spatial bucket and write its inherited codes to prediction maps."""
+        query_radius = self.radius_max if self.adaptive_transfer else self.radius
+        inherited, distances = self.index.nearest_codes(records['xyz'], query_radius, return_distances=True)
+        assigned = inherited != 0
+        scans = records['scan']
+        if self.adaptive_transfer:
+            radii = np.empty(len(records), np.float64)
+            for scan in np.unique(scans):
+                ids = np.flatnonzero(scans == scan)
+                radii[ids] = self._transfer_radii(self._stores_by_scan[int(scan)], records['xyz'][ids])
+            assigned &= distances <= radii
+        if not assigned.any():
+            return
+        for scan in np.unique(scans[assigned]):
+            ids = np.flatnonzero(assigned & (scans == scan))
+            rows = records['row'][ids]
+            codes, confidence, _ = self.predictions[int(scan)]
+            codes[rows] = inherited[ids]
+            confidence[rows] = np.maximum(confidence[rows], 128)
+            self.class_transfer_count += len(ids)
+
+    def _run_transfer_buckets(self):
+        """Process one leaf at a time so the bounded index cache does not thrash."""
+        completed = 0
+        for path in sorted(Path(self.temporary.name).glob('queries_*.bin')):
+            try:
+                self.transfer_bucket_stats['transfer_bucket_open_calls'] += 1
+                with path.open('rb') as handle:
+                    while True:
+                        self.checkpoint()
+                        records = np.fromfile(handle, dtype=self._transfer_record_dtype,
+                                              count=self._transfer_chunk_records)
+                        if not len(records):
+                            break
+                        self._apply_transfer_records(records)
+                        completed += len(records)
+                        self.progress('output_transfer', completed/max(1, self._transfer_query_count),
+                                      int(records['scan'][0]))
+            finally:
+                path.unlink(missing_ok=True)
+        for maps in self.predictions.values():
+            for mapping in maps:
+                mapping.flush()
+
+    def _prepare_reduced_transfer(self, total):
+        """Finalize sources once, then transfer all reduced unknowns in leaf order."""
+        started = time.perf_counter()
+        self.index._finalize()
+        self._stage_transfer_buckets(total)
+        self._run_transfer_buckets()
+        self.index_cache_stats = self.index.cache_stats()
+        self.timing_seconds['transfer'] += time.perf_counter()-started
+        self._transfer_prepared = True
 
     def _transfer_radii(self, store, world):
         """Return per-point transfer radii from the owning scanner or station."""
@@ -808,7 +944,8 @@ class ClassifiedSource:
             started = time.perf_counter()
             world, codes, confidence, states = classify_points(store, start, stop, xyz, valid, self.votes, self.origin, self.voxel_size, self.skipped, self.mirror, world)
             self.timing_seconds['lookup_mirror'] += time.perf_counter()-started
-        if self.index is not None and store.meta['scan_index'] not in self.skipped:
+        if (self.index is not None and store.meta['scan_index'] not in self.skipped and
+                not (density == 'reduced' and self._transfer_prepared)):
             started = time.perf_counter()
             unknown = codes == 1
             query_points = world[unknown]
@@ -934,6 +1071,8 @@ class ClassifiedSource:
 
     def close(self):
         """Release all output-preparation resources; safe to call repeatedly."""
+        self._transfer_buffers.clear()
+        self._transfer_buffer_bytes = 0
         index, self.index = self.index, None
         if index is not None:
             try:

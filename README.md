@@ -550,9 +550,17 @@ evaluation run on this dataset is still pending.
 Shape rules and the TIN DTM have been tuned on **HSLU_Trakt_4** (static TLS) and
 **Loris_home** (mobile SLAM). Noisy SLAM wall surfaces dynamically widen the RANSAC
 structure noise envelope up to 8 cm (`shape_layer_max_band`). Runtime of
-post-processing on large datasets (~50 million voxels) currently takes tens of
-minutes and is actively being optimized. Direct-transfer index memory during
-LAS/LAZ export is bounded by `export_index_cache_gb` (default 4 GB); transient
+post-processing has been measured on a synthetic, HSLU-proportioned fixture:
+tiled, batched RANSAC reduced plane extraction for 51.8 million voxels from
+1,717 s to 319 s (5.4x), with equal or better plane coverage per class (walls
++10.7 pp, ground +15.3 pp), except roads -0.8 pp where newly detected ground
+planes create ties. Spatially bucketed export queries reduced class transfer for
+30 scans and 9 million points from 30.7 s to 5.3 s (5.8x), with index-cache
+misses reduced from 3,235 to 108 and byte-identical output. Shape rules remain
+the largest post-processing stage (about 28 min on the 157-scan dataset) and
+are scheduled for an in-memory rewrite. Confirmation on the real HSLU dataset
+through reclassify is still pending. Direct-transfer index memory during LAS/LAZ
+export is bounded by `export_index_cache_gb` (default 4 GB); transient
 construction and output buffers can add up to about 1 GB on large projects.
 
 SAM can miss objects, produce overly broad masks, or confuse classes. The latest

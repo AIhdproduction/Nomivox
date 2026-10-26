@@ -253,7 +253,9 @@ def _write(path, source, stores, votes, origin, voxel_size, allowed_codes, skipp
             "extra_removed_count": discarded, "class_transfer_count": transferred,
             "geometry_fill_counts": classified.geometry_fill_counts, "_samples": samples,
             "timing_seconds": {**classified.timing_seconds, 'write': write_seconds, 'readback': 0.},
-            **classified.index_cache_stats}
+            **classified.index_cache_stats,
+            **getattr(classified, 'transfer_bucket_stats',
+                      {'transfer_bucket_files': 0, 'transfer_bucket_open_calls': 0})}
 
 
 def write_e57(path: Path, source: Path, stores, votes, origin, voxel_size, allowed_codes,

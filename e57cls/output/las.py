@@ -200,7 +200,9 @@ def write_cloud(path: Path, stores, votes, origin, voxel_size, crs_wkt, allowed_
                 "class_transfer_count": inherited_count,
                 "geometry_fill_counts": classified.geometry_fill_counts,
                 "readback": verification, "warnings": warnings, "las_scale_m": header.scales.tolist(),
-                "timing_seconds": {**classified.timing_seconds, **timing}, **classified.index_cache_stats}
+                "timing_seconds": {**classified.timing_seconds, **timing}, **classified.index_cache_stats,
+                **getattr(classified, 'transfer_bucket_stats',
+                          {'transfer_bucket_files': 0, 'transfer_bucket_open_calls': 0})}
     finally:
         if extra_writer:
             extra_writer.close()

@@ -1101,11 +1101,12 @@ def _wall_metrics(db, objects, planes, walls, origin, voxel_size, checkpoint):
 
 
 def _bulk_update_decisions(db, keys, codes, confidence):
-    """Write a vectorized decision block through one temporary-table update.
+    """Write a vectorized decision block through keyed temporary updates.
 
-    The rule passes already resolve their precedence in NumPy.  Staging the
-    resulting keys avoids one SQLite UPDATE and one Python tuple per voxel,
-    which is material on city-scale outdoor scans.
+    The staging table preserves the previous duplicate-key failure semantics.
+    The ``IN`` predicate makes SQLite drive the update from the small update
+    table and perform a primary-key lookup in ``decisions`` for each changed
+    voxel, rather than scanning the complete decision table for every rule.
     """
     keys = np.asarray(keys, dtype='V24')
     if not len(keys):
@@ -1123,8 +1124,10 @@ def _bulk_update_decisions(db, keys, codes, confidence):
         db.executemany('INSERT INTO shape_decision_updates VALUES (?,?,?)',
                        ((bytes(key), int(code), int(value))
                         for key, code, value in zip(keys[start:stop], codes[start:stop], confidence[start:stop])))
-    db.execute('''UPDATE decisions AS d SET code=u.code,confidence=u.confidence
-                  FROM shape_decision_updates AS u WHERE d.key=u.key''')
+    db.execute('''UPDATE decisions AS d
+                  SET (code,confidence)=(SELECT u.code,u.confidence
+                                         FROM shape_decision_updates AS u WHERE u.key=d.key)
+                  WHERE d.key IN (SELECT key FROM shape_decision_updates)''')
     db.execute('DELETE FROM shape_decision_updates')
 
 

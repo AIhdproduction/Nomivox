@@ -100,50 +100,73 @@ def test_split_cells_matches_reference_order_for_seeded_and_edge_data():
         assert all(np.array_equal(item, reference) for item, reference in zip(actual, expected))
 
 
-def _reference_merge_coplanar_pieces(pieces, tolerance):
-    merged = []
-    cosine = np.cos(np.deg2rad(3.))
+def _rotated_piece(local_cells, *, center, normal, basis):
+    """Build a georeferenced occupancy patch in the supplied plane basis."""
+    cells = _cells_from_uv(np.asarray(local_cells, np.float64)*CELL_SIZE+basis@center)
+    return {'cells': cells, 'normal': np.asarray(normal, np.float64),
+            'center': np.asarray(center, np.float64), 'basis': np.asarray(basis, np.float64),
+            'area': float(len(cells)*CELL_SIZE**2)}
+
+
+def _projected_cell_union(pieces, basis):
+    projected = []
     for piece in pieces:
-        for current in merged:
-            if abs(float(np.dot(piece['normal'], current['normal']))) < cosine:
-                continue
-            if abs(float(np.dot(piece['center']-current['center'], current['normal']))) >= tolerance:
-                continue
-            uv = piece['cells'].astype(np.float64)*CELL_SIZE
-            world = uv@piece['basis'] + piece['normal']*np.dot(piece['center'], piece['normal'])
-            projected = _cells_from_uv(world@current['basis'].T)
-            combined = np.unique(np.vstack((current['cells'], projected)), axis=0)
-            if len(_reference_split_cells(combined)) == 1:
-                current['cells'] = combined
-                current['area'] += piece['area']
-                break
-        else:
-            merged.append(piece)
-    return merged
+        world = (piece['cells'].astype(np.float64)*CELL_SIZE@piece['basis']
+                 + piece['normal']*np.dot(piece['center'], piece['normal']))
+        projected.append(_cells_from_uv(world@basis.T))
+    return np.unique(np.concatenate(projected), axis=0)
 
 
-def _piece(cells, normal=(0., 0., 1.), center=(0., 0., 0.), area=1.):
-    return {'cells': np.asarray(cells, np.int32), 'normal': np.asarray(normal, np.float64),
-            'center': np.asarray(center, np.float64), 'basis': np.eye(2, 3), 'area': area}
+def _cell_sets(pieces):
+    return {tuple(map(tuple, item['cells'][np.lexsort((item['cells'][:, 1], item['cells'][:, 0]))]))
+            for item in pieces}
 
 
-def test_merge_coplanar_pieces_matches_reference_and_first_match_order():
-    rng = np.random.default_rng(20261024)
-    random_pieces = [_piece(rng.integers(-50, 51, size=(rng.integers(1, 5), 2), dtype=np.int32),
-                            center=rng.uniform(-1., 1., 3), area=float(index+1))
-                     for index in range(40)]
-    cases = [[_piece([[0, 0]])],
-             [_piece([[0, 0], [1, 0]], area=2.), _piece([[2, 0]], area=1.),
-              _piece([[10, 0]], area=3.), _piece([[11, 1]], area=4.),
-              _piece([[0, 5]], normal=(0., 1., 0.), area=5.)]+random_pieces]
-    for pieces in cases:
-        expected = _reference_merge_coplanar_pieces(deepcopy(pieces), .02)
-        actual = _merge_coplanar_pieces(deepcopy(pieces), .02)
-        assert len(actual) == len(expected)
-        for item, reference in zip(actual, expected):
-            assert item['area'] == reference['area']
-            for key in ('cells', 'normal', 'center', 'basis'):
-                np.testing.assert_array_equal(item[key], reference[key])
+def _pieces_are_bitwise_equal(first, second):
+    assert len(first) == len(second)
+    for left, right in zip(first, second):
+        assert left['area'] == right['area']
+        for key in ('cells', 'normal', 'center', 'basis'):
+            assert np.array_equal(left[key], right[key])
+
+
+def test_merge_coplanar_pieces_joins_adjacent_coplanar_patches():
+    angle = np.deg2rad(23.)
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0.],
+                         [np.sin(angle), np.cos(angle), 0.], [0., 0., 1.]])
+    center = np.array([2665953., 1207269., 440.])
+    normal = rotation[:, 2]
+    basis = rotation[:, :2].T
+    tolerance = .05
+
+    adjacent = [_rotated_piece([[0, 0], [1, 0]], center=center, normal=normal, basis=basis),
+                _rotated_piece([[2, 0], [2, 1]], center=center, normal=normal, basis=basis)]
+    merged = _merge_coplanar_pieces(deepcopy(adjacent), tolerance)
+    assert len(merged) == 1
+    assert np.array_equal(merged[0]['cells'], _projected_cell_union(adjacent, merged[0]['basis']))
+    assert merged[0]['area'] == len(merged[0]['cells'])*CELL_SIZE**2
+
+    separated = [_rotated_piece([[0, 0], [1, 0]], center=center, normal=normal, basis=basis),
+                 _rotated_piece([[5, 0]], center=center, normal=normal, basis=basis)]
+    assert len(_merge_coplanar_pieces(deepcopy(separated), tolerance)) == 2
+
+    tilted_normal = rotation@np.array([np.sin(np.deg2rad(4.)), 0., np.cos(np.deg2rad(4.))])
+    tilted_basis = np.array([rotation@np.array([np.cos(np.deg2rad(4.)), 0., -np.sin(np.deg2rad(4.))]),
+                             rotation[:, 1]])
+    different_normals = [_rotated_piece([[0, 0], [1, 0]], center=center, normal=normal, basis=basis),
+                         _rotated_piece([[2, 0]], center=center, normal=tilted_normal, basis=tilted_basis)]
+    assert len(_merge_coplanar_pieces(deepcopy(different_normals), tolerance)) == 2
+
+    offset = center+normal*tolerance
+    parallel_offset = [_rotated_piece([[0, 0], [1, 0]], center=center, normal=normal, basis=basis),
+                       _rotated_piece([[2, 0]], center=offset, normal=normal, basis=basis)]
+    assert len(_merge_coplanar_pieces(deepcopy(parallel_offset), tolerance)) == 2
+
+    assert all(len(_split_cells(piece['cells'])) == 1 for piece in merged)
+    repeated = _merge_coplanar_pieces(deepcopy(adjacent), tolerance)
+    _pieces_are_bitwise_equal(merged, repeated)
+    reversed_merged = _merge_coplanar_pieces(deepcopy(list(reversed(adjacent))), tolerance)
+    assert _cell_sets(merged) == _cell_sets(reversed_merged)
 
 
 def _reference_touching_box_labels(low, high, maximum_gap):

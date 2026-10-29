@@ -154,6 +154,11 @@ def _scene_record(scan, resolution, classes):
             'class_ids': [item['id'] for item in classes]}
 
 
+def _emit_scene_event(control, scan, resolution):
+    """Emit a scene event with the current scan taking precedence in its payload."""
+    control.event('scene', **{**resolution, 'scan': int(scan)})
+
+
 def _load_scene_record(work, scan):
     """Load both current shared-SAM and legacy detector scene records."""
     data = json.loads((work/f'scene_{scan:04d}.json').read_text(encoding='utf-8'))
@@ -187,7 +192,7 @@ def finalize_scene_resolution(scan_results, stores, config, warnings, control):
             result['scene_resolution'] = resolution
             result['scene_detection'] = resolution
             if changed:
-                control.event('scene', scan=resolution['scan'], **resolution)
+                _emit_scene_event(control, resolution['scan'], resolution)
     for result in scan_results:
         resolution = result.get('scene_resolution')
         if not resolution:
@@ -304,7 +309,7 @@ def prepare_shared_sam(reader, stores, inspection, config, work, image_cache, ma
             if not classes:
                 raise ValueError('No enabled classes for this scene')
             record.update(_scene_record(scan, resolution, classes))
-            control.event('scene', scan=scan, **resolution)
+            _emit_scene_event(control, scan, resolution)
             prompts = prompt_classes(classes, config)+mirror_phrases
             scan_images = [item for candidate, item in images if candidate is store]
             for item in scan_images:
@@ -1496,7 +1501,7 @@ def execute(config, backend_factory=None, listen=True):
                         classes = select_classes(preset, resolution['class_mode'], config['building_enclosure'])
                         record = _scene_record(scan, resolution, classes)
                         atomic_json(work/f'scene_{scan:04d}.json', record)
-                        control.event('scene', scan=scan, **resolution)
+                        _emit_scene_event(control, scan, resolution)
                     if not classes:
                         raise ValueError('No enabled classes for this scene')
                     rep_path, weights_path, stats = classify_scan(reader, store, inspection, config, work, image_cache,

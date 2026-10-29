@@ -556,14 +556,23 @@ class VoteStore:
 
     @staticmethod
     def _stair_levels(coordinates, voxel_size, level_tolerance):
-        """Extract broad horizontal levels from a stair component's voxels."""
-        horizontal = np.column_stack((np.floor(coordinates[:, :2]*voxel_size/.10).astype(np.int64), coordinates[:, 2]))
-        horizontal = np.unique(horizontal, axis=0)
-        heights, counts = np.unique(horizontal[:, 2], return_counts=True)
+        """Extract tread levels from the top surface of 10 cm horizontal cells.
+
+        Risers and inclined undersides occupy many vertical voxel heights, but
+        only the uppermost voxel in each horizontal cell represents a tread.
+        Reducing to those tops before clustering prevents their heights from
+        forming an artificial continuous chain between real steps.
+        """
+        cells = np.floor(coordinates[:, :2]*voxel_size/.10).astype(np.int64)
+        cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+        tops = np.full(len(cells), np.iinfo(np.int64).min, np.int64)
+        np.maximum.at(tops, inverse, coordinates[:, 2])
+        heights, counts = np.unique(tops, return_counts=True)
         if not len(heights):
             return np.empty(0), np.empty((0, 2))
-        # A landing can cover far more 10 cm cells than each tread. Keep every
-        # broad horizontal level and exclude only the narrow vertical risers.
+        # A landing can cover far more cells than each tread.  Three cells are
+        # enough for the narrowest plausible tread while isolated top outliers
+        # are ignored.
         minimum_cells = 3
         heights, counts = heights[counts >= minimum_cells], counts[counts >= minimum_cells]
         if not len(heights):
@@ -573,38 +582,55 @@ class VoteStore:
         for start, stop in zip(starts[:-1], starts[1:]):
             selected, weights = heights[start:stop], counts[start:stop]
             height = float(np.average(selected*voxel_size, weights=weights))
-            points = coordinates[np.isin(coordinates[:, 2], selected), :2]*voxel_size
+            points = cells[np.isin(tops, selected)]*.10+.05
             levels.append(height)
             centres.append(points.mean(axis=0))
         return np.asarray(levels), np.asarray(centres)
 
     @staticmethod
     def _stair_shape(levels, centres, minimum_levels, rise_minimum, rise_maximum, tread_minimum, tread_maximum):
-        """Accept one or more monotone flights separated by a landing."""
+        """Accept a valid monotone flight, optionally separated by a landing.
+
+        A blocked tread produces one large rise and an outlier can produce one
+        small rise.  Either must split a flight, not invalidate independent
+        valid runs on both sides.  This also permits a landing transition whose
+        geometry or height gap is outside a normal tread edge.
+        """
         if len(levels) < minimum_levels:
             return False
         rises = np.diff(levels)
-        if not np.all((rises >= rise_minimum) & (rises <= rise_maximum)):
-            return False
         vectors = np.diff(centres, axis=0)
         lengths = np.linalg.norm(vectors, axis=1)
-        flights, current = [], []
-        for index, (vector, length) in enumerate(zip(vectors, lengths)):
-            if not tread_minimum <= length <= tread_maximum:
-                if current:
-                    flights.append(current)
-                    current = []
+        longest, current, previous_direction = 0, 0, None
+        for rise, vector, length in zip(rises, vectors, lengths):
+            valid = (rise_minimum <= rise <= rise_maximum
+                     and tread_minimum <= length <= tread_maximum)
+            if not valid:
+                longest = max(longest, current)
+                current, previous_direction = 0, None
                 continue
             direction = vector/length
-            # A landing may turn the next flight by 90 or 180 degrees.  Split
-            # at that turn and test each run in its own forward direction.
-            if current and float(direction @ current[-1][1]) < .5:
-                flights.append(current)
-                current = []
-            current.append((index, direction))
-        if current:
-            flights.append(current)
-        return any(len(flight) >= minimum_levels-1 for flight in flights)
+            # A landing may turn the next flight by 90 or 180 degrees.  The
+            # first edge of the new flight starts a fresh monotone run.
+            if previous_direction is not None and float(direction @ previous_direction) < .5:
+                longest = max(longest, current)
+                current = 0
+            current += 1
+            previous_direction = direction
+        return max(longest, current) >= minimum_levels-1
+
+    @staticmethod
+    def _is_planar_component(coordinates, voxel_size, plane_tolerance, planar_fraction):
+        """Return whether a component is predominantly one geometric plane."""
+        if len(coordinates) < 3:
+            return True
+        points = coordinates.astype(np.float64)*voxel_size
+        stride = max(1, len(points)//10_000)
+        sample = points[::stride]
+        centre = sample.mean(axis=0)
+        _, _, vectors = np.linalg.svd(sample-centre, full_matrices=False)
+        residuals = np.abs((points-centre) @ vectors[-1])
+        return np.mean(residuals <= plane_tolerance) >= planar_fraction
 
     @staticmethod
     def _boxes_touch(first, second, maximum_gap):
@@ -643,7 +669,9 @@ class VoteStore:
                              floor_level_tolerance=.03, underside_minimum_voxels=1000,
                              underside_cluster_size=3, underside_maximum_gap=.20):
         """Keep only components with a physically plausible stepped profile."""
-        result = {'checked_components': 0, 'rejected_components': 0, 'reclassified_voxels': {}}
+        result = {'checked_components': 0, 'rejected_components': 0, 'reclassified_voxels': {},
+                  'accepted_components': 0, 'accepted_voxels': 0,
+                  'kept_fragments': {'components': 0, 'voxels': 0}}
         rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (int(stairs_code),)))
         if not rows:
             self._invalidate_lookup()
@@ -655,6 +683,7 @@ class VoteStore:
         origin = np.asarray(origin, np.float64)
         component_order = np.argsort(labels, kind='stable')
         component_offsets = np.r_[0, np.cumsum(np.bincount(labels, minlength=count))]
+        component_sizes = np.bincount(labels, minlength=count)
         floor_tree = floor_heights = None
         if floor_code is not None:
             floor_rows = list(self.db.execute('SELECT key FROM decisions WHERE code=?', (int(floor_code),)))
@@ -670,8 +699,19 @@ class VoteStore:
             result['checked_components'] += 1
             component_coordinates = coordinates[indices]
             levels, centres = self._stair_levels(component_coordinates, voxel_size, level_tolerance)
-            stepped = len(indices) >= minimum_voxels and self._stair_shape(
-                levels, centres, minimum_levels, rise_minimum, rise_maximum, tread_minimum, tread_maximum)
+            planar = self._is_planar_component(component_coordinates, voxel_size, plane_tolerance, planar_fraction)
+            span = (component_coordinates.max(axis=0)-component_coordinates.min(axis=0)+1)*voxel_size
+            stepped = (len(indices) >= minimum_voxels and not planar and self._stair_shape(
+                levels, centres, minimum_levels, rise_minimum, rise_maximum, tread_minimum, tread_maximum))
+            # A semantic stair component can contain only a clipped riser or
+            # underside after voxel voting.  Such a large, non-planar piece
+            # cannot prove a complete flight by itself, but rejecting it turns
+            # real staircase edges into walls.  A shallow 10--25 cm planar
+            # strip is also retained: it is a partial tread/riser observation,
+            # whereas floors and tables are flatter and ramps/roofs have a
+            # larger vertical span.  Full planar slopes still reclassify.
+            partial_stair = (len(indices) >= minimum_voxels and (not planar
+                             or rise_minimum <= span[2] < minimum_rise))
             returned = np.empty(0, np.int64)
             if floor_tree is not None and len(levels):
                 distance, nearby = floor_tree.query(centres, distance_upper_bound=floor_ring_radius, workers=-1)
@@ -692,14 +732,15 @@ class VoteStore:
             # deliberately not accepted: it is indistinguishable from a roof
             # or ceiling.  Several large, touching flights (or an underside
             # next to a verified stepped flight) are a staircase assembly.
-            span = (component_coordinates.max(axis=0)-component_coordinates.min(axis=0)+1)*voxel_size
             underside = (len(indices) >= underside_minimum_voxels and span[2] >= minimum_rise
                          and np.linalg.norm(span[:2]) >= tread_minimum)
-            component_data.append({'indices': indices, 'stepped': stepped, 'underside': underside,
+            component_data.append({'indices': indices, 'stepped': stepped, 'partial_stair': partial_stair,
+                                   'underside': underside,
                                    'box': np.stack((component_coordinates.min(axis=0)*voxel_size,
                                                     component_coordinates.max(axis=0)*voxel_size))})
 
-        eligible = np.fromiter((data['stepped'] or data['underside'] for data in component_data), bool, count)
+        eligible = np.fromiter((data['stepped'] or data['partial_stair'] or data['underside']
+                                for data in component_data), bool, count)
         eligible_components = np.flatnonzero(eligible)
         boxes = np.asarray([component_data[index]['box'] for index in eligible_components]).reshape(-1, 2, 3)
         group_labels = _touching_box_labels(boxes[:, 0], boxes[:, 1], underside_maximum_gap)
@@ -708,13 +749,39 @@ class VoteStore:
             groups.setdefault(int(group), []).append(int(component))
         accepted = set()
         for members in groups.values():
-            has_steps = any(component_data[item]['stepped'] for item in members)
+            has_steps = any(component_data[item]['stepped'] or component_data[item]['partial_stair']
+                            for item in members)
             enough_flights = sum(component_data[item]['underside'] for item in members) >= underside_cluster_size
             if has_steps or enough_flights:
-                accepted.update(item for item in members if component_data[item]['stepped'] or component_data[item]['underside'])
+                accepted.update(item for item in members if (component_data[item]['stepped']
+                                                             or component_data[item]['partial_stair']
+                                                             or component_data[item]['underside']))
+
+        accepted_mask = np.zeros(count, bool)
+        if accepted:
+            accepted_mask[list(accepted)] = True
+        result['accepted_components'] = int(accepted_mask.sum())
+        result['accepted_voxels'] = int(component_sizes[accepted_mask].sum())
+
+        # Preserve small edge pieces only where they are genuinely attached to
+        # a verified staircase.  The KD-tree query is Chebyshev distance in
+        # voxel coordinates, so it covers all face, edge and corner neighbours
+        # within two voxels without iterating over individual fragment voxels.
+        fragment_mask = (component_sizes[labels] < minimum_voxels) & ~accepted_mask[labels]
+        fragment_indices = np.flatnonzero(fragment_mask)
+        kept_fragment_components = np.zeros(count, bool)
+        if len(fragment_indices) and accepted_mask.any():
+            accepted_indices = np.flatnonzero(accepted_mask[labels])
+            accepted_tree = cKDTree(coordinates[accepted_indices])
+            distances = accepted_tree.query(coordinates[fragment_indices], k=1, p=np.inf,
+                                            distance_upper_bound=2.000001, workers=-1)[0]
+            np.logical_or.at(kept_fragment_components, labels[fragment_indices], np.isfinite(distances))
+        result['kept_fragments'] = {
+            'components': int(kept_fragment_components.sum()),
+            'voxels': int(component_sizes[kept_fragment_components].sum())}
 
         for component, data in enumerate(component_data):
-            if component in accepted:
+            if accepted_mask[component] or kept_fragment_components[component]:
                 continue
             result['rejected_components'] += 1
             indices = data['indices']

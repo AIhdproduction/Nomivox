@@ -7,6 +7,7 @@ from e57cls.scene.detect import decide, horizontal_openness
 from e57cls.scene.resolve import name_hint, resolve_neighbours, resolve_scan_scene
 from e57cls.geometry.planes import fit_plane
 from e57cls.pipeline.config import DEFAULTS
+from e57cls.pipeline import run as pipeline_run
 
 
 def test_scene_thresholds_keep_ambiguity():
@@ -155,6 +156,47 @@ def test_scene_openness_and_neighbours():
         [{'scan': 2, 'scene': 'unsure', 'source': 'pending'}, {'scan': 1, 'scene': 'outdoor', 'source': 'data'}],
         {1: [0, 0, 0], 2: [1, 0, 0]}, DEFAULTS)
     assert records[0]['scene'] == 'outdoor' and warnings[0]['code'] == 'scene_neighbour_resolved'
+
+
+def test_finalize_scene_resolution_emits_changed_scene_once_with_scan_in_resolution(monkeypatch):
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        def event(self, kind, **payload):
+            self.events.append((kind, payload))
+
+    def resolve(records, positions, config):
+        assert {record['scan'] for record in records} == {1, 2}
+        return [
+            {'scan': 1, 'scene': 'indoor', 'source': 'data'},
+            {'scan': 2, 'scene': 'outdoor', 'source': 'neighbour'},
+        ], []
+
+    monkeypatch.setattr(pipeline_run, 'resolve_neighbours', resolve)
+    recorder = Recorder()
+    results = [
+        {'scan': 1, 'scene': 'indoor', 'scene_resolution': {'scan': 1, 'scene': 'indoor'}},
+        {'scan': 2, 'scene': 'unsure', 'scene_resolution': {'scan': 2, 'scene': 'unsure'}},
+    ]
+
+    pipeline_run.finalize_scene_resolution(results, [], {}, [], recorder)
+
+    assert recorder.events == [('scene', {'scan': 2, 'scene': 'outdoor', 'source': 'neighbour'})]
+
+
+def test_emit_scene_event_overrides_scan_in_resolution():
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        def event(self, kind, **payload):
+            self.events.append((kind, payload))
+
+    recorder = Recorder()
+    pipeline_run._emit_scene_event(recorder, 2, {'scan': 99, 'scene': 'outdoor', 'source': 'data'})
+
+    assert recorder.events == [('scene', {'scan': 2, 'scene': 'outdoor', 'source': 'data'})]
 
 
 def _room_returns(missing=(), windows=()):
